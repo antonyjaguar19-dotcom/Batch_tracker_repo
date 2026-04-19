@@ -1,0 +1,55 @@
+# =============================================================
+#  Batch Tracker — Full Requirements
+#  For: CoTracker3 + Gradio UI + SynthEyes Autotrack Pipeline
+# =============================================================
+#
+#  HOW TO INSTALL (Step-by-Step for Non-Coders):
+#  -----------------------------------------------
+#  1. Open Command Prompt (Win+R → type "cmd" → Enter)
+#
+#  2. Navigate to your project folder:
+#        cd D:\Jefrin\BTr\batch_tracker_v001_starter
+#
+#  3. Activate your virtual environment:
+#        .venv\Scripts\activate
+#     You should see (.venv) appear at the start of the line.
+#
+#  4. Install PyTorch FIRST (needs special command):
+#        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#     NOTE: cu121 = CUDA 12.1. If your GPU driver supports a different
+#     CUDA version, check https://pytorch.org/get-started/locally/
+#
+#  5. Install everything else from this file:
+#        pip install -r requirements.txt
+#
+#  6. Done! Close the command prompt.
+#
+#  WHAT IS NOT IN THIS FILE (installed separately / already local):
+#  ----------------------------------------------------------------
+#  - PyTorch + TorchVision  →  Step 4 above (special CUDA index)
+#  - CoTracker3 repo        →  Already in your thirdparty/ folder
+#  - SyPy3                  →  Comes with SynthEyes installation
+#  - core/ package          →  Your own local code
+#  - SAM3 / Qwen2 runners   →  Your own local scripts
+# =============================================================
+
+# --- Core Scientific ---
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# --- UI Framework ---
+gradio>=4.0.0
+pandas>=2.0.0
+
+# --- Visualization (used by app.py in background mode) ---
+matplotlib>=3.7.0
+
+# --- System Utilities ---
+psutil>=5.9.0
+
+# --- Optional: If you use Ollama's Python client for LLaMA ---
+# ollama>=0.1.0
+
+# --- Optional: If SAM3 needs these (check sam3_runner.py) ---
+# segment-anything-2
+# Pillow>=10.0.0
