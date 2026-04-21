@@ -3,26 +3,27 @@
 #  For: CoTracker3 + Gradio UI + SynthEyes Autotrack Pipeline
 # =============================================================
 #
-#  HOW TO INSTALL (Step-by-Step for Non-Coders):
+#  HOW TO INSTALL (One-Click):
 #  -----------------------------------------------
-#  1. Open Command Prompt (Win+R → type "cmd" → Enter)
+#  After cloning the repo, just run the bundled installer from the repo root:
+#        python install.py
 #
-#  2. Navigate to your project folder:
-#        cd D:\Jefrin\BTr\batch_tracker_v001_starter
+#  That will create .venv (if missing), install PyTorch + this file, and
+#  download the required model weights (.safetensors / .pt).
 #
-#  3. Activate your virtual environment:
-#        .venv\Scripts\activate
-#     You should see (.venv) appear at the start of the line.
-#
-#  4. Install PyTorch FIRST (needs special command):
+#  Manual install (advanced):
+#  -----------------------------------------------
+#  1. Open a terminal and `cd` into the cloned repo folder (wherever it is).
+#  2. Create and activate a venv:
+#        python -m venv .venv
+#        (Windows) .venv\Scripts\activate
+#        (macOS/Linux) source .venv/bin/activate
+#  3. Install PyTorch (CUDA 12.1 wheel):
 #        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #     NOTE: cu121 = CUDA 12.1. If your GPU driver supports a different
 #     CUDA version, check https://pytorch.org/get-started/locally/
-#
-#  5. Install everything else from this file:
+#  4. Install everything else from this file:
 #        pip install -r requirements.txt
-#
-#  6. Done! Close the command prompt.
 #
 #  WHAT IS NOT IN THIS FILE (installed separately / already local):
 #  ----------------------------------------------------------------

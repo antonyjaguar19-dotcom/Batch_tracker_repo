@@ -349,10 +349,10 @@ def build_app():
         demo.load(init_session, inputs=None, outputs=[session_state])
 
         with gr.Row():
-            input_dir = gr.Textbox(label="Input Folder (mp4)", placeholder=r"D:\shots\in", scale=3)
-            output_dir = gr.Textbox(label="Output Folder", placeholder=r"D:\shots\out", scale=3)
+            input_dir = gr.Textbox(label="Input Folder (mp4)", placeholder="Path to folder containing .mp4 shots", scale=3)
+            output_dir = gr.Textbox(label="Output Folder", placeholder="Path to folder for tracking outputs", scale=3)
 
-        mask_root = gr.Textbox(label="Mask Root Folder (optional)", placeholder=r"D:\shots\OUT", scale=3)
+        mask_root = gr.Textbox(label="Mask Root Folder (optional)", placeholder="Path to mask root (contains <Shot>/masks/*.png)", scale=3)
         mask_mode = gr.Radio(
             choices=[x[0] for x in MASK_MODE_CHOICES],
             value=MASK_MODE_CHOICES[0][0],
