@@ -48,9 +48,16 @@ matplotlib>=3.7.0
 # --- System Utilities ---
 psutil>=5.9.0
 
-# --- Optional: If you use Ollama's Python client for LLaMA ---
-# ollama>=0.1.0
+# --- CoTracker3 Engine Requirements (REQUIRED) ---
+einops
+timm
+tqdm
+imageio
 
-# --- Optional: If SAM3 needs these (check sam3_runner.py) ---
-# segment-anything-2
-# Pillow>=10.0.0
+# --- SAM3 Masking Requirements (REQUIRED for segmentation) ---
+segment-anything-2
+Pillow>=10.0.0
+
+# --- Qwen2 / LLaMA Reasoning Backend (REQUIRED for Ollama) ---
+ollama>=0.1.0
+requests
