@@ -24,13 +24,22 @@ import gradio as gr
 import pandas as pd
 
 # -----------------------------------------------------------------------------
+# Project root — everything is resolved relative to this file's location so
+# the tool works from any folder on any system when the repo is cloned.
+# -----------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+BTR_PROJECT_ROOT_ENV = os.environ.get("BTR_PROJECT_ROOT")
+if BTR_PROJECT_ROOT_ENV:
+    PROJECT_ROOT = Path(BTR_PROJECT_ROOT_ENV).resolve()
+
+# -----------------------------------------------------------------------------
 # Fixed runtime endpoints / weights (kept out of the UI)
 # You can override these via environment variables if needed.
 # -----------------------------------------------------------------------------
 DEFAULT_OLLAMA_URL = os.environ.get("BTR_OLLAMA_URL", "http://localhost:11434")
 DEFAULT_SAM3_WEIGHTS = os.environ.get(
     "BTR_SAM3_WEIGHTS",
-    r"D:\Jefrin\BTr\batch_tracker_v001_starter\SAM3\weights\sam3.pt",
+    str(PROJECT_ROOT / "SAM3" / "weights" / "sam3.pt"),
 )
 
 
@@ -43,23 +52,31 @@ def _add_to_sys_path(path_str: str):
         sys.path.insert(0, path_str)
         print(f"DEBUG: Added to sys.path: {path_str}")
 
+def _search_roots() -> List[Path]:
+    """Return portable list of candidate roots (no hardcoded absolute paths)."""
+    roots: List[Path] = []
+    seen = set()
+    for r in (PROJECT_ROOT, Path(__file__).resolve().parent, Path.cwd()):
+        try:
+            rp = r.resolve()
+        except Exception:
+            continue
+        if rp in seen or not rp.exists():
+            continue
+        seen.add(rp)
+        roots.append(rp)
+    return roots
+
 def _bootstrap_paths():
     """Recursively find critical modules (core, SAM3, Qwen) and fix sys.path."""
+    _add_to_sys_path(str(PROJECT_ROOT))
     _add_to_sys_path(os.getcwd())
-    
-    candidates = [
-        Path(__file__).resolve().parent,
-        Path(r"D:\Jefrin\BTr\batch_tracker_v001_starter"),
-        Path.cwd()
-    ]
-    
+
     found_core = False
-    
+
     print("DEBUG: Starting Path Bootstrap...")
-    
-    for root in candidates:
-        if not root.exists(): continue
-        
+
+    for root in _search_roots():
         # Core
         if not found_core:
             try:
@@ -70,9 +87,10 @@ def _bootstrap_paths():
                         found_core = True
                         break
             except Exception: pass
-            
+
     if not found_core:
         print("WARNING: Could not find 'core' package automatically.")
+    return PROJECT_ROOT
 
 PROJECT_ROOT = _bootstrap_paths()
 
@@ -102,11 +120,7 @@ def _load_tracker_direct():
     except Exception as e_pkg:
         pkg_err = str(e_pkg)
 
-    roots = [
-        Path(__file__).parent,
-        Path(os.getcwd()),
-        Path(r"D:\Jefrin\BTr\batch_tracker_v001_starter"), 
-    ]
+    roots = _search_roots()
 
     tracker_path: Path | None = None
     meta_path: Path | None = None
@@ -182,7 +196,7 @@ run_sam3_batch = None
 SAM3_IMPORT_ERROR = None
 
 def _load_sam3_direct():
-    roots = [Path(os.getcwd()), Path(__file__).parent, Path(r"D:\Jefrin\BTr\batch_tracker_v001_starter")]
+    roots = _search_roots()
     sam3_path = None
     for r in roots:
         if not r.exists(): continue
@@ -222,7 +236,7 @@ if SAM3_IMPORT_ERROR:
 # --- 2.4 Qwen2 Loader ---
 run_qwen2_batch = None
 def _load_qwen_robustly():
-    roots = [Path(r"D:\Jefrin\BTr\batch_tracker_v001_starter"), Path(__file__).parent]
+    roots = _search_roots()
     found = None
     for r in roots:
         if not r.exists(): continue
@@ -954,15 +968,15 @@ def build_ui():
                 gr.Markdown("## Setup")
                 # Modified Layout: Row with Textbox + Button for each path
                 with gr.Row():
-                    in_dir = gr.Textbox(label="Input Folder", placeholder=r"D:\Jefrin\BTr\IN", scale=5)
+                    in_dir = gr.Textbox(label="Input Folder", placeholder="Pick or paste the folder containing shots (mp4s)", scale=5)
                     btn_browse_in = gr.Button("📂", scale=1, min_width=1, elem_classes=["btn-icon","btn-ghost"])
-                
+
                 with gr.Row():
-                    out_dir = gr.Textbox(label="Output Folder", placeholder=r"D:\Jefrin\BTr\OUT", scale=5)
+                    out_dir = gr.Textbox(label="Output Folder", placeholder="Pick or paste the folder where results will be written", scale=5)
                     btn_browse_out = gr.Button("📂", scale=1, min_width=1, elem_classes=["btn-icon","btn-ghost"])
-                
+
                 with gr.Row():
-                    req_file = gr.Textbox(label="Client Requirements (Optional)", placeholder=r"D:\Jefrin\BTr\reqs.xlsx", scale=5)
+                    req_file = gr.Textbox(label="Client Requirements (Optional)", placeholder="Pick or paste a requirements file (xlsx/csv)", scale=5)
                     btn_browse_req = gr.Button("📄", scale=1, min_width=1, elem_classes=["btn-icon","btn-ghost"])
 
             with gr.Column(scale=2):
