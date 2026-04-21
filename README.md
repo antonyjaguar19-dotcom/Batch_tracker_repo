@@ -1,59 +1,109 @@
-# Batch Tracker Repo
+# Batch Tracker
 
-Batch Tracker is a Python-based Gradio application for running a unified, multi-step tracking workflow. It combines model-assisted scene analysis, mask generation, and batch tracking execution from a single UI.
+Batch Tracker is a Python + Gradio workflow app for video tracking pipelines. It brings multiple AI-assisted steps into one interface so you can go from scene analysis to tracking execution in a single run.
 
-## What’s in this repository
+## AI / Models used
 
-- `app.py` — main unified entrypoint with path bootstrapping and module loading.
-- `run_batch_tracker.py` — minimal launcher that starts the Gradio UI.
-- `install.py` — one-shot installer that creates a virtual environment, installs dependencies, and optionally downloads model weights.
-- `app/` — application modules for UI, tracking core logic, and utilities.
+This project is built around a combined workflow that references these components:
 
-## Quick start
+- **Qwen2 / LLaMA (via Ollama)** for scene/camera reasoning and JSON planning.
+- **SAM3** for mask generation/segmentation.
+- **CoTracker3** for batch point/object tracking.
 
-1. **Install dependencies**# Batch Tracker Repo
+> Note: Model weights are not fully stored in this repo by default. The installer can download required checkpoints when URLs are configured.
 
-Batch Tracker is a Python-based Gradio application for running a unified, multi-step tracking workflow. It combines model-assisted scene analysis, mask generation, and batch tracking execution from a single UI.
+## Repository layout
 
-## What’s in this repository
+- `app.py` — unified app entrypoint and runtime bootstrap.
+- `run_batch_tracker.py` — minimal launcher for the Gradio interface.
+- `install.py` — one-shot installer for environment setup + optional model downloads.
+- `requirements.txt` — Python dependency list for the app stack.
+- `app/` — UI, tracking logic, and helper modules.
+- `thirdparty/` — external code/assets such as CoTracker-related resources.
 
-- `app.py` — main unified entrypoint with path bootstrapping and module loading.
-- `run_batch_tracker.py` — minimal launcher that starts the Gradio UI.
-- `install.py` — one-shot installer that creates a virtual environment, installs dependencies, and optionally downloads model weights.
-- `app/` — application modules for UI, tracking core logic, and utilities.
+## Build from scratch
 
-## Quick start
+If you are starting from a fresh machine:
 
-1. **Install dependencies**
+### 1) Prerequisites
 
-   ```bash
-   python install.py
-   ```
+- Python **3.10+** recommended.
+- `git` installed.
+- (Recommended) NVIDIA GPU + CUDA-compatible driver for faster tracking.
+- Local **Ollama** server if using Qwen/LLaMA reasoning features.
 
-2. **Run the app**
+### 2) Clone
 
-   ```bash
-   python run_batch_tracker.py
-   ```
+```bash
+git clone <your-repo-url>
+cd Batch_tracker_repo
+```
 
-## Notes
+### 3) Install (recommended path)
 
-- The installer supports environment-variable toggles such as `BTR_SKIP_VENV`, `BTR_SKIP_TORCH`, and `BTR_SKIP_WEIGHTS`.
-- Weight download URLs can be configured with environment variables, including `BTR_SAM3_WEIGHTS_URL` and `BTR_COTRACKER_WEIGHTS_URL`.
-- The app defaults to Ollama at `http://localhost:11434` (override with `BTR_OLLAMA_URL`).
+Run the bundled installer:
 
-   ```bash
-   python install.py
-   ```
+```bash
+python install.py
+```
 
-2. **Run the app**
+The installer will:
 
-   ```bash
-   python run_batch_tracker.py
-   ```
+1. Create `.venv` (unless disabled).
+2. Upgrade `pip`.
+3. Install PyTorch + TorchVision from CUDA 12.1 index (unless disabled).
+4. Install `requirements.txt`.
+5. Download configured model weights.
 
-## Notes
+### 4) Run the app
 
-- The installer supports environment-variable toggles such as `BTR_SKIP_VENV`, `BTR_SKIP_TORCH`, and `BTR_SKIP_WEIGHTS`.
-- Weight download URLs can be configured with environment variables, including `BTR_SAM3_WEIGHTS_URL` and `BTR_COTRACKER_WEIGHTS_URL`.
-- The app defaults to Ollama at `http://localhost:11434` (override with `BTR_OLLAMA_URL`).
+```bash
+python run_batch_tracker.py
+```
+
+## Manual dependency install (advanced)
+
+If you prefer full manual control:
+
+```bash
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+## Dependency requirements
+
+From `requirements.txt`:
+
+- `numpy>=1.24.0`
+- `opencv-python>=4.8.0`
+- `gradio>=4.0.0`
+- `pandas>=2.0.0`
+- `matplotlib>=3.7.0`
+- `psutil>=5.9.0`
+
+Optional/commented dependencies may be needed depending on how your local SAM3/Ollama integrations are configured.
+
+## Environment variables
+
+Common runtime/install toggles:
+
+- `BTR_SKIP_VENV=1` — install into current interpreter.
+- `BTR_SKIP_TORCH=1` — skip PyTorch installation.
+- `BTR_SKIP_WEIGHTS=1` — skip model weight downloads.
+- `BTR_SAM3_WEIGHTS_URL` — URL for SAM3 checkpoint.
+- `BTR_COTRACKER_WEIGHTS_URL` — URL for CoTracker checkpoint.
+- `BTR_OLLAMA_URL` — Ollama endpoint (default: `http://localhost:11434`).
+
+## Quick start summary
+
+```bash
+python install.py
+python run_batch_tracker.py
+```
