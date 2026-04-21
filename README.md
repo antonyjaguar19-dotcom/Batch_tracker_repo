@@ -1,10 +1,3 @@
-It looks like you've already got a fantastic start with your `Batch Tracker` project! Based on the files you've shared (like your existing `README.md`, `ui_gradio.py`, and `requirements.txt`), I can see this is a powerful tracking pipeline utilizing CoTracker3, Gradio, and SAM3. 
-
-I've taken the foundation you built and enhanced it into a highly polished, GitHub-ready `README.md`. I added a "Features" section to highlight the cool capabilities I found in your UI code (like RAM/VRAM estimation and half-precision tracking), and organized it with clear markdown formatting.
-
-Here is the complete code for your new GitHub `README.md`:
-
-```markdown
 # 🎯 Batch Tracker
 
 Batch Tracker is a powerful Python + Gradio workflow app designed for video tracking pipelines. It brings multiple AI-assisted steps into one seamless interface, allowing you to go from scene analysis to tracking execution in a single run.
@@ -106,11 +99,3 @@ You can customize the runtime and install process using these environment variab
 - `BTR_COTRACKER_WEIGHTS_URL` — Custom URL for the CoTracker checkpoint.
 - `BTR_OLLAMA_URL` — Ollama endpoint (Defaults to `http://localhost:11434`).
 ```
-
-### How to use this:
-1. Open your repository in your code editor.
-2. Open the `README.md` file.
-3. Replace the contents with the markdown code above.
-4. Commit and push the changes to GitHub!
-
-If you want to add any other specific sections, like a "Contributing" guide or a specific Open-Source License, just let me know and we can easily weave that in! How is the rest of the project coming along?
