@@ -35,7 +35,7 @@ REM ("[Errno 10048] only one usage of each socket address"). Kills whatever is
 REM LISTENING on 8080 - on this single-user box that is always the old Batch Tracker.
 set "BTR_PORT=8080"
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":%BTR_PORT% " ^| findstr LISTENING') do (
-  echo Port %BTR_PORT% busy - stopping old instance (PID %%P) ...
+  echo Port %BTR_PORT% busy - stopping old instance PID %%P ...
   taskkill /F /PID %%P >nul 2>&1
 )
 
