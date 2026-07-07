@@ -13,8 +13,9 @@ pipeline/sam3/weights/
 *.onnx
 *.bin
 
-# Vendored CoTracker upstream repo (own git history, re-clone separately)
-pipeline/co-tracker-main/
+# Vendored TAPNext (google-deepmind/tapnet) upstream repo (own git history, re-clone separately)
+pipeline/tapnext-main/
+checkpoints/
 
 # ── Runtime output / generated ──
 *.log
@@ -25,7 +26,7 @@ overdrive_guide.json
 **/masks/
 **/masks_*/
 **/preview_*.png
-*__cotracker3_bidir.txt
+*__tapnext.txt
 
 # ── Python cruft ──
 __pycache__/

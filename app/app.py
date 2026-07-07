@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Unified Batch Tracker — Automated 5-Step Workflow
-Merges Qwen2/LLaMA Analysis, SAM3 Masking, and CoTracker Execution into one UI.
+Merges Qwen2/LLaMA Analysis, SAM3 Masking, and SynthEyes/TAPNext++ Execution into one UI.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ def _load_video_meta_only():
     return None
 
 def _ensure_tracker_loaded():
-    """Import the CoTracker/torch stack lazily (only when the cotracker fallback runs).
+    """Import the TAPNext++/torch stack lazily (only when the tapnext fallback runs).
     Torch/CUDA is kept OFF the boot path: initialising CUDA at UI startup can wedge the
     GPU display driver on some machines and hard-freeze Windows."""
     global probe_video_meta, BatchTrackerRunner, RunnerConfig, TRACKER_IMPORT_ERROR, _TRACKER_LOADED
@@ -531,9 +531,9 @@ class AppState:
     filter_query: str = ""
     motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
-    track_chunks: int = 0          # CoTracker temporal chunks: 0=auto (VRAM-sized), >=1 forces
+    track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     # --- Tracking backend selection + SynthEyes settings ---
-    track_backend: str = "syntheyes"   # "syntheyes" (default) | "cotracker" (fallback)
+    track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
     se_port: int = field(default_factory=lambda: int(os.environ.get("BTR_SE_PORT", "2222") or 2222))
     se_pin: str = field(default_factory=lambda: os.environ.get("BTR_SE_PIN", "listen") or "listen")
@@ -1076,8 +1076,8 @@ def _find_mask_dir(out_root, shot_name, mask_subdir):
     return None
 
 
-def _track_shots_cotracker(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist):
-    """Original CoTracker3 tracking path (fallback backend)."""
+def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist):
+    """TAPNext++ tracking path (Apache-2.0 GPU tracker, fallback backend)."""
     any_ran = False
     stopped = False
     for shot_name, data in state.shots_data.items():
@@ -1126,7 +1126,7 @@ def _track_shots_cotracker(in_root, out_root, shot_tasks_map, state, grid, seed_
             any_ran = True
             try:
                 stem = Path(filename).stem
-                out_base = f"{stem}__cotracker3_bidir.txt" if not output_tag else f"{stem}__{output_tag}__cotracker3_bidir.txt"
+                out_base = f"{stem}__tapnext.txt" if not output_tag else f"{stem}__{output_tag}__tapnext.txt"
                 summ, _ = compute_track_metrics(
                     os.path.join(str(out_root), out_base),
                     width=int(getattr(data, "width", 0) or 0), height=int(getattr(data, "height", 0) or 0),
@@ -1317,21 +1317,23 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                 logger(f"Warning: could not parse guide tasks: {e}")
 
         backend = str(getattr(state, "track_backend", "syntheyes") or "syntheyes").lower()
+        if backend in ("cotracker", "cotracker3"):
+            backend = "tapnext"   # legacy value -> new GPU tracker
         if backend == "syntheyes" and SynthEyesEngine is None:
-            logger(f"SynthEyes backend unavailable ({SYNTHEYES_IMPORT_ERROR}); falling back to CoTracker.")
-            backend = "cotracker"
+            logger(f"SynthEyes backend unavailable ({SYNTHEYES_IMPORT_ERROR}); falling back to TAPNext++.")
+            backend = "tapnext"
 
         if backend == "syntheyes":
             logger("Tracking backend: SynthEyes")
             _free_vram("before SynthEyes")  # release torch cache so SynthEyes can use the GPU
             any_ran, stopped = _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
         else:
-            logger("Tracking backend: CoTracker3")
+            logger("Tracking backend: TAPNext++")
             _ensure_tracker_loaded()
-            _free_vram("before CoTracker")
+            _free_vram("before TAPNext")
             if BatchTrackerRunner is None: raise ImportError(f"Tracker module missing. {TRACKER_IMPORT_ERROR}")
-            any_ran, stopped = _track_shots_cotracker(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist)
-            _free_vram("after CoTracker")
+            any_ran, stopped = _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist)
+            _free_vram("after TAPNext")
 
         if stopped: logger("Tracking halted.")
         elif not any_ran: logger("Nothing to track.")
@@ -1769,7 +1771,7 @@ TOOLTIP_JS = r'''
     "tip_scan": "Step 1: scan Input Folder, list shots, read resolution/frames, load any previous analysis.",
     "tip_analyze": "Step 2: run Qwen2 (describe shots) then LLaMA/Ollama (decide camera/object track strategy + mask prompts).",
     "tip_mask": "Step 4: run SAM3 to generate keep/ignore alpha masks from the include/exclude prompts.",
-    "tip_track": "Step 5: run CoTracker3 per shot, filter tracks against masks, export 3D Equalizer .txt.",
+    "tip_track": "Step 5: run the tracker (SynthEyes, or TAPNext++ fallback) per shot, filter tracks against masks, export 3D Equalizer .txt.",
     "tip_stop": "Request stop. Halts after the current shot/pass finishes (a tracking pass can't be cut mid-way).",
     "tip_scale": "Downscale factor for processing this shot. Lower = faster/less VRAM; coords still exported at full res.",
     "tip_things": "Objects Qwen2 detected in the selected shot. Check items, then add them to Include or Exclude.",

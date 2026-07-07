@@ -5,6 +5,30 @@ Newest first. Dates are absolute.
 
 ---
 
+## 2026-07-07
+
+### Replaced CoTracker3 with TAPNext++ as the secondary (GPU) tracking backend
+- **What**: removed all CoTracker3 components (`app/cotracker_engine.py`, vendored
+  `pipeline/co-tracker-main/`, `scaled_offline.pth`, `*__cotracker3_bidir.txt`) and replaced them
+  with **TAPNext++** (google-deepmind/tapnet) in new `app/tapnext_engine.py`. SynthEyes stays the
+  **primary** backend; TAPNext++ is the secondary GPU fallback (`track_backend` value `cotracker`
+  → `tapnext`; legacy value auto-migrates). Output files now `<shot>__tapnext.txt`. `TapNextEngine`
+  keeps the exact `track_grid`/`track_queries` interface, so `tracker_core.py` seeding / 4-pass merge /
+  SAM3 gating / filtering / 3DE export is unchanged.
+- **Why**: **CoTracker3 is CC-BY-NC 4.0 (non-commercial)** — a blocker for paid VFX work. TAPNext++
+  is **Apache-2.0** (commercial OK), ships a native PyTorch checkpoint (`tapnextpp_ckpt.pt`), and is
+  stronger for matchmove (40× longer stable tracks, tracks through occlusion, re-detection).
+- **How / gotchas**: TAPNext++ is a **fixed 256×256** model and **causal/streaming** (next-token).
+  The wrapper absorbs both: resize frames to 256² in and rescale predicted coords back to the caller's
+  frame space; seed queries at block frame 0 then feed one frame at a time carrying the recurrent
+  `state`. `tracker_core` already reverses frames for BWD/MID passes, so a single forward stream covers
+  every pass. TAPNext has no grid mode → `track_grid` synthesizes a uniform grid gated by the SAM3
+  inclusion mask. Checkpoint resolver: `pipeline/tapnext-main/checkpoints/` → `<repo>/checkpoints/` →
+  env `BTR_TAPNEXT_CKPT`. **Open verify item**: 256² on 4K plates — confirm sub-pixel precision is
+  acceptable on the GPU box, and confirm video normalization ([0,1] RGB per the torch demo).
+
+---
+
 ## 2026-07-06
 
 ### SynthEyes 2026 automation: SyPy3 API is broken → drive it via Win32 UI + Sizzle

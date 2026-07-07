@@ -506,17 +506,17 @@ with ui.row().classes("w-full no-wrap"):
             seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
             ui.label("Min Seed Distance (px)")
             seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
-            ui.label("Track chunks (CoTracker fallback only · 0 = Auto)")
+            ui.label("Track chunks (TAPNext++ fallback only · 0 = Auto)")
             track_chunks = ui.number(value=0, min=0, max=16, precision=0).classes("w-full")
             track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
-            track_chunks.tooltip("CoTracker fallback only. Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
+            track_chunks.tooltip("TAPNext++ fallback only. Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
                                  "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
 
             ui.separator()
             ui.label("Tracking backend")
-            backend_sel = ui.select(["syntheyes", "cotracker"], value=state.track_backend,
+            backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
                                     on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")).classes("w-full")
-            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). CoTracker = legacy GPU tracker fallback.")
+            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback.")
 
             with ui.row().classes("w-full no-wrap items-end gap-1"):
                 se_exe = ui.input("SynthEyes .exe", value=state.syntheyes_exe,
