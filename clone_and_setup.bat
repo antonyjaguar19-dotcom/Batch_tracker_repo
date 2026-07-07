@@ -6,7 +6,7 @@ REM
 REM  Run this .bat on a bare machine. It:
 REM    1. git clone the repo
 REM    2. bootstraps the portable Python 3.11.9 runtime + pip installs (cu121)
-REM    3. downloads the model weights (Qwen2.5-VL, SAM3, CoTracker3)
+REM    3. downloads the model weights (Qwen2.5-VL, SAM3, TAPNext++)
 REM    4. pulls the Ollama LLM (if Ollama is installed)
 REM
 REM  The weights + runtime are NOT in git (too big) - this script fetches them.
@@ -88,8 +88,14 @@ REM  NOTE: we use the huggingface_hub Python API, NOT the `hf` CLI - the CLI
 REM  imports the `venv` stdlib module, which the embeddable interpreter omits.
 echo [3/5] downloading model weights ...
 
-echo       - CoTracker3 checkpoint (public)
-"%PY%" -c "from huggingface_hub import hf_hub_download as d; d(repo_id='facebook/cotracker3', filename='scaled_offline.pth', local_dir=r'%ROOT%\pipeline\co-tracker-main\checkpoints')" || goto :fail
+echo       - TAPNext++ repo (google-deepmind/tapnet, Apache-2.0) + checkpoint (public)
+if exist "%ROOT%\pipeline\tapnext-main\.git" (
+  git -C "%ROOT%\pipeline\tapnext-main" pull --ff-only || echo [warn] tapnet pull failed, using existing checkout.
+) else (
+  git clone https://github.com/google-deepmind/tapnet "%ROOT%\pipeline\tapnext-main" || goto :fail
+)
+mkdir "%ROOT%\pipeline\tapnext-main\checkpoints" 2>nul
+curl -L -o "%ROOT%\pipeline\tapnext-main\checkpoints\tapnextpp_ckpt.pt" "https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt" || goto :fail
 
 echo       - Qwen2.5-VL  (%QWEN_REPO%, large)
 for %%R in ("%QWEN_REPO%") do set "QWEN_NAME=%%~nxR"

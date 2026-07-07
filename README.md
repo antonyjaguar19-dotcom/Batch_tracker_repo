@@ -10,7 +10,8 @@
 ![Qwen2.5-VL](https://img.shields.io/badge/Qwen2.5--VL-VLM-1E90FF)
 ![LLaMA 3.1](https://img.shields.io/badge/LLaMA_3.1-Ollama-8A2BE2)
 ![SAM3](https://img.shields.io/badge/SAM3-masks-FF8C00)
-![CoTracker3](https://img.shields.io/badge/CoTracker3-tracking-008080)
+![SynthEyes](https://img.shields.io/badge/SynthEyes-tracking-008080)
+![TAPNext++](https://img.shields.io/badge/TAPNext++-tracking-purple)
 
 Windows/CUDA VFX matchmove pipeline. Turns raw shot footage into 2D point tracks
 importable into 3D Equalizer, by chaining four AI/CV stages:
@@ -21,7 +22,8 @@ importable into 3D Equalizer, by chaining four AI/CV stages:
 2. **LLaMA 3.1 (Ollama) + deterministic heuristics** — decide per-shot camera/object
    track strategy and the SAM3 include/exclude mask prompts.
 3. **SAM3** — turns those prompts into per-frame keep/ignore alpha masks.
-4. **CoTracker3** — tracks points per shot (4-pass), filters against the masks, and
+4. **Tracking** — SynthEyes (primary, over SyPy3) or **TAPNext++** (secondary GPU
+   fallback, Apache-2.0) tracks points per shot, filters against the masks, and
    exports 3D Equalizer `.txt` tracks.
 
 ## Fresh-machine setup (clone + weights + runtime)
@@ -29,7 +31,7 @@ importable into 3D Equalizer, by chaining four AI/CV stages:
 The weights and the portable Python runtime are **not in git** (too big). On a bare
 Windows box, download and double-click **`clone_and_setup.bat`** — it clones the repo,
 bootstraps `runtime/python311/`, `pip install`s the cu121 deps, and downloads the model
-weights (Qwen2.5-VL, SAM3, CoTracker3). Prereqs it does *not* install: **Git**, an NVIDIA
+weights (Qwen2.5-VL, SAM3, TAPNext++). Prereqs it does *not* install: **Git**, an NVIDIA
 driver new enough for CUDA 12.1, and **Ollama** (optional, for the LLaMA stage). SAM3 is a
 **gated** HF repo — the script prompts for a Hugging Face token with access to `facebook/sam3`.
 
@@ -61,7 +63,8 @@ Workflow in the UI:
 5. **Generate masks** — SAM3 makes the alpha masks (honors the frame range). If masks
    already exist for the selected shots, you're asked to **Reuse** (skip) or
    **Regenerate** (overwrite).
-6. **Start tracking** — CoTracker3 exports `<shot>__cotracker3_bidir.txt`. A shot that
+6. **Start tracking** — SynthEyes exports `<shot>__syntheyes.txt`; the TAPNext++ fallback
+   exports `<shot>__tapnext.txt`. A shot that
    yields 0 tracks logs the reason (no features / filtered out / mask-gated / too short).
    Long / high-res shots are auto-split into chunks to fit GPU memory (see below).
 
@@ -75,13 +78,13 @@ batch_tracker_v001_starter/
   app/
     app_nicegui.py          NiceGUI UI entry
     app.py                  shared backend (workers, loaders, state)
-    tracker_core.py  cotracker_engine.py  export_3de.py
+    tracker_core.py  tapnext_engine.py  syntheyes_engine.py  export_3de.py
     video_io.py  video_meta.py  reformat_plate_core.py  __init__.py
   pipeline/
     qwen/                   run_qwen2_shot_describer.py, qwen2_shot_describer_core.py, models/
     llama/core/             bridge, heuristics, io_parsers, ollama_backend
     sam3/                   sam3_runner.py, weights/
-    co-tracker-main/        vendored CoTracker3 + checkpoints/
+    tapnext-main/           vendored google-deepmind/tapnet + checkpoints/
   runtime/                  project-local Python + caches (not committed)
 ```
 
@@ -93,8 +96,9 @@ batch_tracker_v001_starter/
   `Qwen2.5-VL-7B-Instruct-AWQ` → `Qwen2.5-VL-7B-Instruct` → `Qwen2.5-VL-3B-Instruct`
   (override with `QWEN2_MODEL_DIR`). 7B is loaded in **int4** (bitsandbytes NF4), ~5.5 GB VRAM.
 - **SAM3 weights**: `pipeline/sam3/weights/sam3.pt` (or set `BTR_SAM3_WEIGHTS`).
-- **CoTracker checkpoint**: `scaled_offline.pth` under
-  `pipeline/co-tracker-main/checkpoints/` (or `<repo>/checkpoints/`).
+- **TAPNext++ checkpoint**: `tapnextpp_ckpt.pt` under
+  `pipeline/tapnext-main/checkpoints/` (or `<repo>/checkpoints/`, or set `BTR_TAPNEXT_CKPT`).
+  Apache-2.0 — commercial use OK.
 - **Ollama** running locally with `llama3.1:8b` (default `http://localhost:11434`,
   override with `BTR_OLLAMA_URL`). Only used for ambiguous client intent.
 
@@ -103,7 +107,7 @@ batch_tracker_v001_starter/
 - **Shot selection**: per-row checkboxes; active shots highlighted; search filter;
   "X of N selected" count; Mask/Track abort if nothing is selected.
 - **Per-shot frame range** (1-based, `0` = full). Honored by **both** SAM3 masking and
-  CoTracker tracking; exported track frame numbers stay aligned to the original shot.
+  the tracker; exported track frame numbers stay aligned to the original shot.
   Restored from the previous run on Scan.
 - **Reuse existing masks**: at Mask, if the selected shots already have masks, choose
   Reuse (skip) or Regenerate (overwrite).
@@ -117,7 +121,7 @@ batch_tracker_v001_starter/
   (**CV motion backstop**) / env `BTR_MOTION_BACKSTOP=0`.
 - **0-track diagnostics**: a shot that exports nothing logs which stage dropped the
   tracks (seeding / post-filter / mask gating / too-short).
-- **VRAM/RAM-safe tracking** (long / high-res shots): CoTracker tracks the shot in
+- **VRAM/RAM-safe tracking** (long / high-res shots, TAPNext++ path): tracks the shot in
   **overlapping chunks whose track IDs are chained across seams** (tracks stay continuous).
   Chunk count is auto-sized from free VRAM (override via **Settings → Track chunks**, `0`=auto);
   on a GPU OOM the chunk auto-downscales and retries; if the whole clip is too big for host RAM,

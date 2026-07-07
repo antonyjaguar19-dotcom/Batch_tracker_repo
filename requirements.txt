@@ -4,7 +4,7 @@
 # Pins are exact (frozen from the working runtime/python311 interpreter).
 #
 # This file covers EVERY pip dependency from the interpreter up to the AI models
-# (torch -> transformers/bitsandbytes -> ultralytics/SAM3 -> CoTracker -> NiceGUI).
+# (torch -> transformers/bitsandbytes -> ultralytics/SAM3 -> TAPNext++ -> NiceGUI).
 #
 # -----------------------------------------------------------------------------
 # NON-pip prerequisites (install these first, in order):
@@ -18,8 +18,9 @@
 # MODEL WEIGHTS (offline by design - NOT pip-installable, fetch manually):
 #   - Qwen2.5-VL  -> pipeline/qwen/models/Qwen2.5-VL-7B-Instruct-AWQ  (or 7B / 3B)
 #   - SAM3        -> pipeline/sam3/weights/sam3.pt        (gated: facebook/sam3 on HF)
-#   - CoTracker3  -> pipeline/co-tracker-main/checkpoints/scaled_offline.pth
-#                    ( https://huggingface.co/facebook/cotracker3 )
+#   - TAPNext++   -> pipeline/tapnext-main/checkpoints/tapnextpp_ckpt.pt
+#                    ( repo: github.com/google-deepmind/tapnet, Apache-2.0;
+#                      ckpt: https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt )
 #
 # INSTALL (one command - the extra-index line lets pip fetch the cu121 torch wheels):
 #   python -m pip install --upgrade pip

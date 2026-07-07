@@ -13,7 +13,7 @@ import cv2  # type: ignore
 import torch # Need torch for empty_cache
 
 from app.video_io import read_video_frames_bgr_scaled, FrameSource, estimate_clip_bytes
-from app.cotracker_engine import CoTracker3Engine
+from app.tapnext_engine import TapNextEngine
 from app.export_3de import write_tracks_txt
 
 StatusCB = Optional[Callable[[str], None]]
@@ -414,7 +414,7 @@ class BatchTrackerRunner:
 
     def _process_single_pass(
         self,
-        engine: CoTracker3Engine,
+        engine: TapNextEngine,
         frames: np.ndarray,
         shot_name: str,
         Ws: int,
@@ -492,7 +492,7 @@ class BatchTrackerRunner:
             y_all = (xy_raw[:, :, 1].astype(np.float32) * float(inv))
             if self.cfg.flip_y_for_3de and H0 > 0: y_all = (float(H0 - 1) - y_all)
 
-            # Pre-mask any immediate NaNs/Infs that CoTracker leaked
+            # Pre-mask any immediate NaNs/Infs that the tracker leaked
             vis_bool = vis_raw.astype(bool) & ~np.isnan(x_all) & ~np.isnan(y_all) & ~np.isinf(x_all) & ~np.isinf(y_all)
 
             keep = np.ones((N,), dtype=bool)
@@ -739,8 +739,8 @@ class BatchTrackerRunner:
         )
 
         tool_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self._status("Loading CoTracker3 (offline) [FP16 mode]...")
-        engine = CoTracker3Engine(tool_root=tool_root, device="cuda")
+        self._status("Loading TAPNext++ (256px, streaming)...")
+        engine = TapNextEngine(tool_root=tool_root, device="cuda")
 
         for i, fn in enumerate(vids, start=1):
             if self._stop.is_set(): break
@@ -888,7 +888,7 @@ class BatchTrackerRunner:
                                               f"after_gate={diag_after_gate} short={diag_short})")
 
                 tag = (self.cfg.output_tag or '').strip()
-                base = f"{shot}__cotracker3_bidir.txt" if not tag else f"{shot}__{tag}__cotracker3_bidir.txt"
+                base = f"{shot}__tapnext.txt" if not tag else f"{shot}__{tag}__tapnext.txt"
                 out_txt = os.path.join(self.cfg.output_dir, base)
                 write_tracks_txt(out_txt, final_tracks_out, end_frame=T)
 
