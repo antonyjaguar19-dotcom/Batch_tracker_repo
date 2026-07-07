@@ -1114,7 +1114,12 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             logger(f"Tracking: {shot_name} | {task_id} | {mode.upper()}")
             cfg = RunnerConfig(
                 input_dir=str(video_dir), output_dir=str(out_root), mask_root_dir=str(out_root),
-                mask_mode=mode, mask_polarity="auto", mask_subdir=mask_subdir, output_tag=output_tag,
+                # SAM3 contract: white=keep/track, black=ignore. Derive polarity from that + mode
+                # (inside seeds the white keep-region; outside seeds background, excluding black
+                # movers). Beats "auto" pixel-majority guessing, which flips per-frame and unions to
+                # a 100% exclude region on ~50/50 masks (movers filling half the frame) -> 0 seeds.
+                mask_mode=mode, mask_polarity=("white" if mode == "inside" else "black"),
+                mask_subdir=mask_subdir, output_tag=output_tag,
                 grid_size=int(grid), seeding_mode="features",
                 max_tracks=int(seed_count), min_feature_dist=int(seed_min_dist),
                 flip_y_for_3de=True, selected_files=[filename], selected_scales={filename: float(data.scale.strip('%'))/100.0 if '%' in data.scale else 1.0},

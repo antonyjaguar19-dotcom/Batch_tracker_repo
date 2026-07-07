@@ -232,8 +232,8 @@ class BatchTrackerRunner:
             return masks_dir, f"mask_dir={masks_dir}"
         return shot_dir, f"mask_dir={shot_dir} (no 'masks' subfolder)"
 
-    def _mask_region_from_gray(self, gray: np.ndarray) -> np.ndarray:
-        pol = (self.cfg.mask_polarity or "auto").strip().lower()
+    def _mask_region_from_gray(self, gray: np.ndarray, pol: str | None = None) -> np.ndarray:
+        pol = (pol if pol is not None else (self.cfg.mask_polarity or "auto")).strip().lower()
         white_region = gray >= 128
         if pol == "white":
             return white_region
@@ -243,6 +243,26 @@ class BatchTrackerRunner:
         if pct_white > 0.5:
             return ~white_region
         return white_region
+
+    def _resolve_auto_polarity(self, sample_paths: list[str], target_w: int, target_h: int) -> str:
+        """Decide 'white'/'black' ONCE for the whole clip when polarity=='auto'.
+
+        Per-mask auto flips near 50% white and, unioned across frames, blows the exclude
+        region up to 100% (-> zero seeds). Deciding once from the clip-wide mean keeps the
+        polarity consistent so the union stays meaningful.
+        """
+        whites = []
+        for p in sample_paths:
+            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            if img.ndim == 3:
+                img = img.squeeze()
+            whites.append(float(np.mean(img >= 128)))
+        if not whites:
+            return "white"
+        # Mirror the original per-frame rule, but on the clip-wide mean (majority = background).
+        return "black" if float(np.mean(whites)) > 0.5 else "white"
 
     def _list_mask_files(self, shot_name: str) -> tuple[list[str], str]:
         mask_dir, where = self._resolve_mask_dir_for_shot(shot_name)
@@ -263,27 +283,31 @@ class BatchTrackerRunner:
         step = max(1, int(np.ceil(len(mask_paths) / float(max_samples))))
         sample_paths = mask_paths[::step]
 
+        # Resolve 'auto' to a single polarity for the whole clip (never flip per-frame).
+        pol = (self.cfg.mask_polarity or "auto").strip().lower()
+        eff_pol = self._resolve_auto_polarity(sample_paths, target_w, target_h) if pol == "auto" else pol
+
         union_region = np.zeros((target_h, target_w), dtype=bool)
         used = 0
         for p in sample_paths:
             img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 continue
-            
+
             if img.ndim == 3:
                 img = img.squeeze()
 
             if img.shape[1] != target_w or img.shape[0] != target_h:
                 img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-            
+
             if img.ndim == 3:
                 img = img.squeeze()
 
-            union_region |= self._mask_region_from_gray(img)
+            union_region |= self._mask_region_from_gray(img, pol=eff_pol)
             used += 1
 
         pct = float(np.mean(union_region)) * 100.0
-        info = f"{where} | masks={len(mask_paths)} sampled={used} union_mask={pct:.1f}% polarity={self.cfg.mask_polarity}"
+        info = f"{where} | masks={len(mask_paths)} sampled={used} union_mask={pct:.1f}% polarity={self.cfg.mask_polarity}->{eff_pol}"
         return union_region, info, len(mask_paths)
 
     def _make_seed_inclusion_mask(self, shot_name: str, Ws: int, Hs: int) -> tuple[np.ndarray | None, str, int]:
