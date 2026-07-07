@@ -1,5 +1,17 @@
 # Batch Tracker
 
+![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11.9-3776AB?logo=python&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-12.1-76B900?logo=nvidia&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-EE4C2C?logo=pytorch&logoColor=white)
+![last commit](https://img.shields.io/github/last-commit/antonyjaguar19-dotcom/Batch_tracker_repo)
+![repo size](https://img.shields.io/github/repo-size/antonyjaguar19-dotcom/Batch_tracker_repo)
+
+![Qwen2.5-VL](https://img.shields.io/badge/Qwen2.5--VL-VLM-1E90FF)
+![LLaMA 3.1](https://img.shields.io/badge/LLaMA_3.1-Ollama-8A2BE2)
+![SAM3](https://img.shields.io/badge/SAM3-masks-FF8C00)
+![CoTracker3](https://img.shields.io/badge/CoTracker3-tracking-008080)
+
 Windows/CUDA VFX matchmove pipeline. Turns raw shot footage into 2D point tracks
 importable into 3D Equalizer, by chaining four AI/CV stages:
 
@@ -12,11 +24,19 @@ importable into 3D Equalizer, by chaining four AI/CV stages:
 4. **CoTracker3** — tracks points per shot (4-pass), filters against the masks, and
    exports 3D Equalizer `.txt` tracks.
 
+## Fresh-machine setup (clone + weights + runtime)
+
+The weights and the portable Python runtime are **not in git** (too big). On a bare
+Windows box, download and double-click **`clone_and_setup.bat`** — it clones the repo,
+bootstraps `runtime/python311/`, `pip install`s the cu121 deps, and downloads the model
+weights (Qwen2.5-VL, SAM3, CoTracker3). Prereqs it does *not* install: **Git**, an NVIDIA
+driver new enough for CUDA 12.1, and **Ollama** (optional, for the LLaMA stage). SAM3 is a
+**gated** HF repo — the script prompts for a Hugging Face token with access to `facebook/sam3`.
+
 ## Running it
 
-Double-click **`launch_nicegui.bat`** (repo root). It uses the project-local Python
-interpreter, keeps all caches/temp inside the repo, and opens the NiceGUI app at
-http://localhost:8080.
+Double-click **`app\BotBatchTracker.bat`**. It uses the project-local Python interpreter,
+keeps all caches/temp inside the repo, and opens the NiceGUI app at http://localhost:8080.
 
 Workflow in the UI:
 
