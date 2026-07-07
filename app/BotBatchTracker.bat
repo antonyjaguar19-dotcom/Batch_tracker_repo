@@ -30,6 +30,15 @@ REM set "BTR_TDE4_EXE=C:\Program Files\3DE4\bin\3DE4.exe"
 REM set "BTR_SE_PORT=2222"
 REM set "BTR_SE_PIN=listen"
 
+REM Free the UI port first so a stale/duplicate instance never blocks this launch
+REM ("[Errno 10048] only one usage of each socket address"). Kills whatever is
+REM LISTENING on 8080 - on this single-user box that is always the old Batch Tracker.
+set "BTR_PORT=8080"
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":%BTR_PORT% " ^| findstr LISTENING') do (
+  echo Port %BTR_PORT% busy - stopping old instance (PID %%P) ...
+  taskkill /F /PID %%P >nul 2>&1
+)
+
 if exist "%PY%" (
   echo Using python: "%PY%"
   "%PY%" "%HERE%app\app_nicegui.py"
