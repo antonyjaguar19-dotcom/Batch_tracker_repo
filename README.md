@@ -63,10 +63,11 @@ Workflow in the UI:
 5. **Generate masks** — SAM3 makes the alpha masks (honors the frame range). If masks
    already exist for the selected shots, you're asked to **Reuse** (skip) or
    **Regenerate** (overwrite).
-6. **Start tracking** — SynthEyes exports `<shot>__syntheyes.txt`; the TAPNext++ fallback
-   exports `<shot>__tapnext.txt`. A shot that
-   yields 0 tracks logs the reason (no features / filtered out / mask-gated / too short).
-   Long / high-res shots are auto-split into chunks to fit GPU memory (see below).
+6. **Start tracking** — pick the backend under **Settings → Tracking backend**
+   (`syntheyes` default, `tapnext` fallback). SynthEyes exports `<shot>__syntheyes.txt`;
+   the TAPNext++ fallback exports `<shot>__tapnext.txt`. A shot that yields 0 tracks logs
+   the reason (no features / filtered out / mask-gated / too short). On the TAPNext++ path,
+   long / high-res shots are auto-split into chunks to fit GPU memory (see below).
 
 ## Layout
 
@@ -102,6 +103,21 @@ batch_tracker_v001_starter/
 - **Ollama** running locally with `llama3.1:8b` (default `http://localhost:11434`,
   override with `BTR_OLLAMA_URL`). Only used for ambiguous client intent.
 
+## Tracking backends
+
+Two interchangeable tracking backends, selected in the UI (**Settings → Tracking backend**)
+or `AppState.track_backend`:
+
+- **SynthEyes** (default) — drives a local SynthEyes instance over the SyPy3 socket +
+  Win32 UI automation; SAM3 masks applied as a Python post-filter. Needs a SynthEyes install
+  (commercial app). Output: `<shot>__syntheyes.txt`.
+- **TAPNext++** (fallback) — GPU neural point tracker (`google-deepmind/tapnet`, **Apache-2.0,
+  commercial-safe**). Fixed 256×256 causal model; the engine wrapper handles resize + coord
+  rescale + streaming internally. 4-pass (fwd/bwd/mid) + SAM3 mask gating + chunked OOM-safe
+  path. Output: `<shot>__tapnext.txt`. Falls back automatically if SynthEyes is unavailable.
+
+Both export classic 3D Equalizer 2D-track ASCII, frame numbers aligned to the original shot.
+
 ## Key features
 
 - **Shot selection**: per-row checkboxes; active shots highlighted; search filter;
@@ -133,6 +149,7 @@ batch_tracker_v001_starter/
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `BTR_SAM3_WEIGHTS` | SAM3 `.pt` path | `<repo>/pipeline/sam3/weights/sam3.pt` |
+| `BTR_TAPNEXT_CKPT` | TAPNext++ checkpoint `.pt` path | (auto-resolve under `pipeline/tapnext-main/checkpoints/`) |
 | `BTR_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
 | `QWEN2_MODEL_DIR` | Force a specific Qwen model folder | (auto-resolve under `pipeline/qwen/models/`) |
 | `BTR_MOTION_BACKSTOP` | `0` disables the CV motion mask | `1` |
