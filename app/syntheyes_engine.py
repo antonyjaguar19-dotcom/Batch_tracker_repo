@@ -32,10 +32,17 @@ import glob
 import site
 import sysconfig
 import ctypes
+from ctypes import wintypes
 import subprocess
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".exr", ".png", ".tif", ".tiff")
 MASK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr")
+
+# Win32 message constants for PostMessage button clicks (blip/peel on 2026.2.4679,
+# where the SyPy3 ByID().ClickAndWait() dispatch silently no-ops).
+_WM_LBUTTONDOWN = 0x0201
+_WM_LBUTTONUP = 0x0202
+_MK_LBUTTON = 0x0001
 
 
 # ============================================================
@@ -243,6 +250,242 @@ class SynthEyesEngine:
                     time.sleep(0.01)
         except Exception as e:
             self.log(f"   WARNING: Hardware typing failed: {e}")
+
+    # ------ Win32 panel-button clicks (bypass the broken SyPy3 dispatch) ------
+    # On SynthEyes 2026.2.4679 the SyPy3 return-value protocol is broken: blip/peel via
+    # hlev.Main().ByID(ActionID(...)).ClickAndWait() returns instantly WITHOUT running (log
+    # shows Blip+Peel "done" in the same second -> ~1 tracker). SynthEyes panel buttons are
+    # real Win32 child windows of class "Butt"; PostMessage(WM_LBUTTONDOWN/UP) fires them for
+    # real, even when the window is backgrounded (no foreground focus needed).
+
+    def _syntheyes_top_windows(self):
+        """All visible top-level windows owned by the SynthEyes process (main window +
+        docked control panels are separate HWNDs; the blip/peel buttons live on a panel,
+        NOT the main toolbar, so we must search every one)."""
+        try:
+            import psutil
+        except ImportError:
+            return []
+        pids = {p.info["pid"] for p in psutil.process_iter(["name", "pid"])
+                if "syntheyes" in (p.info["name"] or "").lower()}
+        if not pids:
+            return []
+        user32 = ctypes.windll.user32
+        found = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lp):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumProc(_cb), 0)
+        return found
+
+    def _enum_butt_buttons(self, main_hwnd):
+        """[(hwnd, text, (l,t,r,b)), ...] for every 'Butt' descendant of main_hwnd."""
+        user32 = ctypes.windll.user32
+        out = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lp):
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value == "Butt":
+                txt = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, txt, 256)
+                r = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                out.append((hwnd, txt.value, (r.left, r.top, r.right, r.bottom)))
+            return True
+
+        user32.EnumChildWindows(main_hwnd, EnumProc(_cb), 0)
+        return out
+
+    def _win32_click_button(self, label, variants, settle=0.5):
+        """Click a Features-room panel button by its text via PostMessage. Returns bool.
+
+        Searches Butt children across ALL of SynthEyes' top-level windows (the panel
+        buttons are not on the main window's toolbar).
+        """
+        tops = self._syntheyes_top_windows()
+        if not tops:
+            self.log(f"   WARNING: SynthEyes windows not found (Win32 {label})")
+            return False
+        buttons = []
+        for w in tops:
+            buttons.extend(self._enum_butt_buttons(w))
+        norm = lambda s: "".join((s or "").lower().split())
+        wants = {norm(v) for v in variants}
+        match = next((b for b in buttons if norm(b[1]) in wants), None)
+        if match is None:
+            named = sorted({b[1] for b in buttons if b[1]})
+            self.log(f"   WARNING: Win32 button '{label}' not found among {len(buttons)} "
+                     f"Butt children across {len(tops)} windows. Labels: {named}")
+            self._dump_all_children()
+            return False
+        hwnd, text, (l, t, r, b) = match
+        cx, cy = (r - l) // 2, (b - t) // 2          # center in the button's client space
+        lp = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+        user32 = ctypes.windll.user32
+        user32.PostMessageW(hwnd, _WM_LBUTTONDOWN, _MK_LBUTTON, lp)
+        time.sleep(0.05)
+        user32.PostMessageW(hwnd, _WM_LBUTTONUP, 0, lp)
+        self.log(f"   OK  Win32 click '{text}'")
+        time.sleep(settle)
+        return True
+
+    def _interruptible_sleep(self, seconds):
+        """Sleep in 0.5s steps, honoring a stop request."""
+        end = time.time() + max(0.0, float(seconds))
+        while time.time() < end:
+            if getattr(self, "_stop_requested", False):
+                return False
+            time.sleep(min(0.5, end - time.time()))
+        return True
+
+    def _bring_foreground(self):
+        """Show + foreground the SynthEyes main window so the Features panel actually
+        paints and its blip/peel child controls get instantiated (they don't exist while
+        the window is backgrounded). Uses the alt-key trick to defeat the Win32
+        foreground lock, then gives it a moment to repaint."""
+        tops = self._syntheyes_top_windows()
+        if not tops:
+            return
+        user32 = ctypes.windll.user32
+
+        def _area(h):
+            r = wintypes.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            return (r.right - r.left) * (r.bottom - r.top)
+
+        main = max(tops, key=_area)
+        SW_RESTORE = 9
+        try:
+            user32.ShowWindow(main, SW_RESTORE)
+            user32.keybd_event(0x12, 0, 0, 0)          # ALT down (unlock SetForegroundWindow)
+            user32.SetForegroundWindow(main)
+            user32.keybd_event(0x12, 0, 0x0002, 0)     # ALT up
+            user32.BringWindowToTop(main)
+        except Exception as e:
+            self.log(f"   (foreground nudge failed: {e})")
+        time.sleep(0.8)
+        try:
+            self.hlev.Redraw()
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+    def _dump_all_children(self):
+        """One-time full window-tree dump (all top windows, child class -> texts) to locate
+        where the blip/peel controls live when text-matching fails."""
+        if getattr(self, "_tree_dumped", False):
+            return
+        self._tree_dumped = True
+        user32 = ctypes.windll.user32
+        for wi, top in enumerate(self._syntheyes_top_windows()):
+            cb = ctypes.create_unicode_buffer(64); user32.GetClassNameW(top, cb, 64)
+            tb = ctypes.create_unicode_buffer(128); user32.GetWindowTextW(top, tb, 128)
+            self.log(f"   [win{wi}] class={cb.value} text='{tb.value}'")
+            classes = {}
+            EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+            def _cb(h, _l):
+                c = ctypes.create_unicode_buffer(64); user32.GetClassNameW(h, c, 64)
+                t = ctypes.create_unicode_buffer(64); user32.GetWindowTextW(h, t, 64)
+                classes.setdefault(c.value, []).append(t.value)
+                return True
+
+            user32.EnumChildWindows(top, EnumProc(_cb), 0)
+            for cls, texts in sorted(classes.items()):
+                named = [x for x in texts if x][:16]
+                self.log(f"       {cls} x{len(texts)} {named}")
+
+    def _winrect(self, hwnd):
+        r = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return r
+
+    def _find_child_by_class(self, parent, cls_name):
+        user32 = ctypes.windll.user32
+        out = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(h, _l):
+            c = ctypes.create_unicode_buffer(64); user32.GetClassNameW(h, c, 64)
+            if c.value == cls_name:
+                r = wintypes.RECT(); user32.GetWindowRect(h, ctypes.byref(r))
+                out.append((h, (r.left, r.top, r.right, r.bottom)))
+            return True
+
+        user32.EnumChildWindows(parent, EnumProc(_cb), 0)
+        return out
+
+    def _click_features_tab(self):
+        """Reach the Features room by sweep-clicking the TopTabber room-selector until the
+        blip button appears (SetRoom is dead on 2026.2.4679, and TopTabber is a custom
+        control with no per-tab child window, so we hit-test it by PostMessage). Self-finds
+        the Features tab - no hardcoded pixel."""
+        tops = self._syntheyes_top_windows()
+        if not tops:
+            return False
+        main = max(tops, key=lambda h: (lambda r: (r.right - r.left) * (r.bottom - r.top))(self._winrect(h)))
+        tabbers = self._find_child_by_class(main, "TopTabber")
+        if not tabbers:
+            self.log("   WARNING: TopTabber room-selector not found")
+            return False
+        thwnd, (l, t, r, b) = tabbers[0]
+        w, h = r - l, b - t
+        self.log(f"   TopTabber found: {w}x{h} px - sweeping for Features tab")
+        user32 = ctypes.windll.user32
+        y = h // 2
+        step = max(20, w // 30)
+        x = step // 2
+        while x < w:
+            lp = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+            user32.PostMessageW(thwnd, _WM_LBUTTONDOWN, _MK_LBUTTON, lp)
+            time.sleep(0.03)
+            user32.PostMessageW(thwnd, _WM_LBUTTONUP, 0, lp)
+            time.sleep(0.2)
+            try:
+                self.hlev.Redraw()
+            except Exception:
+                pass
+            time.sleep(0.15)
+            if self._features_blip_button_present():
+                self.log(f"   OK  Features room reached via TopTabber click at x={x}")
+                return True
+            x += step
+        self.log("   WARNING: swept the whole TopTabber, Features room not reached")
+        return False
+
+    def _features_blip_button_present(self):
+        """True if the Features-room 'Blips all frames' Butt child currently exists."""
+        for w in self._syntheyes_top_windows():
+            for _h, txt, _r in self._enum_butt_buttons(w):
+                if "".join((txt or "").lower().split()) in ("blipsallframes", "blipallframes"):
+                    return True
+        return False
+
+    def _ensure_features_room(self):
+        """Get SynthEyes onto the Features room so its blip/peel buttons instantiate.
+
+        IMPORTANT: do NOT use SyPy3 SetRoom here. On 2026.2.4679 SetRoom is a no-op that
+        DESYNCS the socket, which then breaks the later RunScriptFile Sizzle export. Reach
+        Features purely by clicking the TopTabber room tab (Win32, no socket calls) so the
+        socket stays clean for export."""
+        self._bring_foreground()
+        if self._features_blip_button_present():
+            self.log("   OK  Features room already active - blip button present")
+            return True
+        if self._click_features_tab():
+            return True
+        self.log("   WARNING: Features-room blip button never appeared (TopTabber tab click failed)")
+        return False
 
     # ------ process lifecycle ------
 
@@ -481,12 +724,13 @@ class SynthEyesEngine:
         except Exception:
             pass
 
-        # ---- Optional SAM3 matte ----
-        if mask_dir:
-            self._load_sam3_matte(shot, mask_dir)
+        # NOTE: SAM3 masks are applied as a Python POST-FILTER after export (see
+        # _apply_sam3_postfilter), NOT as a SynthEyes roto matte. The roto path
+        # (_load_sam3_matte) switches to the "Roto Masking" room, which desyncs the SyPy3
+        # socket on 2026.2.4679 and is fragile; the Python gating is more robust + exact.
 
-        self.log("-> Switching to Features room...")
-        self._switch_room("Features", "Feature")
+        self.log("-> Switching to Features room (via TopTabber tab click)...")
+        self._ensure_features_room()
         self._configure_features(track_count, track_threshold, track_separation)
         # NOTE (2026 debug): _set_advanced_max_tracks does ByID(1238).ClickAndContinue()
         # on a control that no longer exists on 2026 ("Advanced dialog not found").
@@ -494,34 +738,59 @@ class SynthEyesEngine:
         # bogus True -> Blip All false-hangs 400s with flat CPU. Skipping to test.
         # self._set_advanced_max_tracks(track_count)
 
+        # Blip All + Peel All via Win32 PostMessage. The SyPy3 dispatch (_click_and_wait)
+        # silently no-ops on 2026.2.4679, so PostMessage the real "Butt" panel buttons and
+        # wait a frame-scaled budget (there is no reliable API to poll blip completion).
+        # SyPy3 remains the fallback if the buttons can't be located.
+        # Foreground the window so the Features panel paints and its blip/peel child
+        # controls instantiate (they don't exist while backgrounded on 2026.2.4679).
+        self.log("-> Bringing SynthEyes foreground for panel clicks...")
+        self._bring_foreground()
+
         blip_timeout = max(400, int(frame_count * 0.2))
-        self.log(f"-> Blip All frames... (timeout {blip_timeout}s)")
-        if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
-            raise RuntimeError("Blip All failed")
+        blip_wait = max(20, int(frame_count * 0.15))
+        self.log("-> Blip All frames (Win32 PostMessage)...")
+        if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
+            self.log(f"   blipping {frame_count} frames... waiting {blip_wait}s")
+            self._interruptible_sleep(blip_wait)
+        else:
+            self.log("   Win32 blip unavailable - falling back to SyPy3 dispatch")
+            if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
+                raise RuntimeError("Blip All failed")
 
         peel_timeout = max(600, int(frame_count * 1.0))
-        self.log(f"-> Peel All ({frame_count} frames, timeout {peel_timeout}s)...")
-        if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
-            raise RuntimeError("Peel All failed")
+        peel_wait = max(15, int(frame_count * 0.1))
+        self.log("-> Peel All (Win32 PostMessage)...")
+        if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+            self.log(f"   peeling... waiting {peel_wait}s")
+            self._interruptible_sleep(peel_wait)
+        else:
+            self.log("   Win32 peel unavailable - falling back to SyPy3 dispatch")
+            if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
+                raise RuntimeError("Peel All failed")
 
         self.log("-> Clearing blips...")
-        self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
+        if not self._win32_click_button("Clear blips", ["Clear all blips"]):
+            self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
 
         # 2026: there is no "Trackers" room -- trackers live on the Summary panel.
         # Feeding SetRoom() an invalid name DESYNCS the SyPy3 socket (all later
         # Run() return bogus True), which corrupted the export step. Use "Summary".
-        self.log("-> Switching to Summary room...")
-        self._switch_room("Summary")
-
-        tracker_list = hlev.Trackers()
-        self.log(f"   Trackers found: {len(tracker_list)}")
-
+        # Export via Sizzle (server-side openout+printf). This reads obj.trk directly, so it
+        # does NOT depend on the broken SyPy3 Trackers()/menu-export path, and works from the
+        # Features room (no Summary switch needed).
         out_txt_path = os.path.join(output_dir, out_txt_name)
-        if len(tracker_list) > 0:
-            self.log("-> Exporting 2D tracks...")
-            self._export_tracks(output_dir, out_txt_name)
+        self.log("-> Exporting 2D tracks via Sizzle...")
+        n_trk = self._sizzle_export_3de(out_txt_path)
 
-            # 3DE sidecar + optional auto-import
+        # SAM3 gating in Python (yesterday's proven method): drop mover points, truncate
+        # the Demo frozen tail. Beats the fragile SynthEyes roto matte.
+        if n_trk > 0 and mask_dir:
+            res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
+            if res:
+                n_trk = res[0]
+
+        if n_trk > 0:
             if image_width is None or image_height is None:
                 image_width, image_height = read_image_size(first_frame)
             sidecar_path = self._write_3de_sidecar(
@@ -533,9 +802,9 @@ class SynthEyesEngine:
             if self._s("auto_3de") and sidecar_path:
                 self._run_3de_import(sidecar_path, output_dir, shot_name, out_txt_name)
         else:
-            self.log("   WARNING: 0 trackers - skipping export")
+            self.log("   WARNING: Sizzle export returned no trackers")
 
-        return len(tracker_list), out_txt_path
+        return max(0, n_trk), out_txt_path
 
     # ------ SAM3 matte loading (UI automation) ------
 
@@ -819,6 +1088,229 @@ class SynthEyesEngine:
             return False
 
     # ------ export ------
+
+    def _run_sizzle(self, script_text, watchdog_secs=90):
+        """Run a //SIZZLET script server-side via RunScriptFile. A watchdog thread dismisses
+        the 'Sizzle Scripting' error modal (#32770) that would otherwise hang RunScriptFile's
+        Sync on any script error. Returns the .szl path written."""
+        import threading
+        tmp = os.environ.get("TEMP") or os.path.dirname(os.path.abspath(__file__))
+        szl = os.path.join(tmp, "btr_export.szl")
+        with open(szl, "w", encoding="utf-8") as f:
+            f.write(script_text)
+        state = {"done": False}
+
+        def _watch():
+            user32 = ctypes.windll.user32
+            t0 = time.time()
+            while not state["done"] and time.time() - t0 < watchdog_secs:
+                h = user32.FindWindowW(None, "Sizzle Scripting")
+                if h:
+                    # read the error message (static-text children) before dismissing
+                    msgs = []
+                    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+                    def _cb(hh, _l):
+                        t = ctypes.create_unicode_buffer(512)
+                        user32.GetWindowTextW(hh, t, 512)
+                        if t.value and t.value not in ("OK", "Cancel"):
+                            msgs.append(t.value)
+                        return True
+
+                    user32.EnumChildWindows(h, EnumProc(_cb), 0)
+                    if msgs:
+                        self.log(f"   Sizzle error: {' | '.join(msgs)}")
+                    ok = user32.GetDlgItem(h, 1)  # IDOK
+                    if ok:
+                        user32.PostMessageW(ok, _WM_LBUTTONDOWN, _MK_LBUTTON, 0)
+                        user32.PostMessageW(ok, _WM_LBUTTONUP, 0, 0)
+                    else:
+                        user32.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE
+                    self.log("   (dismissed a Sizzle error modal)")
+                    time.sleep(0.5)
+                time.sleep(0.3)
+
+        wd = threading.Thread(target=_watch, daemon=True)
+        wd.start()
+        try:
+            self.hlev.RunScriptFile(szl.replace("\\", "/"))
+        except Exception as e:
+            self.log(f"   WARNING: RunScriptFile: {e}")
+        finally:
+            state["done"] = True
+        return szl
+
+    def _apply_sam3_postfilter(self, txt_path, mask_dir, min_len=5):
+        """Gate the exported 3DE tracks against the SAM3 masks in Python (yesterday's proven
+        method - more robust than SynthEyes roto matte). For each track point (frame,x,y),
+        sample the mask at (x,y): white(>=127)=background=KEEP, black=mover=DROP. Coords index
+        the mask directly (px=0.5*(u+1)*w, py=0.5*(1-v)*h, NOT Y-flipped). Also truncates the
+        Demo-build 'frozen tail' (>=2 identical consecutive coords). Rewrites txt_path in place.
+        Returns (kept_tracks, kept_points)."""
+        import glob
+        import cv2  # type: ignore
+        import numpy as np
+        masks = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        if not masks:
+            self.log(f"   SAM3 post-filter: no masks in {mask_dir} - leaving tracks ungated")
+            return None
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                toks = f.read().split("\n")
+        except Exception as e:
+            self.log(f"   SAM3 post-filter: cannot read export: {e}")
+            return None
+
+        # parse classic 3DE: <N> then per track: name / color / count / count*(frame x y)
+        it = iter(toks)
+
+        def nxt():
+            for t in it:
+                if t.strip() != "":
+                    return t.strip()
+            return None
+
+        try:
+            ntr = int(nxt())
+        except Exception:
+            self.log("   SAM3 post-filter: bad export header")
+            return None
+
+        mask_cache = {}
+
+        def keep_point(frame, x, y):
+            # export frame is 1-based; masks are a sorted 1-based sequence
+            idx = int(frame) - 1
+            if idx < 0 or idx >= len(masks):
+                return True  # no mask for this frame -> don't drop
+            m = mask_cache.get(idx)
+            if m is None:
+                m = cv2.imread(masks[idx], cv2.IMREAD_GRAYSCALE)
+                mask_cache[idx] = m
+            if m is None:
+                return True
+            h, w = m.shape[:2]
+            xi = min(max(int(round(x)), 0), w - 1)
+            yi = min(max(int(round(y)), 0), h - 1)
+            return int(m[yi, xi]) >= 127  # white = background = keep
+
+        out_tracks = []
+        for _ in range(ntr):
+            name = nxt()
+            color = nxt()
+            cnt = int(nxt())
+            pts = []
+            for _p in range(cnt):
+                parts = nxt().split()
+                fr, x, y = int(parts[0]), float(parts[1]), float(parts[2])
+                pts.append((fr, x, y))
+            # truncate frozen tail (Demo build holds the last real coord)
+            trimmed = [pts[0]] if pts else []
+            for i in range(1, len(pts)):
+                if abs(pts[i][1] - pts[i - 1][1]) < 1e-4 and abs(pts[i][2] - pts[i - 1][2]) < 1e-4:
+                    break
+                trimmed.append(pts[i])
+            # SAM3 gating: keep only background points
+            gated = [(fr, x, y) for (fr, x, y) in trimmed if keep_point(fr, x, y)]
+            if len(gated) >= min_len:
+                out_tracks.append((name, color, gated))
+
+        # rewrite in place
+        lines = [str(len(out_tracks))]
+        for name, color, gated in out_tracks:
+            lines.append(name)
+            lines.append(color)
+            lines.append(str(len(gated)))
+            for fr, x, y in gated:
+                lines.append(f"{fr} {x:.4f} {y:.4f}")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        kept_pts = sum(len(g) for _n, _c, g in out_tracks)
+        self.log(f"   SAM3 post-filter: {ntr} -> {len(out_tracks)} tracks, {kept_pts} points kept")
+        return len(out_tracks), kept_pts
+
+    def _resync_socket(self):
+        """Recreate the SyPy3 socket (fresh SyLevel + OpenExisting) to the SAME running
+        SynthEyes. The Win32 room nav + spinner writes leave the 2026.2.4679 socket desynced
+        so RunScriptFile no-ops; a fresh socket resets the protocol state while the scene +
+        peeled trackers stay intact."""
+        try:
+            from SyPy3.sylevel import SyLevel
+            port = self._s("port")
+            pin = self._s("pin")
+            fresh = SyLevel()
+            if fresh.OpenExisting(port, pin):
+                self.hlev = fresh
+                self.log("   OK  SyPy3 socket resynced for export")
+                return True
+        except Exception as e:
+            self.log(f"   WARNING: socket resync failed: {e}")
+        return False
+
+    def _sizzle_export_3de(self, out_txt_path):
+        """Write classic 3DE 2D-track ASCII directly from SynthEyes via Sizzle (openout +
+        printf), bypassing the broken SyPy3 export. Pixel: px=w*0.5*(u+1), py=h*0.5*(1-v).
+        Returns the real tracker count (parsed from the file), or -1 on failure."""
+        try:
+            if os.path.isfile(out_txt_path):
+                os.remove(out_txt_path)
+        except Exception:
+            pass
+        self._resync_socket()  # clean socket so RunScriptFile actually runs
+        p = out_txt_path.replace("\\", "/")
+        # Sizzle syntax (from SynthEyes' own tdexport.szl / trkpath.szl): newline-terminated
+        # statements, for(...)...end / if(...)...end (NO semicolons, NO braces). openout()
+        # redirects printf to the file; pixel = 0.5*(u+1)*width, 0.5*(1-v)*height. Classic 3DE
+        # 2D-track ASCII: <N> then per track name / color 0 / point-count / "frame x y" lines.
+        script = (
+            "//SIZZLET BTRExport\n"   # tool-script header REQUIRED - without it RunScriptFile silently no-ops
+            "obj = Scene.activeObj\n"
+            "shot = obj.shot\n"
+            "start = shot.start\n"
+            "stop = shot.stop\n"
+            "width = shot.width\n"
+            "height = shot.height\n"
+            f'openout("{p}")\n'
+            "nt = 0\n"
+            "for (tk in obj.trk)\n"
+            "    if (tk.isExported)\n"
+            "        nt = nt + 1\n"
+            "    end\n"
+            "end\n"
+            'printf("%d\\n", nt)\n'
+            "for (tk in obj.trk)\n"
+            "    if (tk.isExported)\n"
+            "        cnt = 0\n"
+            "        for (frame = start; frame <= stop; frame++)\n"
+            "            if (tk.valid)\n"
+            "                cnt = cnt + 1\n"
+            "            end\n"
+            "        end\n"
+            '        printf("%s\\n", tk.nm)\n'
+            '        printf("0\\n")\n'
+            '        printf("%d\\n", cnt)\n'
+            "        for (frame = start; frame <= stop; frame++)\n"
+            "            if (tk.valid)\n"
+            '                printf("%d %.4f %.4f\\n", frame+1, 0.5*(tk.u+1)*width, 0.5*(1-tk.v)*height)\n'
+            "            end\n"
+            "        end\n"
+            "    end\n"
+            "end\n"
+            "closeout()\n"
+        )
+        self._run_sizzle(script)
+        if not os.path.isfile(out_txt_path):
+            self.log("   ERROR: Sizzle export produced no file")
+            return -1
+        try:
+            with open(out_txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                first = f.readline().strip()
+            count = int(first)
+            self.log(f"   OK  Sizzle export -> {os.path.basename(out_txt_path)} ({count} trackers)")
+            return count
+        except Exception as e:
+            self.log(f"   WARNING: could not parse Sizzle export header: {e}")
+            return -1
 
     def _export_tracks(self, output_dir, filename):
         out = os.path.normpath(output_dir)
