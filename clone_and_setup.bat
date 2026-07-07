@@ -83,25 +83,25 @@ echo       installing requirements (torch cu121 + all deps, this is large)...
 "%PY%" -m pip install --upgrade pip --no-warn-script-location || goto :fail
 "%PY%" -m pip install -r "%ROOT%\requirements.txt" --no-warn-script-location || goto :fail
 
-set "HF=%PY_DIR%\Scripts\hf.exe"
-
 REM ---- 3. weights ----------------------------------------------------------
+REM  NOTE: we use the huggingface_hub Python API, NOT the `hf` CLI - the CLI
+REM  imports the `venv` stdlib module, which the embeddable interpreter omits.
 echo [3/5] downloading model weights ...
 
 echo       - CoTracker3 checkpoint (public)
-"%HF%" download facebook/cotracker3 scaled_offline.pth --local-dir "%ROOT%\pipeline\co-tracker-main\checkpoints" || goto :fail
+"%PY%" -c "from huggingface_hub import hf_hub_download as d; d(repo_id='facebook/cotracker3', filename='scaled_offline.pth', local_dir=r'%ROOT%\pipeline\co-tracker-main\checkpoints')" || goto :fail
 
 echo       - Qwen2.5-VL  (%QWEN_REPO%, large)
 for %%R in ("%QWEN_REPO%") do set "QWEN_NAME=%%~nxR"
-"%HF%" download "%QWEN_REPO%" --local-dir "%ROOT%\pipeline\qwen\models\!QWEN_NAME!" || goto :fail
+"%PY%" -c "from huggingface_hub import snapshot_download as s; s(repo_id='%QWEN_REPO%', local_dir=r'%ROOT%\pipeline\qwen\models\!QWEN_NAME!')" || goto :fail
 
-echo       - SAM3 sam3.pt  (GATED repo facebook/sam3 - needs a Hugging Face login)
-"%HF%" auth whoami >nul 2>&1 || (
-  echo         Not logged in to Hugging Face. Paste a token with access to facebook/sam3.
-  echo         Get one at https://huggingface.co/settings/tokens  ^(accept the model license first^).
-  "%HF%" auth login
+echo       - SAM3 sam3.pt  (GATED repo facebook/sam3 - needs a Hugging Face token)
+if not defined HF_TOKEN (
+  echo         facebook/sam3 is gated. Accept its license at https://huggingface.co/facebook/sam3
+  echo         then paste a token from https://huggingface.co/settings/tokens
+  set /p "HF_TOKEN=        HF token: "
 )
-"%HF%" download facebook/sam3 sam3.pt --local-dir "%ROOT%\pipeline\sam3\weights" || goto :fail
+"%PY%" -c "from huggingface_hub import hf_hub_download as d; d(repo_id='facebook/sam3', filename='sam3.pt', local_dir=r'%ROOT%\pipeline\sam3\weights')" || goto :fail
 
 REM ---- 4. Ollama LLM -------------------------------------------------------
 echo [4/5] Ollama LLM (llama3.1:8b) ...
