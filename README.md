@@ -4,8 +4,6 @@
 ![Python](https://img.shields.io/badge/Python-3.11.9-3776AB?logo=python&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-12.1-76B900?logo=nvidia&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-EE4C2C?logo=pytorch&logoColor=white)
-![last commit](https://img.shields.io/github/last-commit/antonyjaguar19-dotcom/Batch_tracker_repo)
-![repo size](https://img.shields.io/github/repo-size/antonyjaguar19-dotcom/Batch_tracker_repo)
 
 ![Qwen2.5-VL](https://img.shields.io/badge/Qwen2.5--VL-VLM-1E90FF)
 ![LLaMA 3.1](https://img.shields.io/badge/LLaMA_3.1-Ollama-8A2BE2)
@@ -29,7 +27,7 @@ importable into 3D Equalizer, by chaining four AI/CV stages:
 ## Fresh-machine setup (clone + weights + runtime)
 
 The weights and the portable Python runtime are **not in git** (too big). On a bare
-Windows box, download and double-click **`clone_and_setup.bat`** — it clones the repo,
+Windows box, download and double-click **`clone_and_setup.bat`** — it fetches the project,
 bootstraps `runtime/python311/`, `pip install`s the cu121 deps, and downloads the model
 weights (Qwen2.5-VL, SAM3, TAPNext++). Prereqs it does *not* install: **Git**, an NVIDIA
 driver new enough for CUDA 12.1, and **Ollama** (optional, for the LLaMA stage). SAM3 is a

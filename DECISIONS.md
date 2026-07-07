@@ -117,9 +117,9 @@ Newest first. Dates are absolute.
   vendored `RAFT-master` + `tapnet-main`.
 - **Why**: one front-end, one launcher; less to maintain and ship. The Gradio UI code
   still lives inside `app/app.py` but no launcher ships for it.
-- **Note**: no git in this repo — deletions are permanent; confirmed the keep/remove
-  list before executing. `app/syntheyes_runner.py` (alt SynthEyes engine) is also gone;
-  the tracker loader falls back to `tracker_core.py` (CoTracker), so nothing broke.
+- **Note**: deletions are permanent; confirmed the keep/remove list before executing.
+  `app/syntheyes_runner.py` (alt SynthEyes engine) is also gone; the tracker loader falls
+  back to `tracker_core.py` (CoTracker), so nothing broke.
 
 ### CoTracker checkpoint fetched
 - **What**: downloaded `scaled_offline.pth` to `co-tracker-main/checkpoints/` from the
