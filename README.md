@@ -33,6 +33,17 @@ weights (Qwen2.5-VL, SAM3, CoTracker3). Prereqs it does *not* install: **Git**, 
 driver new enough for CUDA 12.1, and **Ollama** (optional, for the LLaMA stage). SAM3 is a
 **gated** HF repo — the script prompts for a Hugging Face token with access to `facebook/sam3`.
 
+Notes:
+- Weights are fetched with the `huggingface_hub` **Python API** (`hf_hub_download` /
+  `snapshot_download`), not the `hf` CLI — the embeddable interpreter omits the `venv`
+  stdlib module the CLI imports on startup.
+- `QWEN_REPO` in the bat's CONFIG block picks the Qwen model — default 7B (~16 GB, matches
+  the int4/bitsandbytes loader); switch to `Qwen/Qwen2.5-VL-3B-Instruct` (~7 GB) for a lighter box.
+- **tkinter/tcl** is not part of the embeddable Python, so the UI's folder-browse dialogs
+  won't work until Tcl/Tk is copied in (paste `tcl/`, `DLLs/tk*`, `DLLs/tcl*` and
+  `Lib/tkinter/` from a full CPython 3.11.9 install into `runtime/python311/`). Not scripted —
+  you can type paths into the UI fields directly meanwhile.
+
 ## Running it
 
 Double-click **`app\BotBatchTracker.bat`**. It uses the project-local Python interpreter,
