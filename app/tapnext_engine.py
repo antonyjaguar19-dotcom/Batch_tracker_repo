@@ -152,7 +152,10 @@ class TapNextEngine:
                 tr_all.append(tracks)
                 vis_all.append(vlog)
         tracks = torch.cat(tr_all, dim=1)[0]           # (T,N,2)
-        vis = (torch.cat(vis_all, dim=1)[0] > 0)       # (T,N) bool  (visible_logits > 0)
+        vlog = torch.cat(vis_all, dim=1)[0]            # (T,N) or (T,N,1)
+        if vlog.ndim == 3 and vlog.shape[-1] == 1:
+            vlog = vlog.squeeze(-1)                     # drop trailing singleton -> (T,N)
+        vis = (vlog > 0)                               # bool  (visible_logits > 0)
         return tracks.float().cpu().numpy(), vis.cpu().numpy().astype(bool)
 
     # ---- public API (matches the old CoTracker3Engine) -------------------------
