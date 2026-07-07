@@ -1,0 +1,106 @@
+# Batch Tracker
+
+Windows/CUDA VFX matchmove pipeline. Turns raw shot footage into 2D point tracks
+importable into 3D Equalizer, by chaining four AI/CV stages:
+
+1. **Qwen2.5-VL (vision-language)** — describes each shot: scene, camera movement,
+   objects, and matchmove signals (moving things, bad-track regions, foreground
+   occluders, quality flags, depth layers, parallax).
+2. **LLaMA 3.1 (Ollama) + deterministic heuristics** — decide per-shot camera/object
+   track strategy and the SAM3 include/exclude mask prompts.
+3. **SAM3** — turns those prompts into per-frame keep/ignore alpha masks.
+4. **CoTracker3** — tracks points per shot (4-pass), filters against the masks, and
+   exports 3D Equalizer `.txt` tracks.
+
+## Running it
+
+Double-click **`launch_nicegui.bat`** (repo root). It uses the project-local Python
+interpreter, keeps all caches/temp inside the repo, and opens the NiceGUI app at
+http://localhost:8080.
+
+Workflow in the UI:
+
+1. **Scan inputs** — set Input/Output folders, scan to list shots (resolution, frames).
+   Re-scanning an Output that holds a previous run restores its include/exclude prompts
+   and frame range.
+2. Tick the shot(s) to run (table checkboxes; active rows are highlighted). Use the
+   search box to filter, and the **Edit shot** picker to tune one shot.
+3. **Analyze (AI)** — runs Qwen2.5-VL then LLaMA/Ollama, writes a masking guide.
+4. (Optional) edit per-shot Include/Exclude prompts, downscale, and **frame range**.
+5. **Generate masks** — SAM3 makes the alpha masks (honors the frame range). If masks
+   already exist for the selected shots, you're asked to **Reuse** (skip) or
+   **Regenerate** (overwrite).
+6. **Start tracking** — CoTracker3 exports `<shot>__cotracker3_bidir.txt`. A shot that
+   yields 0 tracks logs the reason (no features / filtered out / mask-gated / too short).
+   Long / high-res shots are auto-split into chunks to fit GPU memory (see below).
+
+## Layout
+
+```
+batch_tracker_v001_starter/
+  launch_nicegui.bat        the only launcher (root)
+  requirements.txt          frozen deps (torch/torchvision are cu121 builds)
+  README.md  DECISIONS.md  CLAUDE.md
+  app/
+    app_nicegui.py          NiceGUI UI entry
+    app.py                  shared backend (workers, loaders, state)
+    tracker_core.py  cotracker_engine.py  export_3de.py
+    video_io.py  video_meta.py  reformat_plate_core.py  __init__.py
+  pipeline/
+    qwen/                   run_qwen2_shot_describer.py, qwen2_shot_describer_core.py, models/
+    llama/core/             bridge, heuristics, io_parsers, ollama_backend
+    sam3/                   sam3_runner.py, weights/
+    co-tracker-main/        vendored CoTracker3 + checkpoints/
+  runtime/                  project-local Python + caches (not committed)
+```
+
+## Requirements (placed locally, offline by design)
+
+- **Python runtime**: portable interpreter at `runtime/python311/` (set up once; see
+  DECISIONS). All pip installs/caches stay inside `runtime/`.
+- **Qwen2.5-VL weights** under `pipeline/qwen/models/` — resolver prefers, in order:
+  `Qwen2.5-VL-7B-Instruct-AWQ` → `Qwen2.5-VL-7B-Instruct` → `Qwen2.5-VL-3B-Instruct`
+  (override with `QWEN2_MODEL_DIR`). 7B is loaded in **int4** (bitsandbytes NF4), ~5.5 GB VRAM.
+- **SAM3 weights**: `pipeline/sam3/weights/sam3.pt` (or set `BTR_SAM3_WEIGHTS`).
+- **CoTracker checkpoint**: `scaled_offline.pth` under
+  `pipeline/co-tracker-main/checkpoints/` (or `<repo>/checkpoints/`).
+- **Ollama** running locally with `llama3.1:8b` (default `http://localhost:11434`,
+  override with `BTR_OLLAMA_URL`). Only used for ambiguous client intent.
+
+## Key features
+
+- **Shot selection**: per-row checkboxes; active shots highlighted; search filter;
+  "X of N selected" count; Mask/Track abort if nothing is selected.
+- **Per-shot frame range** (1-based, `0` = full). Honored by **both** SAM3 masking and
+  CoTracker tracking; exported track frame numbers stay aligned to the original shot.
+  Restored from the previous run on Scan.
+- **Reuse existing masks**: at Mask, if the selected shots already have masks, choose
+  Reuse (skip) or Regenerate (overwrite).
+- **VRAM staging**: Qwen freed after Analyze; the Ollama LLM stays resident through
+  Analyze and is unloaded at Mask; SAM3 freed before Track. Watch the `VRAM freed …`
+  log lines.
+- **Four "mover" backstops** for camera solves (exclude moving subjects):
+  1. VLM `moving_things`, 2. deterministic dynamic-subjects (animals/people/vehicles),
+  3. scene-text heuristic, 4. **CV optical-flow** (masks pixels moving independently of
+  the camera — even objects never named). The CV layer is a UI toggle
+  (**CV motion backstop**) / env `BTR_MOTION_BACKSTOP=0`.
+- **0-track diagnostics**: a shot that exports nothing logs which stage dropped the
+  tracks (seeding / post-filter / mask gating / too-short).
+- **VRAM/RAM-safe tracking** (long / high-res shots): CoTracker tracks the shot in
+  **overlapping chunks whose track IDs are chained across seams** (tracks stay continuous).
+  Chunk count is auto-sized from free VRAM (override via **Settings → Track chunks**, `0`=auto);
+  on a GPU OOM the chunk auto-downscales and retries; if the whole clip is too big for host RAM,
+  frames are decoded per-window. Exported coords are always at original resolution.
+- **Busy state**: step buttons disable while a job runs; live status + progress; Stop.
+
+## Environment variables
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `BTR_SAM3_WEIGHTS` | SAM3 `.pt` path | `<repo>/pipeline/sam3/weights/sam3.pt` |
+| `BTR_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
+| `QWEN2_MODEL_DIR` | Force a specific Qwen model folder | (auto-resolve under `pipeline/qwen/models/`) |
+| `BTR_MOTION_BACKSTOP` | `0` disables the CV motion mask | `1` |
+
+See `DECISIONS.md` for why things are the way they are, and `CLAUDE.md` for the
+internal architecture / loader rules.

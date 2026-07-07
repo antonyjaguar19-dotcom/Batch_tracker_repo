@@ -1,0 +1,45 @@
+# ── Heavy binaries: never push (GitHub caps files at 100MB) ──
+
+# Embeddable Python runtime + pip cache/temp (9.3G)
+runtime/
+
+# Model weights (23G + 3.3G)
+pipeline/qwen/models/
+pipeline/sam3/weights/
+*.safetensors
+*.pt
+*.pth
+*.gguf
+*.onnx
+*.bin
+
+# Vendored CoTracker upstream repo (own git history, re-clone separately)
+pipeline/co-tracker-main/
+
+# ── Runtime output / generated ──
+*.log
+shot_descriptions.json
+mask_guidance.json
+overdrive_guide.json
+*_run.json
+**/masks/
+**/masks_*/
+**/preview_*.png
+*__cotracker3_bidir.txt
+
+# ── Python cruft ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── OS / editor ──
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code local config (contains secrets/tokens)
+.claude/
