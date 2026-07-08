@@ -118,19 +118,22 @@ class TapNextEngine:
 
     @staticmethod
     def _q_to_256(queries: np.ndarray, H: int, W: int) -> np.ndarray:
-        """Scale query [frame,x,y] from (W,H) frame space into 256x256 space."""
-        q = queries.astype(np.float32).copy()
+        """Caller queries are [frame, x, y] in (W,H) pixels. TAPNext wants [t, y, x] in 256px
+        (see tapnet/tapvid/evaluation_datasets: query_points = [t, y, x]). Swap axes + scale."""
+        qin = queries.astype(np.float32)
         sx, sy = float(_IMG) / max(1, W), float(_IMG) / max(1, H)
-        q[..., 1] *= sx
-        q[..., 2] *= sy
-        return q
+        out = np.empty_like(qin)
+        out[..., 0] = qin[..., 0]           # t
+        out[..., 1] = qin[..., 2] * sy      # y -> row (256)
+        out[..., 2] = qin[..., 1] * sx      # x -> col (256)
+        return out
 
     @staticmethod
     def _tracks_from_256(tracks256: np.ndarray, H: int, W: int) -> np.ndarray:
-        """Scale predicted (T,N,2) [x,y] from 256x256 space back to (W,H) frame space."""
-        out = tracks256.astype(np.float32).copy()
-        out[..., 0] *= float(W) / _IMG
-        out[..., 1] *= float(H) / _IMG
+        """TAPNext returns (T,N,2) as [y, x] in 256px. Swap back to [x, y] in (W,H) pixels."""
+        out = np.empty_like(tracks256, dtype=np.float32)
+        out[..., 0] = tracks256[..., 1] * (float(W) / _IMG)   # x = col
+        out[..., 1] = tracks256[..., 0] * (float(H) / _IMG)   # y = row
         return out
 
     # ---- core streaming inference ---------------------------------------------
