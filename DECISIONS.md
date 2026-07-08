@@ -5,6 +5,38 @@ Newest first. Dates are absolute.
 
 ---
 
+## 2026-07-08
+
+### TAPNext++ tracks were sliding — wrong video norm + swapped x/y
+- **What**: fixed two `app/tapnext_engine.py` bugs that made every TAPNext track ignore image
+  content (points slid uniformly, seed frame correct then drift). (1) Video fed to the model
+  normalized to **[-1,1]** (`frames/255*2-1`), was [0,1]. (2) `query_points` are **`[t, y, x]`**
+  and predicted tracks return **`[y, x]`** (256px) — the wrapper used `[t,x,y]`/`[x,y]`, so x/y
+  were swapped. `_q_to_256`/`_tracks_from_256` now swap axes at the boundary.
+- **Why**: both conventions are what `tapnet/tapvid/evaluation_datasets` (the model's own eval
+  pipeline) uses; feeding anything else = garbage. Confirmed by a synthetic moving-dot test (pred
+  follows the dot exactly) after the ground-truth 3DE compare pointed at seed-right-then-drift.
+- **Note**: the 256² model on a 4K plate still downscales hard; sub-pixel precision on 4K is the
+  remaining thing to eyeball in 3DE.
+
+### SynthEyes 2026.2.4679: drive it via Win32 + Sizzle (shipped SyPy3 is broken)
+- **What**: `app/syntheyes_engine.py` now tracks end-to-end on build 2026.2.4679 by bypassing the
+  broken SyPy3 return-value protocol. Reach the Features room by **Win32 PostMessage-clicking the
+  `TopTabber` room tab** (`SetRoom` no-ops AND desyncs the socket); fire **Blips-all / Peel-all /
+  Clear** by PostMessage to the `Butt` panel children (found by `GetWindowText`, work backgrounded);
+  **export via a `//SIZZLET` RunScriptFile** script (`openout`+`printf` → 3DE 2D-track ASCII — the
+  `//SIZZLET` header is REQUIRED or RunScriptFile silently no-ops); **resync the socket** (fresh
+  `OpenExisting`) right before export; **gate SAM3 masks as a Python post-filter** (sample each
+  point: white=keep/black=drop, truncate the frozen tail), not the fragile roto matte.
+- **Why**: on 2026.2.4679 every SyPy3 write (SetRoom/blip/peel/menu-export) no-ops and leaves the
+  socket desynced, so the old path produced ~1 tracker + "file not found". Win32/Sizzle touches the
+  real UI + writes tracks server-side, sidestepping the protocol bug.
+- **Note**: verified SH012 = 120 trackers × ~10 frames (~10 = **SynthEyes Pro DEMO** track cap;
+  re-verify length on a full license, same code). Sizzle syntax from the install's own
+  `scripts/tdexport.szl`/`trkpath.szl` + `Documentation/SizzleManual.pdf`.
+
+---
+
 ## 2026-07-07
 
 ### Replaced CoTracker3 with TAPNext++ as the secondary (GPU) tracking backend

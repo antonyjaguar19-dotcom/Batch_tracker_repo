@@ -20,8 +20,8 @@ importable into 3D Equalizer, by chaining four AI/CV stages:
 2. **LLaMA 3.1 (Ollama) + deterministic heuristics** — decide per-shot camera/object
    track strategy and the SAM3 include/exclude mask prompts.
 3. **SAM3** — turns those prompts into per-frame keep/ignore alpha masks.
-4. **Tracking** — SynthEyes (primary, over SyPy3) or **TAPNext++** (secondary GPU
-   fallback, Apache-2.0) tracks points per shot, filters against the masks, and
+4. **Tracking** — SynthEyes (primary, driven via Win32 + Sizzle) or **TAPNext++** (secondary
+   GPU fallback, Apache-2.0) tracks points per shot, filters against the masks, and
    exports 3D Equalizer `.txt` tracks.
 
 ## Fresh-machine setup (clone + weights + runtime)
@@ -106,9 +106,10 @@ batch_tracker_v001_starter/
 Two interchangeable tracking backends, selected in the UI (**Settings → Tracking backend**)
 or `AppState.track_backend`:
 
-- **SynthEyes** (default) — drives a local SynthEyes instance over the SyPy3 socket +
-  Win32 UI automation; SAM3 masks applied as a Python post-filter. Needs a SynthEyes install
-  (commercial app). Output: `<shot>__syntheyes.txt`.
+- **SynthEyes** (default) — drives a local SynthEyes instance. On build 2026.2.4679 the shipped
+  SyPy3 socket API is broken, so blip/peel/room-switch/export run via **Win32 UI automation**
+  (PostMessage to the real panel buttons) + a **Sizzle export script**; SAM3 masks applied as a
+  Python post-filter. Needs a SynthEyes install (commercial app). Output: `<shot>__syntheyes.txt`.
 - **TAPNext++** (fallback) — GPU neural point tracker (`google-deepmind/tapnet`, **Apache-2.0,
   commercial-safe**). Fixed 256×256 causal model; the engine wrapper handles resize + coord
   rescale + streaming internally. 4-pass (fwd/bwd/mid) + SAM3 mask gating + chunked OOM-safe
