@@ -532,6 +532,8 @@ class AppState:
     motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
+    track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
+    track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
     # --- Tracking backend selection + SynthEyes settings ---
     track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
@@ -1125,6 +1127,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 flip_y_for_3de=True, selected_files=[filename], selected_scales={filename: float(data.scale.strip('%'))/100.0 if '%' in data.scale else 1.0},
                 frame_start=int(getattr(data, "frame_start", 0) or 0), frame_end=int(getattr(data, "frame_end", 0) or 0),
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
+                spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
+                max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()

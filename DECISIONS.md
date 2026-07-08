@@ -7,6 +7,29 @@ Newest first. Dates are absolute.
 
 ## 2026-07-08
 
+### TAPNext++: quality-ranked, evenly-spread track selection (kill the 4× dup dump)
+- **What**: added a post-pass selection stage in `app/tracker_core.py:_merge_filter_export` —
+  the single funnel both the single-block and chunked paths already call. It now pools every
+  filtered+gated survivor from all passes, scores each (`_track_quality_score`), then greedily
+  accepts the strongest tracks that stay ≥ `spread_min_dist_px` apart (`_select_spread`).
+  New `RunnerConfig` fields (`enable_spread_select`, `spread_min_dist_px=40`, `max_output_tracks=0`,
+  `w_coverage/ w_smoothness/ w_stability`); UI slider "Track spacing (px)" + "Max tracks" wired via
+  `AppState.track_spacing_px/ track_max_output` → `_track_shots_tapnext`.
+- **Why**: the tracker had **no** ranking, **no** dedup, **no** output cap. The 4 passes
+  (FWD/BWD/MID_F/MID_B) each seed independently on the same frame → up to ~4× duplicate tracks,
+  concatenated raw → thousands of clumped, redundant, mixed-quality tracks. Goal: 10s–100s of the
+  best, evenly spread across the whole tracking region at all frames, count floating with camera
+  motion. Greedy min-spacing (spacing ≫ any duplicate offset) collapses the pass dups implicitly,
+  so it doubles as dedup; `spread_min_dist_px` is the only density dial (small=dense, large=sparse).
+- **PARALLAX-SAFE**: the score judges each track on its **own** trajectory only (coverage,
+  own-path jitter, own max-jump) — deliberately **no** agreement-with-global-motion term, which
+  would rank down correct foreground parallax and gut the camera solve. The one global-motion
+  test (`_post_filter_tracks.min_motion_inlier_ratio`) stays at its low 0.10 floor, not raised.
+- **Note**: verified in isolation (synthetic tracks) — smooth fast parallax scores 0.97 vs a
+  jittery mistrack 0.67; 4 dups collapse to 1; within-spacing weaker track rejected; spacing dial
+  and cap honored. Still to eyeball on a real plate in 3DE: spread evenness + early/late-frame
+  coverage from the mid-seeded passes.
+
 ### TAPNext++ tracks were sliding — wrong video norm + swapped x/y
 - **What**: fixed two `app/tapnext_engine.py` bugs that made every TAPNext track ignore image
   content (points slid uniformly, seed frame correct then drift). (1) Video fed to the model

@@ -57,6 +57,20 @@ class RunnerConfig:
     enable_mask_gating: bool = True
     inside_ratio: float = 0.80
 
+    # --- Quality-ranked, evenly-spread track selection (post-pass) ---
+    # Collapses the 4x pass duplication, scores each surviving track on its OWN
+    # trajectory (parallax-safe: no agreement-with-global-motion term), then greedily
+    # accepts the strongest tracks that stay >= spread_min_dist_px apart -> an even
+    # blanket instead of clumps. Count floats with footage: dense texture/parallax
+    # clears the spacing test in more places. spread_min_dist_px is the only density dial.
+    enable_spread_select: bool = True
+    spread_min_dist_px: int = 40   # min px spacing between kept tracks (density dial)
+    max_output_tracks: int = 0     # soft cap; 0 = unlimited
+    # score weights (self-referential terms only; must not judge vs global motion)
+    w_coverage: float = 0.5        # visible span / low internal gaps -> long, gapless
+    w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
+    w_stability: float = 0.2       # small max single-frame jump -> no teleports
+
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks
     chunk_overlap: int = 24    # frames of overlap between consecutive chunks (chaining band)
@@ -507,6 +521,11 @@ class BatchTrackerRunner:
         total_kept = total_candidates = 0
         diag_after_filter = diag_after_gate = diag_short = 0
 
+        # Pool every filtered+gated survivor from all passes, THEN dedup/score/spread once
+        # (below). Passes seed independently on the same frame, so the raw union carries
+        # up to ~4x duplicates of the same physical point -- the spread pass collapses them.
+        candidates: List[dict] = []
+
         for p_name, xy_raw, vis_raw, gate_mask in passes:
             if xy_raw is None or xy_raw.shape[1] == 0: continue
             N = xy_raw.shape[1]
@@ -538,19 +557,101 @@ class BatchTrackerRunner:
 
                 out_id = f"{p_name}_{j+1:04d}"
                 valid_pts = []
+                sx = sy = 0.0
                 for t in range(T):
                     if vis_bool[t, j]:
                         x_val, y_val = float(xs[t]), float(ys[t])
                         if not (np.isnan(x_val) or np.isnan(y_val) or np.isinf(x_val) or np.isinf(y_val)):
                             valid_pts.append((t + 1 + self._frame_offset, x_val, y_val))
+                            sx += x_val; sy += y_val
 
                 if len(valid_pts) > 1:
-                    final_tracks_out[out_id] = valid_pts
-                    total_kept += 1
+                    n = len(valid_pts)
+                    candidates.append({
+                        "id": out_id,
+                        "pts": valid_pts,
+                        "mean": (sx / n, sy / n),
+                        "score": self._track_quality_score(valid_pts, T, diag),
+                    })
                 else:
                     diag_short += 1
 
+        if self.cfg.enable_spread_select and candidates:
+            final_tracks_out = self._select_spread(candidates)
+        else:
+            final_tracks_out = {c["id"]: c["pts"] for c in candidates}
+        total_kept = len(final_tracks_out)
+
         return final_tracks_out, total_kept, total_candidates, diag_after_filter, diag_after_gate, diag_short
+
+    def _track_quality_score(self, pts: List[Tuple[int, float, float]], T: int, diag: float) -> float:
+        """Per-track quality in ~[0,1] from the track's OWN trajectory only.
+
+        PARALLAX-SAFE: no term compares the track against global/median motion, so a fast
+        foreground (high-parallax) point is not penalised for moving unlike the background.
+        Mistracks are caught by self-consistency (jitter/jump on the track's own path).
+        Terms: coverage (long, gapless), smoothness (low own jitter), stability (no jumps).
+        """
+        n = len(pts)
+        if n < 2:
+            return 0.0
+        frames = [p[0] for p in pts]
+        span = max(1, frames[-1] - frames[0] + 1)
+        cov = float(n) / float(max(1, T))       # fraction of shot the track is alive
+        fill = float(n) / float(span)           # 1.0 = no internal gaps
+        cov_score = 0.5 * min(1.0, cov) + 0.5 * fill
+
+        vels = []
+        for i in range(n - 1):
+            dt = max(1, pts[i + 1][0] - pts[i][0])
+            d = math.hypot(pts[i + 1][1] - pts[i][1], pts[i + 1][2] - pts[i][2])
+            vels.append(d / dt)
+        max_jump = max(vels) if vels else 0.0
+        if len(vels) > 1:
+            jitter = sum(abs(vels[k + 1] - vels[k]) for k in range(len(vels) - 1)) / (len(vels) - 1)
+        else:
+            jitter = 0.0
+        d = float(diag) if diag > 0 else 1.0
+        smooth_score = 1.0 / (1.0 + jitter / (0.005 * d))   # scale: 0.5% of frame diagonal
+        stab_score = 1.0 / (1.0 + max_jump / (0.020 * d))   # scale: 2% of frame diagonal
+
+        w_c, w_s, w_j = self.cfg.w_coverage, self.cfg.w_smoothness, self.cfg.w_stability
+        wsum = (w_c + w_s + w_j) or 1.0
+        return (w_c * cov_score + w_s * smooth_score + w_j * stab_score) / wsum
+
+    def _select_spread(self, candidates: List[dict]) -> Dict[str, List[Tuple[int, float, float]]]:
+        """Greedy min-spacing selection over score-sorted candidates.
+
+        Walk best-first; accept a track only if its mean position is >= spread_min_dist_px
+        from every already-accepted track. Because spacing (default 40px) >> any pass
+        duplicate offset, near-identical duplicates are rejected implicitly -- this doubles
+        as the pass dedup. A coarse cell grid keeps each spacing test O(neighbours).
+        """
+        d = max(1, int(self.cfg.spread_min_dist_px))
+        d2 = float(d * d)
+        cap = int(self.cfg.max_output_tracks or 0)
+        grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        out: Dict[str, List[Tuple[int, float, float]]] = {}
+
+        for c in sorted(candidates, key=lambda c: c["score"], reverse=True):
+            mx, my = c["mean"]
+            cx, cy = int(mx // d), int(my // d)
+            ok = True
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for (ax, ay) in grid.get((gx, gy), ()):  # type: ignore[arg-type]
+                        if (ax - mx) ** 2 + (ay - my) ** 2 < d2:
+                            ok = False
+                            break
+                    if not ok: break
+                if not ok: break
+            if not ok:
+                continue
+            out[c["id"]] = c["pts"]
+            grid.setdefault((cx, cy), []).append((mx, my))
+            if cap > 0 and len(out) >= cap:
+                break
+        return out
 
     # -------------------------------------------------------------------------
     # VRAM/RAM-safe chunked tracking

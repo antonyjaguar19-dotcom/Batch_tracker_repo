@@ -512,6 +512,16 @@ with ui.row().classes("w-full no-wrap"):
             track_chunks.tooltip("TAPNext++ fallback only. Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
                                  "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
 
+            ui.label("Track spacing (px · TAPNext++ · density dial)")
+            track_spacing = ui.slider(min=10, max=120, value=int(getattr(state, "track_spacing_px", 40)), step=5).props("label-always")
+            track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 40)))
+            track_spacing.tooltip("TAPNext++ only. Min pixel gap between kept tracks. Small = denser/more tracks, large = sparser/fewer. "
+                                  "Collapses duplicate passes and spreads the strongest tracks evenly; count floats with footage texture/parallax.")
+            ui.label("Max tracks per task (TAPNext++ · 0 = auto)")
+            track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0).classes("w-full")
+            track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
+            track_max.tooltip("TAPNext++ only. Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
+
             ui.separator()
             ui.label("Tracking backend")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
