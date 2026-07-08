@@ -100,14 +100,19 @@ class TapNextEngine:
 
     # ---- video / coordinate plumbing (256x256 <-> caller frame space) ----------
     def _prep_video(self, frames_bgr: np.ndarray):
-        """(T,H,W,3) BGR -> (1,T,256,256,3) float[0,1] RGB tensor. Returns (video, H, W)."""
+        """(T,H,W,3) BGR -> (1,T,256,256,3) float[-1,1] RGB tensor. Returns (video, H, W).
+
+        TAPNext expects TAP-Vid normalization frames/255*2-1 -> [-1,1] (canonical across
+        tapnet: tapvid/evaluation_datasets, pytorch_live_demo, training). Feeding [0,1]
+        makes tracks ignore image content -> uniform sliding.
+        """
         torch = self.torch
         T, H, W = frames_bgr.shape[0], frames_bgr.shape[1], frames_bgr.shape[2]
         out = np.empty((T, _IMG, _IMG, 3), dtype=np.float32)
         for t in range(T):
             r = cv2.resize(frames_bgr[t], (_IMG, _IMG), interpolation=cv2.INTER_AREA)
             out[t] = r[..., ::-1]  # BGR -> RGB
-        out /= 255.0
+        out = out / 255.0 * 2.0 - 1.0  # -> [-1, 1]
         video = torch.from_numpy(out)[None].to(self.device)  # (1,T,256,256,3)
         return video, H, W
 
