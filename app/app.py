@@ -534,6 +534,8 @@ class AppState:
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
     track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
+    pattern_refine: bool = True    # TAPNext: 3DE-style NCC/affine pattern lock at native res
+    refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
     # --- Tracking backend selection + SynthEyes settings ---
     track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
@@ -1129,6 +1131,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
                 max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
+                enable_pattern_refine=bool(getattr(state, "pattern_refine", True)),
+                refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()

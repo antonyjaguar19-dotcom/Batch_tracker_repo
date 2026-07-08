@@ -71,6 +71,18 @@ class RunnerConfig:
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
     w_stability: float = 0.2       # small max single-frame jump -> no teleports
 
+    # --- 3DE-style NCC + affine pattern refinement (full-res, post-selection) ---
+    # TAPNext (256px) only centres the search box; a contrast patch tracked at native
+    # resolution decides the sub-pixel position -> tracks stick to the pattern like 3DE.
+    # Hybrid re-reference + trim-on-lost + affine motion (see app/pattern_refine.py).
+    enable_pattern_refine: bool = True
+    refine_patch_px: int = 31       # pattern box (odd); larger = more stable, less local
+    refine_search_px: int = 24      # search radius around TAPNext coarse position
+    refine_ncc_lost: float = 0.60   # corr below this = lock lost -> trim the track here
+    refine_ncc_reref: float = 0.85  # corr below this (but >= lost) = re-grab the pattern
+    refine_motion: str = "affine"   # translation | euclidean | affine
+    refine_min_len: int = 8         # drop a refined track shorter than this many frames
+
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks
     chunk_overlap: int = 24    # frames of overlap between consecutive chunks (chaining band)
@@ -1011,6 +1023,20 @@ class BatchTrackerRunner:
                     self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ZERO {zmsg} "
                                               f"(seeded={total_candidates} after_filter={diag_after_filter} "
                                               f"after_gate={diag_after_gate} short={diag_short})")
+
+                # 3DE-style NCC/affine pattern lock at native resolution (post-selection,
+                # so it runs only on the handful of spread-selected tracks -> cheap).
+                if self.cfg.enable_pattern_refine and final_tracks_out:
+                    try:
+                        from app.pattern_refine import refine_tracks
+                        self._status(f"[{i}/{len(vids)}] Pattern-refine (NCC/{self.cfg.refine_motion}) at {W0}x{H0}...")
+                        final_tracks_out, rinfo = refine_tracks(
+                            final_tracks_out, in_path, W0, H0, orig_total, self.cfg,
+                            status=lambda m: self._status(f"TRACK: {m}"))
+                        total_kept = len(final_tracks_out)
+                        self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
+                    except Exception as e:
+                        self._status(f"[{i}/{len(vids)}] Pattern-refine skipped: {e}")
 
                 tag = (self.cfg.output_tag or '').strip()
                 base = f"{shot}__tapnext.txt" if not tag else f"{shot}__{tag}__tapnext.txt"

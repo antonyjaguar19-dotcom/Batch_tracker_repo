@@ -7,6 +7,30 @@ Newest first. Dates are absolute.
 
 ## 2026-07-08
 
+### TAPNext++: 3DE-style NCC + affine pattern lock at native resolution
+- **What**: new `app/pattern_refine.py`, run in `tracker_core._run_impl` right before export,
+  on the (few) spread-selected tracks. Re-tracks each point like a 3DE pattern-box/search-box
+  tracker: anchor a reference patch at the track's **highest-contrast frame** (min-eigenvalue of
+  the structure tensor), refine **outward both directions**; per frame NCC template-match
+  (`matchTemplate` TM_CCOEFF_NORMED) at **full resolution** in a search box centred on TAPNext's
+  coarse position, sub-pixel parabola peak, then **affine ECC** (`findTransformECC`, MOTION_AFFINE)
+  for rotation/scale. Correlation gating = **hybrid re-reference** (re-grab the patch when corr sags
+  below `refine_ncc_reref` 0.85) + **trim on lost** (cut the track where corr < `refine_ncc_lost`
+  0.60). New `RunnerConfig`: `enable_pattern_refine`, `refine_patch_px` 31, `refine_search_px` 24,
+  `refine_ncc_lost/reref`, `refine_motion="affine"`, `refine_min_len` 8. UI: "3DE-style pattern
+  lock" switch + "Pattern box (px)" slider (`AppState.pattern_refine/ refine_patch_px`).
+- **Why**: user's reference `3de track.txt` is a 173-frame, ~12-decimal, sub-pixel-smooth 4K track
+  from 3DE's pattern/search-box tracker. TAPNext is fixed **256px** — on a 4K plate 1 model px ≈
+  8–15 real px, so it is coarse AND locks to a learned point, not the actual contrast patch; no
+  filter fixes a precision ceiling. Letting TAPNext only **centre the search box** and letting a
+  full-res contrast patch decide the sub-pixel position gives 3DE-grade lock while keeping TAPNext's
+  robustness for large motion / re-acquisition. Runs post-selection so it's only ~tens of tracks.
+- **Note**: verified on synthetic texture — NCC sub-pixel 0.08px; affine ECC recovers centre through
+  4° rotation to 0.05px; full refine of a 20-frame drift = mean **0.02px** / max 0.03px error; and it
+  correctly **trims** at the frame where a bad coarse guide loses the pattern (found + fixed the ECC
+  centre-mapping sign via this test). Chose hybrid re-reference + trim + affine per the artist. Still
+  to eyeball: real 4K plate + timing (full-decode-to-gray vs streamed per-frame LRU in `_FrameGray`).
+
 ### TAPNext++: quality-ranked, evenly-spread track selection (kill the 4× dup dump)
 - **What**: added a post-pass selection stage in `app/tracker_core.py:_merge_filter_export` —
   the single funnel both the single-block and chunked paths already call. It now pools every

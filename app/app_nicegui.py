@@ -522,6 +522,16 @@ with ui.row().classes("w-full no-wrap"):
             track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
             track_max.tooltip("TAPNext++ only. Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
 
+            sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
+                                  on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
+            sw_refine.tooltip("TAPNext++ only. After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
+                              "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
+                              "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
+            ui.label("Pattern box (px · odd)")
+            refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
+            refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
+            refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
+
             ui.separator()
             ui.label("Tracking backend")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
