@@ -44,3 +44,6 @@ Desktop.ini
 
 # Claude Code local config (contains secrets/tokens)
 .claude/
+
+# Isolated experiment eval outputs (videos/pngs/npz)
+experiments/**/out/

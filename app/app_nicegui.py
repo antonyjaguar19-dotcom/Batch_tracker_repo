@@ -522,6 +522,11 @@ with ui.row().classes("w-full no-wrap"):
             track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
             track_max.tooltip("TAPNext++ only. Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
 
+            sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
+                                   on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
+            sw_movtile.tooltip("TAPNext++ only. Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
+                               "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
+                               "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
             sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
                                   on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
             sw_refine.tooltip("TAPNext++ only. After selection, re-track each point at NATIVE resolution with an NCC pattern box + "

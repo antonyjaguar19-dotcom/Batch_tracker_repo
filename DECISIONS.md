@@ -5,6 +5,37 @@ Newest first. Dates are absolute.
 
 ---
 
+## 2026-07-10
+
+### TAPNext++: moving-tile native re-track before NCC (4K accuracy)
+- **What**: new `app/moving_tile_refine.py`, run in `tracker_core._run_impl` right AFTER
+  spread-selection and BEFORE `pattern_refine`. For each selected track it cuts a **native
+  256×256 crop that follows the coarse path** (window by window, re-centred on the coarse
+  guide via `mt_window` 16 / `mt_edge_margin` 40) and re-runs TAPNext on that crop, so the
+  model sees full-resolution pixels instead of the whole frame squashed to 256. Non-destructive:
+  track count and length are preserved (frames the tile can't reach keep their coarse value);
+  `pattern_refine` still does the trimming/gating afterwards. Native BGR frames via
+  `video_io.FrameSource` (full-decode if it fits `host_ram_frac`, else streamed). New
+  `RunnerConfig.enable_moving_tile` (default True), `mt_window`, `mt_edge_margin`;
+  `AppState.moving_tile`; UI switch "Moving-tile native re-track (4K accuracy)".
+- **Why**: TAPNext is fixed 256px, so on a 4K plate the frame is squashed ~15× and the coarse
+  position lands several px off the real feature. NCC alone can't fix that — its search box
+  centres on the coarse point, so a far-off start makes it lock the WRONG nearby patch.
+  **Measured vs 17 manual artist tracks on a 4K plate (mean px deviation)**: baseline
+  whole-frame 4.88 · baseline+NCC (old bot) 4.03 · moving-tile 2.46 · **moving-tile+NCC 1.30**
+  (3× closer, and worst-frame 5.9px vs 26px — no solve-breaking drifts). NCC alone even
+  *regressed* several strong features (trk04 1.6→5.1, trk08 6.7→9.4). Moving-tile supplies the
+  accurate start NCC needs.
+- **Also**: `refine_motion` default flipped `affine` → **`translation`**. With moving-tile placing
+  the point accurately, affine's extra rot/scale DoF only added wobble on pan/translation-dominant
+  plates (measured jitter regression 0.60→1.02px). Set back to `affine`/`euclidean` for shots with
+  real camera roll or zoom.
+- **Proof**: isolated eval harness under `experiments/moving_tile/` (staged v0→v7 ablation +
+  ground-truth deviation vs `Tracks_Shot_01.txt`). Verified end-to-end through the real
+  `BatchTrackerRunner` on SH011 (moving-tile stage runs, exports valid 3DE `.txt`).
+
+---
+
 ## 2026-07-08
 
 ### TAPNext++: 3DE-style NCC + affine pattern lock at native resolution

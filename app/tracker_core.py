@@ -71,6 +71,17 @@ class RunnerConfig:
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
     w_stability: float = 0.2       # small max single-frame jump -> no teleports
 
+    # --- Moving-tile native re-track (post-selection, BEFORE pattern_refine) ---
+    # TAPNext runs at 256px, so on a 4K plate the whole frame is squashed ~15x and the
+    # coarse position lands several px off the real feature. NCC alone can't fix that
+    # (its search box centres on the coarse point -> locks the wrong patch). Moving tiling
+    # cuts a NATIVE 256px crop that follows the coarse path and re-runs TAPNext on it, so
+    # the point lands on the real feature. Measured vs 17 manual 4K tracks: baseline 4.88px,
+    # baseline+NCC 4.03px, moving-tile+NCC 1.30px. Non-destructive (see moving_tile_refine.py).
+    enable_moving_tile: bool = True
+    mt_window: int = 16             # frames per tile window before it re-centres on the guide
+    mt_edge_margin: int = 40        # keep the coarse guide this many px inside the tile edge
+
     # --- 3DE-style NCC + affine pattern refinement (full-res, post-selection) ---
     # TAPNext (256px) only centres the search box; a contrast patch tracked at native
     # resolution decides the sub-pixel position -> tracks stick to the pattern like 3DE.
@@ -80,7 +91,10 @@ class RunnerConfig:
     refine_search_px: int = 24      # search radius around TAPNext coarse position
     refine_ncc_lost: float = 0.60   # corr below this = lock lost -> trim the track here
     refine_ncc_reref: float = 0.85  # corr below this (but >= lost) = re-grab the pattern
-    refine_motion: str = "affine"   # translation | euclidean | affine
+    # translation default: with moving-tile placing the point accurately, affine's extra
+    # rot/scale DoF only adds wobble on pan/translation-dominant plates (measured regression).
+    # Set to "affine"/"euclidean" for shots with real camera roll or zoom.
+    refine_motion: str = "translation"   # translation | euclidean | affine
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
 
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
@@ -1023,6 +1037,20 @@ class BatchTrackerRunner:
                     self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ZERO {zmsg} "
                                               f"(seeded={total_candidates} after_filter={diag_after_filter} "
                                               f"after_gate={diag_after_gate} short={diag_short})")
+
+                # Moving-tile native re-track: fix the coarse 256px position on the full-res
+                # plate BEFORE NCC (NCC can't recover a position that started several px off).
+                # Runs only on the handful of selected tracks; non-destructive (count/len kept).
+                if getattr(self.cfg, "enable_moving_tile", True) and final_tracks_out:
+                    try:
+                        from app.moving_tile_refine import moving_tile_refine
+                        self._status(f"[{i}/{len(vids)}] Moving-tile native re-track at {W0}x{H0}...")
+                        final_tracks_out, minfo = moving_tile_refine(
+                            final_tracks_out, in_path, W0, H0, orig_total, engine, self.cfg,
+                            status=lambda m: self._status(f"TRACK: {m}"))
+                        self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] MOVINGTILE {shot}: {minfo}")
+                    except Exception as e:
+                        self._status(f"[{i}/{len(vids)}] Moving-tile skipped: {e}")
 
                 # 3DE-style NCC/affine pattern lock at native resolution (post-selection,
                 # so it runs only on the handful of spread-selected tracks -> cheap).
