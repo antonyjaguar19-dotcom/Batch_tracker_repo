@@ -535,6 +535,8 @@ class AppState:
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
     track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
     moving_tile: bool = True       # TAPNext: native moving-tile re-track before NCC (4K accuracy)
+    edge_track: bool = True        # TAPNext: keep refining points to the frame border (edge tracks)
+    gap_aware_refine: bool = True  # TAPNext: keep disappear/reappear points as one track (per-segment refine)
     pattern_refine: bool = True    # TAPNext: 3DE-style NCC/affine pattern lock at native res
     refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
     # --- Tracking backend selection + SynthEyes settings ---
@@ -1133,6 +1135,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
                 max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
                 enable_moving_tile=bool(getattr(state, "moving_tile", True)),
+                mt_edge_track=bool(getattr(state, "edge_track", True)),
+                refine_gap_aware=bool(getattr(state, "gap_aware_refine", True)),
                 enable_pattern_refine=bool(getattr(state, "pattern_refine", True)),
                 refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
             )

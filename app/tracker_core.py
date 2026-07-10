@@ -81,6 +81,9 @@ class RunnerConfig:
     enable_moving_tile: bool = True
     mt_window: int = 16             # frames per tile window before it re-centres on the guide
     mt_edge_margin: int = 40        # keep the coarse guide this many px inside the tile edge
+    # Edge tracking: keep refining a point right up to the frame border instead of trimming it
+    # when the search box / tile clamps against the edge (edge tracks anchor lens/solve corners).
+    mt_edge_track: bool = True
 
     # --- 3DE-style NCC + affine pattern refinement (full-res, post-selection) ---
     # TAPNext (256px) only centres the search box; a contrast patch tracked at native
@@ -96,6 +99,10 @@ class RunnerConfig:
     # Set to "affine"/"euclidean" for shots with real camera roll or zoom.
     refine_motion: str = "translation"   # translation | euclidean | affine
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
+    # Gap-aware refine: a track that disappears (occlusion) and reappears is refined per
+    # contiguous VISIBLE segment (each re-acquires its own reference patch) and reassembled
+    # under ONE id -> the reappeared segment is kept, not trimmed by the pre-occlusion patch.
+    refine_gap_aware: bool = True
 
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks

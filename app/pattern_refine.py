@@ -76,16 +76,34 @@ def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
 
 
 def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
-               search: int, half: int) -> Optional[Tuple[float, float, float]]:
-    """NCC template match of `patch` in a search box around (cx,cy). -> (x,y,cc)."""
+               search: int, half: int, edge_clamp: bool = False
+               ) -> Optional[Tuple[float, float, float]]:
+    """NCC template match of `patch` in a search box around (cx,cy). -> (x,y,cc).
+
+    `edge_clamp`: near the frame border, instead of giving up, CLAMP the search window to
+    the frame (reduce search on the clipped side) so an edge point still gets refined. Only
+    bail when the patch itself can't fit (target within `half` of the border). Without it the
+    original behaviour is kept (bail if the full search box falls off frame).
+    """
     P = 2 * half + 1
-    x0 = int(round(cx)) - half - search
-    y0 = int(round(cy)) - half - search
-    win_w = P + 2 * search
-    win_h = P + 2 * search
-    if x0 < 0 or y0 < 0 or x0 + win_w > gray.shape[1] or y0 + win_h > gray.shape[0]:
-        return None
-    win = gray[y0:y0 + win_h, x0:x0 + win_w]
+    H, W = gray.shape[:2]
+    if not edge_clamp:
+        x0 = int(round(cx)) - half - search
+        y0 = int(round(cy)) - half - search
+        if x0 < 0 or y0 < 0 or x0 + P + 2 * search > W or y0 + P + 2 * search > H:
+            return None
+        win = gray[y0:y0 + P + 2 * search, x0:x0 + P + 2 * search]
+    else:
+        # patch must fit fully inside the frame at the target, else there is nothing to match
+        if cx - half < 0 or cy - half < 0 or cx + half + 1 > W or cy + half + 1 > H:
+            return None
+        x0 = max(0, int(round(cx)) - half - search)
+        y0 = max(0, int(round(cy)) - half - search)
+        x1 = min(W, int(round(cx)) + half + search + 1)
+        y1 = min(H, int(round(cy)) + half + search + 1)
+        win = gray[y0:y1, x0:x1]
+        if win.shape[0] < P or win.shape[1] < P:   # window smaller than the patch -> can't match
+            return None
     resp = cv2.matchTemplate(win, patch, cv2.TM_CCOEFF_NORMED)
     _, maxv, _, maxloc = cv2.minMaxLoc(resp)
     dx, dy = _subpix_peak(resp, maxloc)
@@ -166,9 +184,10 @@ class _FrameGray:
         return g
 
 
-def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
-                cfg) -> Optional[Track]:
-    pts = sorted(track, key=lambda t: t[0])
+def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
+                    edge_clamp: bool) -> Optional[Track]:
+    """NCC/ECC refine one CONTIGUOUS visible segment (anchor at its sharpest frame,
+    refine outward both ways, trim on loss of lock). Returns refined points or None."""
     if len(pts) < 2:
         return None
     half = int(cfg.refine_patch_px) // 2
@@ -177,7 +196,7 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
     lost = float(cfg.refine_ncc_lost)
     reref = float(cfg.refine_ncc_reref)
 
-    # 1. anchor = highest-contrast valid patch
+    # 1. anchor = highest-contrast valid patch (within THIS segment -> re-acquires per segment)
     best_i, best_c, best_patch = -1, -1.0, None
     for i, (f, x, y) in enumerate(pts):
         g = get(f - 1)
@@ -201,11 +220,11 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
         patch = best_patch.copy()
         i = best_i + direction
         while 0 <= i < len(pts):
-            f, cx, cy = pts[i]  # cx,cy = TAPNext coarse position (search centre)
+            f, cx, cy = pts[i]  # cx,cy = coarse position (search centre)
             g = get(f - 1)
             if g is None:
                 break
-            res = _ncc_match(g, patch, cx, cy, search, half)
+            res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp)
             if res is None or res[2] < lost:
                 break  # trim this side at loss of lock
             x, y, cc = res
@@ -220,10 +239,45 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
                     patch = np2
             i += direction
 
-    out = [refined[k] for k in sorted(refined.keys())]
-    if len(out) < int(cfg.refine_min_len):
+    return [refined[k] for k in sorted(refined.keys())]
+
+
+def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
+                cfg) -> Optional[Track]:
+    pts = sorted(track, key=lambda t: t[0])
+    if len(pts) < 2:
         return None
-    return out
+    edge_clamp = bool(getattr(cfg, "mt_edge_track", True))
+    gap_aware = bool(getattr(cfg, "refine_gap_aware", True))
+    min_len = int(cfg.refine_min_len)
+
+    if not gap_aware:
+        out = _refine_segment(pts, get, cfg, edge_clamp)
+        if out is None or len(out) < min_len:
+            return None
+        return out
+
+    # Gap-aware: split into contiguous VISIBLE segments (occlusion = frame number jump > 1),
+    # refine each on its OWN reference patch, and reassemble under one id. A segment that
+    # refines cleanly (>= min_len) is used refined; otherwise its ORIGINAL points are kept so
+    # a disappear/reappear point is never trimmed away just because its patch changed.
+    segments: List[Track] = []
+    cur: Track = [pts[0]]
+    for p in pts[1:]:
+        if int(p[0]) - int(cur[-1][0]) == 1:
+            cur.append(p)
+        else:
+            segments.append(cur)
+            cur = [p]
+    segments.append(cur)
+
+    combined: Track = []
+    for seg in segments:
+        ref = _refine_segment(seg, get, cfg, edge_clamp) if len(seg) >= 2 else None
+        combined.extend(ref if (ref is not None and len(ref) >= min_len) else seg)
+    if len(combined) < min_len:
+        return None
+    return sorted(combined, key=lambda t: t[0])
 
 
 def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,

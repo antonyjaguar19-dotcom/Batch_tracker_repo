@@ -7,6 +7,35 @@ Newest first. Dates are absolute.
 
 ## 2026-07-10
 
+### TAPNext++: edge tracking + strict disappear/reappear (gap-aware refine)
+- **What**: two accuracy fixes on the moving-tile/NCC refine path.
+  1. **Edge tracking** (`mt_edge_track`, default on). `pattern_refine._ncc_match` now **clamps**
+     its search window to the frame at the border instead of returning `None` (which trimmed edge
+     frames); only bails when the patch itself can't fit. `moving_tile_refine._retrack_one`
+     **accepts** a tile-edge position when the tile is clamped against the frame on the exit side
+     (the point is at the real border, not lost) and breaks only on an unclamped-side escape. Net:
+     points track right up to the frame border — the edge tracks that anchor lens/solve corners.
+  2. **Gap-aware refine** (`refine_gap_aware`, default on). A disappear→reappear point already
+     survives as one 3DE-gapped track (TAPNext is recurrent; `_merge_filter_export` omits hidden
+     frames; the jump filter ignores across-gap displacement). But `_refine_one` anchored ONE patch
+     and refined outward across the whole track, so at the occlusion gap the stale pre-occlusion
+     patch failed NCC and **trimmed the entire reappeared segment**. Now `_refine_one` splits the
+     track into **contiguous visible segments**, refines each on its **own** sharpest-frame anchor
+     (= re-acquire), and reassembles under **one** id; a segment that won't refine keeps its
+     original points. The returning point is kept + re-acquired, never trimmed away.
+- **Why**: artist request — edge features were dropping early, and occluded-then-returning points
+  need to stay one continuous track. Per the artist's call: keep the returning point as one track
+  (no split/drop) and bridge occlusions of any length, so gap-aware has no NCC bridge-gate.
+- **Config**: `RunnerConfig.mt_edge_track`, `refine_gap_aware`; `AppState.edge_track`,
+  `gap_aware_refine`; two NiceGUI switches ("Track to frame edge", "Keep disappear/reappear as one
+  track"). Both default to the new behavior.
+- **Proof**: deterministic unit checks (`experiments/moving_tile/_verify_edge_occlusion.py`) — NCC
+  edge-clamp returns an exact border match where the old code returned `None`; gap-aware keeps both
+  segments of a gapped track. End-to-end on SH011 through the real `BatchTrackerRunner`: exports
+  cleanly, 20 tracks (was 19 — a previously-trimmed track kept).
+
+---
+
 ### TAPNext++: moving-tile native re-track before NCC (4K accuracy)
 - **What**: new `app/moving_tile_refine.py`, run in `tracker_core._run_impl` right AFTER
   spread-selection and BEFORE `pattern_refine`. For each selected track it cuts a **native

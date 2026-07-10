@@ -48,7 +48,8 @@ def _tile_origin(cx: float, cy: float, W: int, H: int) -> Tuple[int, int]:
 
 
 def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSource,
-                 engine, W: int, H: int, win: int, edge_margin: int) -> Dict[int, Tuple[float, float]]:
+                 engine, W: int, H: int, win: int, edge_margin: int,
+                 edge_track: bool = True) -> Dict[int, Tuple[float, float]]:
     """Re-track one coarse path with a native tile that follows it. Returns {frame:(x,y)}.
 
     The coarse path (xs,ys) only PLACES the tile per window; the tile's own TAPNext run
@@ -91,8 +92,17 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
         for k in range(1, tr.shape[0]):
             if not vs[k]:
                 break
-            if not (2.0 <= tr[k, 0] <= _TILE - 2.0 and 2.0 <= tr[k, 1] <= _TILE - 2.0):
-                break  # left the native tile -> stop this window, next re-centres
+            tx, ty = float(tr[k, 0]), float(tr[k, 1])
+            at_l, at_r = tx <= 2.0, tx >= _TILE - 2.0
+            at_t, at_b = ty <= 2.0, ty >= _TILE - 2.0
+            if at_l or at_r or at_t or at_b:
+                # Hitting a tile edge on a side where the tile is CLAMPED against the frame
+                # means the point is at the real frame border -> keep tracking to it. Hitting
+                # an UNclamped side means the point out-ran the tile -> stop, next re-centres.
+                hit_unclamped = ((at_l and ox != 0) or (at_r and ox != W - _TILE)
+                                 or (at_t and oy != 0) or (at_b and oy != H - _TILE))
+                if hit_unclamped or not edge_track:
+                    break
             gx = ox + float(tr[k, 0]); gy = oy + float(tr[k, 1])
             out[int(frs[i0 + k])] = (gx, gy)
             cx, cy = gx, gy
@@ -122,6 +132,7 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
 
     win = int(getattr(cfg, "mt_window", 16) or 16)
     edge_margin = int(getattr(cfg, "mt_edge_margin", 40) or 40)
+    edge_track = bool(getattr(cfg, "mt_edge_track", True))
     flip = bool(getattr(cfg, "flip_y_for_3de", True)) and H0 > 0
 
     # native BGR frame provider: hold whole clip if it fits the RAM budget, else stream.
@@ -152,7 +163,7 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         frs = np.array([int(p[0]) for p in pts], dtype=int)
         xs = np.array([float(p[1]) for p in pts], dtype=float)
         ys = np.array([(float(H0 - 1) - float(p[2])) if flip else float(p[2]) for p in pts], dtype=float)
-        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, win, edge_margin)
+        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, win, edge_margin, edge_track)
         new_tr: Track = []
         any_moved = False
         for k in range(len(frs)):
