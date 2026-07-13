@@ -115,6 +115,14 @@ class RunnerConfig:
     enable_reseed: bool = True
     reseed_every: int = 30     # max frames between re-seeds (window cap); 0 = disable
     reseed_max_windows: int = 40  # safety cap on forced window count
+    # ORGANIC per-window seed budget (prevents the fixed max_tracks * n_windows blow-up that
+    # saturated the machine). Fresh seeds PER WINDOW are capped to a resolution-scaled density,
+    # so the TOTAL across the clip = density * n_windows, and n_windows = frames/reseed_every ->
+    # total scales linearly with the FRAME RANGE and with resolution, not a fixed multiplied N.
+    # goodFeatures still returns fewer on low-texture frames (content-organic); max_tracks is
+    # only the upper bound. Applies to the chunked/re-seed path (single-block seeds once).
+    reseed_density_per_mp: float = 60.0  # fresh seeds per window per megapixel
+    reseed_seed_floor: int = 64          # min fresh seeds per window (small frames)
 
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks
@@ -798,10 +806,18 @@ class BatchTrackerRunner:
                 for gid, (xo, yo) in carry.items():
                     q_list.append((0.0, xo * sx, yo * sy))
                     gid_list.append(gid)
-                # fresh features (new ids) for content that appears in this window
+                # fresh features (new ids) for content that appears in this window.
+                # ORGANIC per-window cap: resolution-scaled density, not a fixed count -> total
+                # seeds = cap * n_windows scales with frame range (n_windows = T/reseed_every),
+                # so re-seeding REDISTRIBUTES a shot-sized budget over time instead of stacking
+                # max_tracks per window. max_tracks stays only as the upper bound.
+                area_mp = max(0.1, (cur_Ws * cur_Hs) / 1_000_000.0)
+                fresh_cap = int(round(float(getattr(self.cfg, "reseed_density_per_mp", 60.0)) * area_mp))
+                fresh_cap = max(int(getattr(self.cfg, "reseed_seed_floor", 64)),
+                                min(int(self.cfg.max_tracks), fresh_cap))
                 seed_mask, _info, _nm = self._make_seed_inclusion_mask(shot, cur_Ws, cur_Hs)
                 pts = self._detect_features(
-                    blk[0], mask=seed_mask, count=self.cfg.max_tracks,
+                    blk[0], mask=seed_mask, count=fresh_cap,
                     quality=self.cfg.feature_quality, min_dist=self.cfg.min_feature_dist,
                 )
                 for (px, py) in pts:

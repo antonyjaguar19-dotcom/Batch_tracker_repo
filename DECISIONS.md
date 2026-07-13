@@ -17,6 +17,18 @@ Newest first. Dates are absolute.
   machinery — re-seeded tracks are mover-gated + motion-filtered + quality-selected like any
   other (no separate path). New `RunnerConfig.enable_reseed` (default True), `reseed_every` 30,
   `reseed_max_windows` 40; `AppState.reseed`/`reseed_every`; NiceGUI switch + interval slider.
+- **ORGANIC per-window seed budget** (`_chain_core`): a fixed `max_tracks` fresh seeds PER
+  WINDOW multiplied by the window count (`max_tracks * T/reseed_every`) is what saturated the
+  machine on a fast 4K/1440p shot (NOT a memory bug -- the box has 126G free; host RAM peaked
+  ~16G). Replaced with a resolution-scaled density: `fresh_cap = clamp(reseed_density_per_mp *
+  megapixels, reseed_seed_floor, max_tracks)` (defaults 60/MP, floor 64). TOTAL = cap *
+  n_windows scales linearly with the FRAME RANGE (n_windows = T/reseed_every) and with
+  resolution -- re-seeding REDISTRIBUTES a shot-sized budget over time instead of stacking N per
+  window. `max_tracks` is now only the upper bound; goodFeatures still returns fewer on
+  low-texture frames (content-organic). Verified: full-range SH013 with `max_tracks=1200` (the
+  config that previously froze the box) now completes -- ~221 seeds/window, 244 tracks, RAM flat.
+  Also: moving-tile + pattern-refine now SHARE one native decode (reuse the tracking FrameSource
+  at scale 1.0) instead of three concurrent full decodes.
 - **Why / proof**: validated against a **manual artist track** on SH013 (fast motocross
   whip-pan, 2562x1440, real motion blur; `Tracks_Shot_13.txt`, 62 tracks). Real bot output
   (frames 1-150, re-seed on, full pipeline) vs the artist:
