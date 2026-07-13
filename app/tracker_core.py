@@ -104,6 +104,17 @@ class RunnerConfig:
     # under ONE id -> the reappeared segment is kept, not trimmed by the pre-occlusion patch.
     refine_gap_aware: bool = True
 
+    # --- Track replenishment (re-seeding) ---
+    # A single frame-0 seed leaves the frame uncovered once those points exit (fast/low-angle
+    # shots: the close FG sweeps out in a few frames -> FG goes untracked). The chunked path
+    # already seeds FRESH features per window; this bounds the window to `reseed_every` frames
+    # so new features are seeded at least that often (re-seeding), reusing the existing
+    # seed->carry->merge->filter->gate->spread machinery (so re-seeded tracks are mover-gated
+    # and quality-filtered like any other). 0 = off (keep VRAM-only chunking).
+    enable_reseed: bool = True
+    reseed_every: int = 30     # max frames between re-seeds (window cap); 0 = disable
+    reseed_max_windows: int = 40  # safety cap on forced window count
+
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks
     chunk_overlap: int = 24    # frames of overlap between consecutive chunks (chaining band)
@@ -941,8 +952,19 @@ class BatchTrackerRunner:
                 diag = float(np.sqrt(float(W0 * W0 + H0 * H0))) if (W0 > 0 and H0 > 0) else 1000.0
 
                 n_chunks = self._decide_chunks(T, Ws, Hs)
+                # Re-seeding: cap the window to reseed_every frames so fresh features are
+                # seeded at least that often (the chunked path seeds per window). Only ever
+                # INCREASES the window count vs the VRAM decision, so headroom is preserved.
+                reseed_msg = ""
+                if getattr(self.cfg, "enable_reseed", True) and int(getattr(self.cfg, "reseed_every", 0) or 0) > 0:
+                    every = int(self.cfg.reseed_every)
+                    n_reseed = int(math.ceil(T / float(max(1, every))))
+                    n_reseed = min(n_reseed, int(getattr(self.cfg, "reseed_max_windows", 40) or 40))
+                    if n_reseed > n_chunks:
+                        n_chunks = n_reseed
+                        reseed_msg = f" (re-seed every ~{every}f)"
                 free_gb = self._free_vram_bytes() / (1024.0 ** 3)
-                self._status(f"[{i}/{len(vids)}] frames={T} res={Ws}x{Hs} freeVRAM={free_gb:.1f}GB -> chunks={n_chunks}")
+                self._status(f"[{i}/{len(vids)}] frames={T} res={Ws}x{Hs} freeVRAM={free_gb:.1f}GB -> chunks={n_chunks}{reseed_msg}")
 
                 log_f = log_b = log_mid_f = log_mid_b = ""
 

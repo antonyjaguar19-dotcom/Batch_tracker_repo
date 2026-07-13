@@ -5,6 +5,35 @@ Newest first. Dates are absolute.
 
 ---
 
+## 2026-07-13
+
+### TAPNext++: periodic re-seeding (track replenishment on fast/low-angle shots)
+- **What**: a single frame-0 seed leaves the frame uncovered once those points sweep out
+  (fast/low-angle shots: close FG exits in a few frames -> FG untracked the rest of the clip).
+  The chunked path already seeds FRESH features per window; re-seeding **bounds the window to
+  `reseed_every` frames** (`tracker_core._run_impl`, right after `_decide_chunks`: force
+  `n_chunks >= ceil(T/reseed_every)`, capped by `reseed_max_windows`). So fresh features are
+  seeded at least that often, reusing the existing seed->carry->merge->filter->gate->spread
+  machinery — re-seeded tracks are mover-gated + motion-filtered + quality-selected like any
+  other (no separate path). New `RunnerConfig.enable_reseed` (default True), `reseed_every` 30,
+  `reseed_max_windows` 40; `AppState.reseed`/`reseed_every`; NiceGUI switch + interval slider.
+- **Why / proof**: validated against a **manual artist track** on SH013 (fast motocross
+  whip-pan, 2562x1440, real motion blur; `Tracks_Shot_13.txt`, 62 tracks). Real bot output
+  (frames 1-150, re-seed on, full pipeline) vs the artist:
+  - **continuity**: 149 tracks (mean 86f, 112 >=50f) vs 54 (mean 60f, 24 >=50f).
+  - **scatter**: 85 live tracks/frame vs 22; grid-coverage 30.6% vs 29.8% (matched); bot
+    vertical spread narrower (113px vs 189px) — artist still catches some lower grass features.
+  - **accuracy** (seeded at 28 manual points): moving-tile+NCC median **2.8px**, p90 20.5px
+    (a few drift outliers to ~260px on the fastest blur). No mover/junk tracks (bike correctly
+    rejected by the motion filter + spread-quality — the raw experiment harness, which bypassed
+    those filters, showed floating mover tracks; the real pipeline does not).
+- **Not wired**: motion-blur "matched-kernel bank" — proved on synthetic (+69%) but regressed
+  on every real plate (velocity/screen-motion != image blur; jitter up, tracks slide). Cepstral
+  kernel estimation too noisy per-patch on real footage. Blur effort shelved; needs image-based
+  kernel estimation to be viable. See `experiments/moving_tile/` (blur_*, reseed_*, eval_*).
+
+---
+
 ## 2026-07-10
 
 ### TAPNext++: edge tracking + strict disappear/reappear (gap-aware refine)

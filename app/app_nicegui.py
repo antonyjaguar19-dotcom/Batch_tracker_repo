@@ -527,6 +527,15 @@ with ui.row().classes("w-full no-wrap"):
             sw_movtile.tooltip("TAPNext++ only. Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
                                "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
                                "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
+            sw_reseed = ui.switch("Re-seed tracks (fast/low-angle shots)", value=getattr(state, "reseed", True),
+                                  on_change=lambda e: setattr(state, "reseed", bool(e.value)))
+            sw_reseed.tooltip("TAPNext++ only. Seed fresh features periodically across the clip (not just at frame 0) so the "
+                              "frame stays populated when the initial points sweep out on fast/low-angle shots. Re-seeded tracks "
+                              "pass through the same mover-gating + motion filter + spread selection, so movers/junk are still dropped.")
+            ui.label("Re-seed interval (frames)")
+            reseed_every = ui.slider(min=10, max=90, value=int(getattr(state, "reseed_every", 30)), step=5).props("label-always")
+            reseed_every.on_value_change(lambda e: setattr(state, "reseed_every", int(e.value or 30)))
+            reseed_every.tooltip("Max frames between re-seeds. Smaller = denser replenishment (better on very fast shots), more compute.")
             sw_edge = ui.switch("Track to frame edge", value=getattr(state, "edge_track", True),
                                 on_change=lambda e: setattr(state, "edge_track", bool(e.value)))
             sw_edge.tooltip("TAPNext++ only. Keep refining a point right up to the frame border instead of trimming it when "
