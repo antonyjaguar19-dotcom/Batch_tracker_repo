@@ -280,13 +280,48 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
     return sorted(combined, key=lambda t: t[0])
 
 
+class _GrayFromBGR:
+    """Gray provider adapter over a shared BGR FrameSource, so pattern-refine can reuse the
+    native decode moving-tile already holds instead of decoding the clip a second time.
+    Caches converted gray frames in a small LRU (bounds RAM when the BGR source streams)."""
+
+    def __init__(self, src, lru: int = 128):
+        self.src = src
+        self._all = getattr(src, "_arr", None)   # for the 'full-decode' status line
+        self._cache: Dict[int, np.ndarray] = {}
+        self._order: List[int] = []
+        self._lru = int(lru)
+
+    def get(self, idx0: int) -> Optional[np.ndarray]:
+        idx0 = int(idx0)
+        g = self._cache.get(idx0)
+        if g is not None:
+            return g
+        try:
+            win = self.src.get(idx0, 1)
+        except Exception:
+            return None
+        if win is None or win.shape[0] < 1:
+            return None
+        g = cv2.cvtColor(win[0], cv2.COLOR_BGR2GRAY)
+        self._cache[idx0] = g
+        self._order.append(idx0)
+        if len(self._order) > self._lru:
+            self._cache.pop(self._order.pop(0), None)
+        return g
+
+
 def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,
-                  total_frames: int, cfg, status: StatusCB = None) -> Tuple[Dict[str, Track], str]:
+                  total_frames: int, cfg, status: StatusCB = None,
+                  bgr_source=None) -> Tuple[Dict[str, Track], str]:
     """NCC+affine pattern-refine already-selected tracks at native resolution.
 
     `final_tracks` frames are 1-based absolute; y may be flipped for 3DE
     (cfg.flip_y_for_3de) -> un-flip to image space, refine, re-flip on output.
     Returns (refined_tracks, info). Tracks that lose lock immediately are dropped.
+
+    `bgr_source`: optional shared native FrameSource to derive gray from (reuses one decode
+    across moving-tile + refine instead of a second full decode -> avoids the host-RAM freeze).
     """
     if not final_tracks:
         return final_tracks, "no tracks to refine"
@@ -298,7 +333,10 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     def to_out(t: Track) -> Track:
         return [(f, x, (float(H0 - 1) - y) if flip else y) for (f, x, y) in t]
 
-    prov = _FrameGray(video_path, total_frames, host_ram_frac=float(getattr(cfg, "host_ram_frac", 0.5)))
+    if bgr_source is not None:
+        prov = _GrayFromBGR(bgr_source)
+    else:
+        prov = _FrameGray(video_path, total_frames, host_ram_frac=float(getattr(cfg, "host_ram_frac", 0.5)))
     if status:
         status(f"Pattern-refine: {len(final_tracks)} tracks, patch={cfg.refine_patch_px}px "
                f"search=±{cfg.refine_search_px}px motion={cfg.refine_motion} "

@@ -117,13 +117,18 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
 
 
 def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,
-                       total_frames: int, engine, cfg, status: StatusCB = None
+                       total_frames: int, engine, cfg, status: StatusCB = None,
+                       src: "FrameSource | None" = None
                        ) -> Tuple[Dict[str, Track], str]:
     """Native moving-tile re-track of already-selected tracks (before pattern_refine).
 
     `final_tracks` frames are 1-based absolute; y may be 3DE-flipped (cfg.flip_y_for_3de)
     -> un-flip to image space, re-track, re-flip on output. Non-destructive: track count
     and length are preserved; only positions move.
+
+    `src`: an optional pre-built native (scale 1.0) FrameSource to REUSE, so the caller can
+    share ONE native decode with pattern_refine instead of each stage decoding the clip again
+    (three concurrent full decodes of a 4K/1440p clip is what exhausts host RAM).
     """
     if not final_tracks:
         return final_tracks, "no tracks"
@@ -135,22 +140,23 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
     edge_track = bool(getattr(cfg, "mt_edge_track", True))
     flip = bool(getattr(cfg, "flip_y_for_3de", True)) and H0 > 0
 
-    # native BGR frame provider: hold whole clip if it fits the RAM budget, else stream.
-    frac = float(getattr(cfg, "host_ram_frac", 0.5) or 0.5)
-    stream = False
-    try:
-        need = int(estimate_clip_bytes(video_path, 1.0))
-        import psutil  # type: ignore
-        budget = int(psutil.virtual_memory().available * frac)
-        stream = need > budget
-    except Exception:
+    if src is None:
+        # native BGR frame provider: hold whole clip if it fits the RAM budget, else stream.
+        frac = float(getattr(cfg, "host_ram_frac", 0.5) or 0.5)
         stream = False
-    sd = str(getattr(cfg, "stream_decode", "auto") or "auto").lower()
-    if sd == "always":
-        stream = True
-    elif sd == "never":
-        stream = False
-    src = FrameSource(video_path, 1.0, stream=stream)
+        try:
+            need = int(estimate_clip_bytes(video_path, 1.0))
+            import psutil  # type: ignore
+            budget = int(psutil.virtual_memory().available * frac)
+            stream = need > budget
+        except Exception:
+            stream = False
+        sd = str(getattr(cfg, "stream_decode", "auto") or "auto").lower()
+        if sd == "always":
+            stream = True
+        elif sd == "never":
+            stream = False
+        src = FrameSource(video_path, 1.0, stream=stream)
 
     if status:
         status(f"Moving-tile: {len(final_tracks)} tracks, tile {_TILE}px win={win} "

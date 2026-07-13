@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import gc
 import time
 import math
 import threading
@@ -1067,6 +1068,47 @@ class BatchTrackerRunner:
                                               f"(seeded={total_candidates} after_filter={diag_after_filter} "
                                               f"after_gate={diag_after_gate} short={diag_short})")
 
+                # --- Host-RAM: free the (scaled) tracking frames and build ONE native decode
+                # shared by moving-tile + pattern-refine. Three concurrent full decodes of a
+                # 4K/1440p clip (tracking + moving-tile BGR + refine gray) exhaust host RAM and
+                # freeze the machine. When tracking already holds the NATIVE frames (scale 1.0,
+                # full-decode), reuse them directly -> a single decode for the whole shot.
+                refine_src = None
+                if final_tracks_out and (getattr(self.cfg, "enable_moving_tile", True)
+                                         or self.cfg.enable_pattern_refine):
+                    if float(scale) == 1.0 and source is not None:
+                        refine_src = source                       # already native (full or streamed) -> reuse
+                    else:
+                        # free the scaled tracking array + any single-block frames, then decode
+                        # (or stream) the native clip ONCE for both refine stages.
+                        try:
+                            if source is not None and getattr(source, "_arr", None) is not None:
+                                source._arr = None
+                        except Exception:
+                            pass
+                        try:
+                            frames_fwd = None  # single-block path holds this at scale
+                        except Exception:
+                            pass
+                        gc.collect(); torch.cuda.empty_cache()
+                        stream_native = False
+                        try:
+                            import psutil  # type: ignore
+                            need = int(estimate_clip_bytes(in_path, 1.0))
+                            budget = int(psutil.virtual_memory().available * float(self.cfg.host_ram_frac))
+                            stream_native = need > budget
+                        except Exception:
+                            stream_native = False
+                        sdn = (self.cfg.stream_decode or "auto").strip().lower()
+                        if sdn == "always":
+                            stream_native = True
+                        elif sdn == "never":
+                            stream_native = False
+                        try:
+                            refine_src = FrameSource(in_path, scale=1.0, stream=stream_native)
+                        except Exception:
+                            refine_src = None
+
                 # Moving-tile native re-track: fix the coarse 256px position on the full-res
                 # plate BEFORE NCC (NCC can't recover a position that started several px off).
                 # Runs only on the handful of selected tracks; non-destructive (count/len kept).
@@ -1076,7 +1118,7 @@ class BatchTrackerRunner:
                         self._status(f"[{i}/{len(vids)}] Moving-tile native re-track at {W0}x{H0}...")
                         final_tracks_out, minfo = moving_tile_refine(
                             final_tracks_out, in_path, W0, H0, orig_total, engine, self.cfg,
-                            status=lambda m: self._status(f"TRACK: {m}"))
+                            status=lambda m: self._status(f"TRACK: {m}"), src=refine_src)
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] MOVINGTILE {shot}: {minfo}")
                     except Exception as e:
                         self._status(f"[{i}/{len(vids)}] Moving-tile skipped: {e}")
@@ -1089,7 +1131,7 @@ class BatchTrackerRunner:
                         self._status(f"[{i}/{len(vids)}] Pattern-refine (NCC/{self.cfg.refine_motion}) at {W0}x{H0}...")
                         final_tracks_out, rinfo = refine_tracks(
                             final_tracks_out, in_path, W0, H0, orig_total, self.cfg,
-                            status=lambda m: self._status(f"TRACK: {m}"))
+                            status=lambda m: self._status(f"TRACK: {m}"), bgr_source=refine_src)
                         total_kept = len(final_tracks_out)
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:
@@ -1100,7 +1142,8 @@ class BatchTrackerRunner:
                 out_txt = os.path.join(self.cfg.output_dir, base)
                 write_tracks_txt(out_txt, final_tracks_out, end_frame=T)
 
-                torch.cuda.empty_cache()
+                refine_src = None            # release the shared native decode before next shot
+                gc.collect(); torch.cuda.empty_cache()
                 secs = time.time() - shot_start
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 msg = f"kept {total_kept}/{total_candidates} | F:{log_f} | B:{log_b} | MF:{log_mid_f} | MB:{log_mid_b}"
