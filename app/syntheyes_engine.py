@@ -1144,9 +1144,8 @@ class SynthEyesEngine:
         """Gate the exported 3DE tracks against the SAM3 masks in Python (yesterday's proven
         method - more robust than SynthEyes roto matte). For each track point (frame,x,y),
         sample the mask at (x,y): white(>=127)=background=KEEP, black=mover=DROP. Coords index
-        the mask directly (px=0.5*(u+1)*w, py=0.5*(1-v)*h, NOT Y-flipped). Also truncates the
-        Demo-build 'frozen tail' (>=2 identical consecutive coords). Rewrites txt_path in place.
-        Returns (kept_tracks, kept_points)."""
+        the mask directly (px=0.5*(u+1)*w, py=0.5*(1-v)*h, NOT Y-flipped). Rewrites txt_path in
+        place. Returns (kept_tracks, kept_points)."""
         import glob
         import cv2  # type: ignore
         import numpy as np
@@ -1204,14 +1203,12 @@ class SynthEyesEngine:
                 parts = nxt().split()
                 fr, x, y = int(parts[0]), float(parts[1]), float(parts[2])
                 pts.append((fr, x, y))
-            # truncate frozen tail (Demo build holds the last real coord)
-            trimmed = [pts[0]] if pts else []
-            for i in range(1, len(pts)):
-                if abs(pts[i][1] - pts[i - 1][1]) < 1e-4 and abs(pts[i][2] - pts[i - 1][2]) < 1e-4:
-                    break
-                trimmed.append(pts[i])
-            # SAM3 gating: keep only background points
-            gated = [(fr, x, y) for (fr, x, y) in trimmed if keep_point(fr, x, y)]
+            # SAM3 gating: keep only background points. (The Demo build's "frozen tail"
+            # truncation was removed for the Pro license: Pro produces real full-length
+            # tracks with no held-coord padding, and a genuinely static feature -- a
+            # locked-off plate, a bolt on a wall -- legitimately holds identical coords,
+            # so truncating on the first repeated coord would chop real tracks.)
+            gated = [(fr, x, y) for (fr, x, y) in pts if keep_point(fr, x, y)]
             if len(gated) >= min_len:
                 out_tracks.append((name, color, gated))
 
