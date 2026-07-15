@@ -177,11 +177,17 @@ SE_DEFAULTS = {
     "fps":            24.0,
     # Long-shot chunking: blipping thousands of 4K frames at once OOMs SynthEyes
     # ('Imminent Crash'). Above chunk_threshold frames, blip/peel per playback-range
-    # window (bounded blip memory) and accumulate trackers; 0/False disables.
-    "chunk_long_shots": True,
-    "chunk_threshold":  1000,
-    "chunk_size":       600,
-    "chunk_overlap":    24,
+    # window (bounded blip memory) and accumulate trackers; chunk_long_shots False disables.
+    # Window SIZE is ADAPTIVE (not fixed): seeded from resolution (chunk_frames_per_mp),
+    # self-calibrated from live SynthEyes RSS, shrunk toward a RAM ceiling + on the crash
+    # dialog. chunk_size>0 forces a fixed window (manual override).
+    "chunk_long_shots":    True,
+    "chunk_threshold":     1000,
+    "chunk_size":          0,       # 0 = adaptive; >0 = fixed window size (override)
+    "chunk_overlap":       24,
+    "chunk_frames_per_mp": 5000,    # seed: ~600 frames @ 4K (8.3 MP); HD bigger, 8K smaller
+    "chunk_ram_frac":      0.5,     # SynthEyes RSS headroom = this fraction of available RAM
+    "chunk_min_window":    120,     # never shrink a window below this
 }
 
 
@@ -504,58 +510,176 @@ class SynthEyesEngine:
         if not self._win32_click_button("Clear blips", ["Clear all blips"]):
             self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
 
-    def _plan_windows(self, start, end, size, overlap):
-        """Contiguous (optionally overlapping) [a,b] frame windows covering [start,end]."""
-        size = max(100, int(size))
-        overlap = max(0, min(int(overlap), size - 1))
-        windows = []
+    def _dismiss_error_dialog(self):
+        """Click OK / close any SynthEyes crash/OOM #32770 dialog so a chunked run can
+        recover and retry with a smaller window."""
+        user32 = ctypes.windll.user32
+        try:
+            import psutil
+            pids = {p.info["pid"] for p in psutil.process_iter(["name", "pid"])
+                    if "syntheyes" in (p.info["name"] or "").lower()}
+        except ImportError:
+            return
+        targets = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lp):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                c = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, c, 64)
+                if c.value == "#32770":
+                    t = ctypes.create_unicode_buffer(160)
+                    user32.GetWindowTextW(hwnd, t, 160)
+                    if any(b in (t.value or "").lower() for b in self._OP_ERROR_TERMS):
+                        targets.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumProc(_cb), 0)
+        for h in targets:
+            ok = user32.GetDlgItem(h, 1)  # IDOK
+            if ok:
+                user32.PostMessageW(ok, _WM_LBUTTONDOWN, _MK_LBUTTON, 0)
+                user32.PostMessageW(ok, _WM_LBUTTONUP, 0, 0)
+            else:
+                user32.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE
+            self.log("   dismissed a SynthEyes crash/error dialog")
+        if targets:
+            time.sleep(0.5)
+
+    def _blip_peel_chunked(self, shot, start, end, frame_count, blip_timeout, peel_timeout,
+                           img_w=None, img_h=None):
+        """Long-shot path: blip/peel one playback-range WINDOW at a time so SynthEyes never
+        holds blips for the whole shot at once (that OOMs -> 'Imminent Crash'). Blips are
+        cleared after each window's peel to free their (heavy) memory; peeled trackers
+        ACCUMULATE (they are light) and the full-range Sizzle export afterward covers the
+        whole shot. 'Blips playback range' + SetAnimStart/End confine the blip to the window
+        (probe-verified).
+
+        Window size is ADAPTIVE, not a fixed constant:
+          A) seeded from plate resolution -- chunk_frames_per_mp / megapixels, anchored to a
+             known-safe ~600 frames @ 4K, so HD gets bigger windows and 8K smaller;
+          B) self-calibrated live -- the first window's SynthEyes RSS growth gives real
+             MB/frame on THIS machine+settings, then later windows are sized to a RAM ceiling
+             and shrink as accumulated trackers raise the baseline (never grows past the
+             resolution-safe seed);
+          C) crash-guarded -- if the 'Imminent Crash' dialog fires mid-blip, dismiss it,
+             halve the window, and retry.
+        chunk_size>0 forces a fixed window (manual override)."""
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        proc = None
+        if psutil:
+            pid = self._syntheyes_pid()
+            try:
+                proc = psutil.Process(pid) if pid else None
+            except Exception:
+                proc = None
+
+        def rss():
+            try:
+                return proc.memory_info().rss if proc else 0
+            except Exception:
+                return 0
+
+        overlap = int(self._s("chunk_overlap") or 24)
+        min_win = max(30, int(self._s("chunk_min_window") or 120))
+        fixed = int(self._s("chunk_size") or 0)   # >0 => fixed window (disable adaptive size)
+
+        # A) resolution-seeded window
+        mp = 8.3
+        if img_w and img_h:
+            mp = max(0.5, (float(img_w) * float(img_h)) / 1e6)
+        frames_per_mp = float(self._s("chunk_frames_per_mp") or 5000.0)
+        seed = fixed if fixed > 0 else int(frames_per_mp / mp)
+        win0 = max(min_win, min(frame_count, seed))
+
+        # B) RAM ceiling for adaptive sizing
+        ram_frac = float(self._s("chunk_ram_frac") or 0.5)
+        base0 = rss()
+        ceiling = None
+        if proc and psutil:
+            try:
+                ceiling = base0 + int(psutil.virtual_memory().available * ram_frac)
+            except Exception:
+                ceiling = None
+        rss_per_frame = None
+
+        self.log(f"-> Long shot ({frame_count} frames, ~{mp:.1f}MP): "
+                 f"{'fixed' if fixed > 0 else 'adaptive'} chunking, seed window {win0}"
+                 + (f", RSS base {base0/1e9:.1f}GB" if proc else " (no psutil)"))
+
         a = start
+        idx = 0
+        win = win0
         while a <= end:
-            b = min(a + size - 1, end)
-            windows.append((a, b))
+            if getattr(self, "_stop_requested", False):
+                self.log("   chunked blip/peel stopped by user."); return
+            idx += 1
+            # size this window: shrink toward the ceiling as the baseline creeps up with
+            # accumulated trackers; never exceed the resolution-safe seed.
+            if fixed <= 0 and rss_per_frame and ceiling:
+                room = max(0, ceiling - rss())
+                win = max(min_win, min(win0, int(room / rss_per_frame)))
+            b = min(a + win - 1, end)
+
+            # C) blip the window; on a crash/OOM dialog, shrink and retry
+            attempt = 0
+            rss_before = rss()
+            while True:
+                attempt += 1
+                self._set_frame_range(shot, a, b)
+                self._ensure_features_room()
+                self._bring_foreground()
+                wto = max(120, int((b - a + 1) * 0.3))
+                if self._win32_click_button("Blips playback range",
+                                            ["Blips playback range", "Blip playback range"]):
+                    ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
+                else:
+                    self.log("   'Blips playback range' not found - falling back to Blip All")
+                    self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
+                    ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
+                if ok or getattr(self, "_stop_requested", False):
+                    break
+                # crash/OOM signal -> recover + shrink + retry
+                self._dismiss_error_dialog()
+                self._win32_click_button("Clear blips", ["Clear all blips"])
+                if not self.is_alive():
+                    raise RuntimeError("SynthEyes crashed during chunked blip (OOM)")
+                shrunk = max(min_win, (b - a + 1) // 2)
+                if shrunk >= (b - a + 1) or attempt > 6:
+                    self.log(f"   window {a}-{b}: cannot shrink further -> proceeding"); break
+                win = shrunk
+                b = min(a + win - 1, end)
+                self.log(f"   memory pressure -> shrink window to {a}-{b} ({win}f) and retry")
+
+            # B) calibrate MB/frame from the first successful window
+            if fixed <= 0 and rss_per_frame is None and proc:
+                peak = rss()
+                frames = max(1, b - a + 1)
+                if peak > rss_before:
+                    rss_per_frame = (peak - rss_before) / frames
+                    self.log(f"   calibrated ~{rss_per_frame/1e6:.1f} MB/frame @ {mp:.1f}MP; "
+                             f"later windows sized to the RAM ceiling")
+
+            self.log(f"   [window {idx}] frames {a}-{b} ({b - a + 1}f) blipped")
+            if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+                self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
+                                         max_timeout=max(200, int((b - a + 1) * 1.2)))
+            self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
+
             if b >= end:
                 break
             a = b + 1 - overlap
-        return windows
 
-    def _blip_peel_chunked(self, shot, start, end, frame_count, blip_timeout, peel_timeout):
-        """Long-shot path: blip/peel one playback-range WINDOW at a time. SynthEyes holds
-        blips only for the window (bounded memory), we peel them into trackers, then Clear
-        all blips to free that memory before the next window. Trackers ACCUMULATE across
-        windows (peeled trackers are light); the full-range Sizzle export afterward covers
-        the whole shot. 'Blips playback range' + SetAnimStart/End confines the blip to the
-        window (probe-verified). Restores the full range at the end so export is complete."""
-        size = int(self._s("chunk_size") or 600)
-        overlap = int(self._s("chunk_overlap") or 24)
-        windows = self._plan_windows(start, end, size, overlap)
-        # per-window timeouts scale to the window, not the whole shot
-        w_blip_to = max(200, int(size * 0.3))
-        w_peel_to = max(200, int(size * 1.2))
-        self.log(f"-> Long shot ({frame_count} frames) -> chunked blip/peel: "
-                 f"{len(windows)} windows of ~{size} (overlap {overlap})")
-        for i, (a, b) in enumerate(windows, 1):
-            if getattr(self, "_stop_requested", False):
-                self.log("   chunked blip/peel stopped by user."); return
-            self.log(f"   [window {i}/{len(windows)}] frames {a}-{b}")
-            self._set_frame_range(shot, a, b)
-            self._ensure_features_room()
-            self._bring_foreground()
-            if self._win32_click_button("Blips playback range",
-                                        ["Blips playback range", "Blip playback range"]):
-                self._wait_for_operation(f"Blip w{i}", min_wait=2.0, max_timeout=w_blip_to)
-            else:
-                # Fallback: no range button -> blip-all (defeats the memory bound, but keeps
-                # the shot from failing outright on builds without that control).
-                self.log("   'Blips playback range' not found - falling back to Blip All")
-                if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
-                    self._wait_for_operation(f"Blip w{i}", min_wait=2.0, max_timeout=blip_timeout)
-            if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-                self._wait_for_operation(f"Peel w{i}", min_wait=2.0, max_timeout=w_peel_to)
-            # free the heavy blip memory before the next window
-            self._win32_click_button("Clear blips", ["Clear all blips"])
         # restore the full range so the Sizzle export walks the whole shot
         self._set_frame_range(shot, start, end)
-        self.log(f"-> Chunked blip/peel done ({len(windows)} windows); trackers accumulated.")
+        self.log(f"-> Adaptive chunked blip/peel done ({idx} windows); trackers accumulated.")
 
     def _bring_foreground(self):
         """Show + foreground the SynthEyes main window so the Features panel actually
@@ -962,8 +1086,12 @@ class SynthEyesEngine:
         if bool(self._s("chunk_long_shots")) and frame_count > chunk_threshold:
             # Long shots: blip a playback-range window at a time so SynthEyes never holds
             # blips for thousands of 4K frames at once (that OOMs -> 'Imminent Crash').
+            # Pass the plate resolution so the window size adapts to it (see _blip_peel_chunked).
+            cw, ch = image_width, image_height
+            if not cw or not ch:
+                cw, ch = read_image_size(first_frame)
             self._blip_peel_chunked(shot, start_frame, end_frame, frame_count,
-                                    blip_timeout, peel_timeout)
+                                    blip_timeout, peel_timeout, img_w=cw, img_h=ch)
         else:
             self._blip_peel_full(frame_count, blip_timeout, peel_timeout)
 
