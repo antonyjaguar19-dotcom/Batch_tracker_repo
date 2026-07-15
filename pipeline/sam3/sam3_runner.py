@@ -41,9 +41,9 @@ class RunnerConfig:
     mask_dilation_px: int = 0
     # Preview PNGs (preview_<frame>.png) are QC-only — the tracker reads masks/, never
     # preview/. Rendering them costs an extra full-res decode + RGBA composite + PNG
-    # encode PER FRAME, meaningful on 4K batches. Turn off for speed runs (masks still
-    # written). Also gated by env BTR_SAVE_PREVIEWS=0.
-    save_previews: bool = True
+    # encode PER FRAME (~1.8s/frame @ 4K, ~5min per 180-frame shot). OFF by default;
+    # flip on (or env BTR_SAVE_PREVIEWS=1) only when you want the QC overlays.
+    save_previews: bool = False
 
 
 def load_masking_guide(path: str | Path) -> Dict[str, Any]:
@@ -668,9 +668,14 @@ def run_sam3_batch(
             log("  motion backstop: ON (mask pixels moving independently of camera)")
         prev_frame_path: Optional[Path] = None
 
-        # QC preview render is optional (masks are always written). Time it so the user
-        # can see the real per-shot saving when it's off.
-        previews_on = bool(getattr(cfg, "save_previews", True)) and (os.environ.get("BTR_SAVE_PREVIEWS", "1") != "0")
+        # QC preview render is optional + OFF by default (masks are always written).
+        # env BTR_SAVE_PREVIEWS overrides the config either way; render time is logged so
+        # the cost is visible when it IS on.
+        _env_prev = os.environ.get("BTR_SAVE_PREVIEWS")
+        if _env_prev is not None:
+            previews_on = _env_prev.strip().lower() not in ("0", "false", "no", "")
+        else:
+            previews_on = bool(getattr(cfg, "save_previews", False))
         prev_secs = 0.0
 
         for frame_path in frames:

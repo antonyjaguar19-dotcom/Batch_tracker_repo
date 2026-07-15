@@ -600,10 +600,10 @@ with ui.row().classes("w-full no-wrap"):
         sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
                           "Turn OFF if it masks things you removed from Exclude.")
 
-        sw_previews = ui.switch("Save QC previews", value=True,
+        sw_previews = ui.switch("Save QC previews", value=False,
                                 on_change=lambda e: setattr(state, "save_previews", bool(e.value)))
-        sw_previews.tooltip("Red-overlay preview PNGs for eyeballing masks (QC only — the tracker never reads them). "
-                            "Turn OFF for faster batches; masks are still written. Per-shot render time is logged.")
+        sw_previews.tooltip("OFF by default — red-overlay preview PNGs are QC-only (the tracker never reads them) "
+                            "and cost ~1.8s/frame @ 4K. Masks are always written. Flip on only to eyeball masks.")
 
         ui.markdown("### Find shots")
         ui.input("Find shots", placeholder="type part of a shot name…").classes("w-full").on_value_change(on_search)

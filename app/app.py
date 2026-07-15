@@ -530,7 +530,7 @@ class AppState:
     log_history: List[str] = field(default_factory=list)
     filter_query: str = ""
     motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
-    save_previews: bool = True     # SAM3 QC preview PNGs; off = faster batches (masks still written)
+    save_previews: bool = False    # SAM3 QC preview PNGs OFF by default (masks still written); ~1.8s/frame @ 4K
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
