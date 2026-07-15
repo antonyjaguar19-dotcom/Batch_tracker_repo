@@ -5,7 +5,6 @@ from typing import Any, Dict, List
 
 from .io_parsers import ShotItem, get_qwen2_shot, _norm_shot
 from .heuristics import (
-    propose_mask_plan,
     build_sam3_prompts,
     filter_things_by_scene,
     allowed_mask_terms,
@@ -15,38 +14,6 @@ from .heuristics import (
     pick_object_subject,
     dynamic_subjects,
 )
-from .ollama_backend import OllamaReasoner
-
-
-def _format_for_llm(
-    shot: str,
-    client_note: str,
-    scene: str,
-    cam: str,
-    things_filtered: List[str],
-    plan: Dict[str, Any],
-) -> str:
-    things_str = ", ".join(things_filtered) if things_filtered else "(none)"
-    return f"""SHOT: {shot}
-
-CLIENT NOTE:
-{client_note}
-
-QWEN2 ANALYSIS:
-Scene description: {scene}
-Camera movement: {cam if cam else "(unknown)"}
-Detected things (filtered by scene text): {things_str}
-
-HEURISTIC SUGGESTED PLAN:
-Suggested tracking targets: {plan.get("suggested_tracking_targets")}
-Suggested track_mode: {plan.get("suggested_track_mode")}
-Suggested mask_excludes: {plan.get("suggested_mask_excludes")}
-Moving foreground terms (camera safety): {plan.get("moving_terms")}
-
-Task:
-Return JSON only with mask_includes/mask_excludes/track_mode/tracking_targets/confidence/notes.
-Only use mask nouns from the filtered things list.
-"""
 
 
 def _filter_list(xs: List[Any], allowed: set) -> List[str]:
@@ -153,12 +120,17 @@ def _qwen_fields(q: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_batch_tracker_json(items: List[ShotItem], qwen2_map: Dict[str, Dict[str, Any]], reasoner: OllamaReasoner) -> Dict[str, Any]:
+def build_batch_tracker_json(items: List[ShotItem], qwen2_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Build mask guidance JSON.
 
     Output schema v2.1:
       - shots[].tasks is authoritative.
       - top-level mask_includes/mask_excludes/track_mode remain for backward compatibility.
+
+    Qwen-only decisioning: no text LLM (Ollama/LLaMA) is consulted. camera/object/both
+    intents are deterministic heuristics over Qwen's structured matchmove signals;
+    ambiguous intent defaults to a camera task via _build_camera_task (same as the
+    uncovered-shot synthesis below), which carries Qwen's mover signals.
     """
 
     out: Dict[str, Any] = {
@@ -222,43 +194,15 @@ def build_batch_tracker_json(items: List[ShotItem], qwen2_map: Dict[str, Dict[st
             confidence = 0.9 if (obj_task.get("mask_includes")) else 0.75
 
         else:
-            plan = propose_mask_plan(it.client_note, scene, things_raw, cam)
-            user_text = _format_for_llm(it.shot, it.client_note, scene, cam, things_filtered, plan)
-            llm_failed = False
-            try:
-                data = reasoner.reason_one(user_text)
-            except Exception as e:
-                # Ollama unreachable/down: don't abort the whole batch — fall back to
-                # the deterministic heuristic plan for this ambiguous shot.
-                llm_failed = True
-                print(f"WARNING: Ollama unavailable for shot {it.shot} ({e}). "
-                      f"Falling back to deterministic plan.")
-                data = {
-                    "mask_includes": plan.get("suggested_mask_includes", []),
-                    "mask_excludes": plan.get("suggested_mask_excludes", []),
-                    "track_mode": plan.get("suggested_track_mode", "no_mask_needed"),
-                    "confidence": 0.4,
-                    "notes": "Ollama offline — deterministic fallback.",
-                }
-
-            mi = _filter_list(data.get("mask_includes", []), allowed)
-            me = _filter_list(data.get("mask_excludes", []), allowed)
-            tm = data.get("track_mode", "no_mask_needed")
-            if tm not in ["track_inside_mask", "track_outside_mask", "no_mask_needed"]:
-                tm = "no_mask_needed"
-
-            if tm == "track_inside_mask" and not mi:
-                tm = "no_mask_needed"
-
-            if tm == "track_outside_mask":
-                mi = []
-                me = cap_excludes(me, cap=4)
-
-            other_task = _task_dict("other", tm, mi, me)
-            other_task["notes"] = "Ambiguous intent: LLaMA output with strict noun gating."
-            tasks = [other_task]
-            confidence = float(data.get("confidence", 0.6))
-            notes = f"Ambiguous intent: used LLaMA with strict noun gating. {data.get('notes','')}".strip()
+            # Ambiguous client intent (no clear camera/object/both cue): default to a
+            # camera solve. _build_camera_task folds in Qwen's structured mover signals
+            # (moving_things / foreground_occluders / bad_track_regions / dynamic_subjects),
+            # which is richer + more deterministic than the old text-LLM prose pass.
+            cam_task = _build_camera_task(scene, things_filtered, allowed, q)
+            cam_task["notes"] = "Ambiguous intent => default camera task (Qwen signals, deterministic)."
+            tasks = [cam_task]
+            notes = cam_task["notes"]
+            confidence = 0.7
 
         primary = tasks[0] if tasks else _task_dict("other", "no_mask_needed", [], [])
 

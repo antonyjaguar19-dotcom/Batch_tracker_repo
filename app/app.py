@@ -832,15 +832,13 @@ def _ensure_ollama(base_url: str = None, model: str = "llama3.1:8b", timeout: fl
 def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
     try:
         logger("--- Starting Step 2: Analysis & Decision ---")
-        global load_requirements, load_qwen2_v1_scene_cam_things, OllamaConfig, OllamaReasoner, build_batch_tracker_json
+        global load_requirements, load_qwen2_v1_scene_cam_things, build_batch_tracker_json
         try:
             from core.io_parsers import load_requirements, load_qwen2_v1_scene_cam_things
-            from core.ollama_backend import OllamaConfig, OllamaReasoner
             from core.bridge import build_batch_tracker_json
         except ImportError:
             sys.path.append(os.getcwd())
             from core.io_parsers import load_requirements, load_qwen2_v1_scene_cam_things
-            from core.ollama_backend import OllamaConfig, OllamaReasoner
             from core.bridge import build_batch_tracker_json
 
         batch_dir = Path(out_dir) / "_batches" / f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -855,8 +853,7 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         qwen_json = run_qwen2_batch(in_dir=in_dir, out_dir=str(batch_dir), fps=int(fps),
                                     use_int4=True, log_cb=logger, only_shots=(selected or None))
         
-        logger("Running LLaMA (Ollama) Decision Engine...")
-        _ensure_ollama(ollama_url, "llama3.1:8b")
+        logger("Building mask guidance (Qwen signals + deterministic heuristics)...")
         reqs = []
         if req_path and os.path.exists(req_path):
             try:
@@ -896,9 +893,7 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         if before != len(reqs):
             logger(f"Skipped {before - len(reqs)} requirement(s) for shots not analyzed this run.")
 
-        cfg = OllamaConfig(base_url=ollama_url, model="llama3.1:8b", temperature=0.2)
-        reasoner = OllamaReasoner(cfg)
-        guide_data = build_batch_tracker_json(items=reqs, qwen2_map=qmap, reasoner=reasoner)
+        guide_data = build_batch_tracker_json(items=reqs, qwen2_map=qmap)
         
         guide_path = batch_dir / "mask_guidance.json"
         with open(guide_path, "w", encoding="utf-8") as f:
@@ -955,9 +950,8 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
             logger("No shots selected. Tick the 'Use' box on at least one shot, then retry.")
             JOB_QUEUE.put("DONE_MASKING")
             return
-        # Free analysis models before loading SAM3: unload the Ollama LLM (kept resident
-        # through Analyze) + clear any leftover Qwen VRAM.
-        _free_ollama(base_url=DEFAULT_OLLAMA_URL)
+        # Free analysis models before loading SAM3: clear any leftover Qwen VRAM.
+        # (No Ollama LLM to unload — decisioning is Qwen-only now.)
         _free_vram("before SAM3")
         _ensure_sam3_loaded()
         if SamConfig is None: raise ImportError(f"SAM3 module missing. {SAM3_IMPORT_ERROR}")
