@@ -348,6 +348,129 @@ class SynthEyesEngine:
             time.sleep(min(0.5, end - time.time()))
         return True
 
+    # ------ active completion detection (replaces fixed blip/peel waits) ------
+    # On 2026.2.4679 there's no working API to poll blip/peel completion (broken SyPy3).
+    # A probe (2026-07) found two OS-level signals instead: (1) blip/peel spawn a transient
+    # #32770 progress dialog ('Computing Blips' -> 'Linking'; present ~1s for 300 frames,
+    # ~40s+ for 2114) that closes on completion, and (2) the process CPU pegs to thousands
+    # of % during the op and drops to ~idle when done. We wait on BOTH (dialog-present OR
+    # CPU-pegged = working; dialog-gone AND CPU-idle = done), abort on a crash/error dialog
+    # (long-shot OOM shows 'Imminent Crash'), and cap with a max timeout so it can't hang.
+
+    def _syntheyes_pid(self):
+        try:
+            import psutil
+        except ImportError:
+            return None
+        for p in psutil.process_iter(["name", "pid"]):
+            if "syntheyes" in (p.info["name"] or "").lower():
+                return p.info["pid"]
+        return None
+
+    # Match SPECIFIC titles, not "any dialog": a benign startup dialog (crash-recovery
+    # after a force-kill, license, tip) must count as NEITHER progress (else the wait never
+    # ends) NOR error (else we abort the wait too early). Progress dialogs seen in the probe:
+    # 'Computing Blips', 'Linking' (blip), 'Peeling'/'Computing' (peel). The real abort
+    # signal is the long-shot OOM dialog 'SynthEyes Imminent Crash' -> match it precisely.
+    _OP_PROGRESS_TERMS = ("computing", "linking", "peel", "blip", "solv", "refin",
+                          "processing", "please wait", "working")
+    _OP_ERROR_TERMS = ("imminent", "out of memory")
+
+    def _op_dialog_state(self):
+        """(progress_present, error_present) across SynthEyes #32770 dialogs, matched by
+        KNOWN titles so benign dialogs (crash-recovery, license, tips) are ignored."""
+        user32 = ctypes.windll.user32
+        try:
+            import psutil
+            pids = {p.info["pid"] for p in psutil.process_iter(["name", "pid"])
+                    if "syntheyes" in (p.info["name"] or "").lower()}
+        except ImportError:
+            return (False, False)
+        if not pids:
+            return (False, False)
+        state = {"prog": False, "err": False}
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lp):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                c = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, c, 64)
+                if c.value == "#32770":
+                    t = ctypes.create_unicode_buffer(160)
+                    user32.GetWindowTextW(hwnd, t, 160)
+                    title = (t.value or "").strip().lower()
+                    if title:
+                        if any(b in title for b in self._OP_ERROR_TERMS):
+                            state["err"] = True
+                        elif any(b in title for b in self._OP_PROGRESS_TERMS):
+                            state["prog"] = True
+            return True
+
+        user32.EnumWindows(EnumProc(_cb), 0)
+        return (state["prog"], state["err"])
+
+    def _wait_for_operation(self, label, min_wait=3.0, max_timeout=600.0,
+                            peak_cpu=250.0, idle_hold=1.5, start_grace=6.0):
+        """Wait for a SynthEyes long-op (blip/peel) to finish via live signals instead of a
+        fixed sleep. Returns True when done (or on the timeout ceiling, to never hang the
+        batch); False on stop-request or a crash/error dialog. Falls back to a fixed sleep if
+        psutil is unavailable."""
+        pid = self._syntheyes_pid()
+        proc = None
+        try:
+            import psutil
+            if pid:
+                proc = psutil.Process(pid)
+                proc.cpu_percent(None)  # prime the delta
+        except Exception:
+            proc = None
+
+        t0 = time.time()
+        peaked = False
+        seen_dialog = False
+        low_since = None
+        while time.time() - t0 < max_timeout:
+            if getattr(self, "_stop_requested", False):
+                return False
+            prog, err = self._op_dialog_state()
+            if err:
+                self.log(f"   {label}: SynthEyes crash/error dialog -> aborting op")
+                return False
+            if proc is not None:
+                try:
+                    cpu = proc.cpu_percent(interval=0.3)
+                except Exception:
+                    self.log(f"   {label}: SynthEyes process gone during wait")
+                    return False
+            else:
+                cpu = 0.0
+                time.sleep(0.3)
+            el = time.time() - t0
+            if prog:
+                seen_dialog = True
+            if cpu >= peak_cpu:
+                peaked = True
+            working = prog or (cpu >= peak_cpu)
+            if working:
+                low_since = None
+            else:
+                if low_since is None:
+                    low_since = time.time()
+                idled = time.time() - low_since
+                # release once idle has held long enough, past min_wait, and we've either
+                # seen real work (CPU peak / progress dialog) or waited out start_grace (for
+                # an instant/no-op op like peel on a short shot, or no-psutil fallback).
+                ready = peaked or seen_dialog or (proc is None) or (el >= start_grace)
+                if el >= min_wait and idled >= idle_hold and ready:
+                    self.log(f"   {label}: complete at ~{el:.1f}s (dialog gone + CPU idle)")
+                    return True
+        self.log(f"   {label}: hit {max_timeout:.0f}s ceiling -> proceeding")
+        return True
+
     def _bring_foreground(self):
         """Show + foreground the SynthEyes main window so the Features panel actually
         paints and its blip/peel child controls get instantiated (they don't exist while
@@ -748,22 +871,20 @@ class SynthEyesEngine:
         self._bring_foreground()
 
         blip_timeout = max(400, int(frame_count * 0.2))
-        blip_wait = max(20, int(frame_count * 0.15))
         self.log("-> Blip All frames (Win32 PostMessage)...")
         if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
-            self.log(f"   blipping {frame_count} frames... waiting {blip_wait}s")
-            self._interruptible_sleep(blip_wait)
+            self.log(f"   blipping {frame_count} frames... (waiting for completion signal)")
+            self._wait_for_operation("Blip All", min_wait=3.0, max_timeout=blip_timeout)
         else:
             self.log("   Win32 blip unavailable - falling back to SyPy3 dispatch")
             if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
                 raise RuntimeError("Blip All failed")
 
         peel_timeout = max(600, int(frame_count * 1.0))
-        peel_wait = max(15, int(frame_count * 0.1))
         self.log("-> Peel All (Win32 PostMessage)...")
         if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-            self.log(f"   peeling... waiting {peel_wait}s")
-            self._interruptible_sleep(peel_wait)
+            self.log("   peeling... (waiting for completion signal)")
+            self._wait_for_operation("Peel All", min_wait=3.0, max_timeout=peel_timeout)
         else:
             self.log("   Win32 peel unavailable - falling back to SyPy3 dispatch")
             if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
