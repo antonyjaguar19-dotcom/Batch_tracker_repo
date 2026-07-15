@@ -175,6 +175,13 @@ SE_DEFAULTS = {
     "sensor_height":  24.0,
     "focal_length":   35.0,
     "fps":            24.0,
+    # Long-shot chunking: blipping thousands of 4K frames at once OOMs SynthEyes
+    # ('Imminent Crash'). Above chunk_threshold frames, blip/peel per playback-range
+    # window (bounded blip memory) and accumulate trackers; 0/False disables.
+    "chunk_long_shots": True,
+    "chunk_threshold":  1000,
+    "chunk_size":       600,
+    "chunk_overlap":    24,
 }
 
 
@@ -470,6 +477,85 @@ class SynthEyesEngine:
                     return True
         self.log(f"   {label}: hit {max_timeout:.0f}s ceiling -> proceeding")
         return True
+
+    # ------ blip/peel (single-pass + long-shot chunked) ------
+
+    def _blip_peel_full(self, frame_count, blip_timeout, peel_timeout):
+        """Single-pass: blip ALL frames, peel, clear. Fine for shots that fit in memory."""
+        self.log("-> Blip All frames (Win32 PostMessage)...")
+        if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
+            self.log(f"   blipping {frame_count} frames... (waiting for completion signal)")
+            self._wait_for_operation("Blip All", min_wait=3.0, max_timeout=blip_timeout)
+        else:
+            self.log("   Win32 blip unavailable - falling back to SyPy3 dispatch")
+            if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
+                raise RuntimeError("Blip All failed")
+
+        self.log("-> Peel All (Win32 PostMessage)...")
+        if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+            self.log("   peeling... (waiting for completion signal)")
+            self._wait_for_operation("Peel All", min_wait=3.0, max_timeout=peel_timeout)
+        else:
+            self.log("   Win32 peel unavailable - falling back to SyPy3 dispatch")
+            if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
+                raise RuntimeError("Peel All failed")
+
+        self.log("-> Clearing blips...")
+        if not self._win32_click_button("Clear blips", ["Clear all blips"]):
+            self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
+
+    def _plan_windows(self, start, end, size, overlap):
+        """Contiguous (optionally overlapping) [a,b] frame windows covering [start,end]."""
+        size = max(100, int(size))
+        overlap = max(0, min(int(overlap), size - 1))
+        windows = []
+        a = start
+        while a <= end:
+            b = min(a + size - 1, end)
+            windows.append((a, b))
+            if b >= end:
+                break
+            a = b + 1 - overlap
+        return windows
+
+    def _blip_peel_chunked(self, shot, start, end, frame_count, blip_timeout, peel_timeout):
+        """Long-shot path: blip/peel one playback-range WINDOW at a time. SynthEyes holds
+        blips only for the window (bounded memory), we peel them into trackers, then Clear
+        all blips to free that memory before the next window. Trackers ACCUMULATE across
+        windows (peeled trackers are light); the full-range Sizzle export afterward covers
+        the whole shot. 'Blips playback range' + SetAnimStart/End confines the blip to the
+        window (probe-verified). Restores the full range at the end so export is complete."""
+        size = int(self._s("chunk_size") or 600)
+        overlap = int(self._s("chunk_overlap") or 24)
+        windows = self._plan_windows(start, end, size, overlap)
+        # per-window timeouts scale to the window, not the whole shot
+        w_blip_to = max(200, int(size * 0.3))
+        w_peel_to = max(200, int(size * 1.2))
+        self.log(f"-> Long shot ({frame_count} frames) -> chunked blip/peel: "
+                 f"{len(windows)} windows of ~{size} (overlap {overlap})")
+        for i, (a, b) in enumerate(windows, 1):
+            if getattr(self, "_stop_requested", False):
+                self.log("   chunked blip/peel stopped by user."); return
+            self.log(f"   [window {i}/{len(windows)}] frames {a}-{b}")
+            self._set_frame_range(shot, a, b)
+            self._ensure_features_room()
+            self._bring_foreground()
+            if self._win32_click_button("Blips playback range",
+                                        ["Blips playback range", "Blip playback range"]):
+                self._wait_for_operation(f"Blip w{i}", min_wait=2.0, max_timeout=w_blip_to)
+            else:
+                # Fallback: no range button -> blip-all (defeats the memory bound, but keeps
+                # the shot from failing outright on builds without that control).
+                self.log("   'Blips playback range' not found - falling back to Blip All")
+                if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
+                    self._wait_for_operation(f"Blip w{i}", min_wait=2.0, max_timeout=blip_timeout)
+            if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+                self._wait_for_operation(f"Peel w{i}", min_wait=2.0, max_timeout=w_peel_to)
+            # free the heavy blip memory before the next window
+            self._win32_click_button("Clear blips", ["Clear all blips"])
+        # restore the full range so the Sizzle export walks the whole shot
+        self._set_frame_range(shot, start, end)
+        self.log(f"-> Chunked blip/peel done ({len(windows)} windows); trackers accumulated.")
 
     def _bring_foreground(self):
         """Show + foreground the SynthEyes main window so the Features panel actually
@@ -871,28 +957,15 @@ class SynthEyesEngine:
         self._bring_foreground()
 
         blip_timeout = max(400, int(frame_count * 0.2))
-        self.log("-> Blip All frames (Win32 PostMessage)...")
-        if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
-            self.log(f"   blipping {frame_count} frames... (waiting for completion signal)")
-            self._wait_for_operation("Blip All", min_wait=3.0, max_timeout=blip_timeout)
-        else:
-            self.log("   Win32 blip unavailable - falling back to SyPy3 dispatch")
-            if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
-                raise RuntimeError("Blip All failed")
-
         peel_timeout = max(600, int(frame_count * 1.0))
-        self.log("-> Peel All (Win32 PostMessage)...")
-        if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-            self.log("   peeling... (waiting for completion signal)")
-            self._wait_for_operation("Peel All", min_wait=3.0, max_timeout=peel_timeout)
+        chunk_threshold = int(self._s("chunk_threshold") or 1000)
+        if bool(self._s("chunk_long_shots")) and frame_count > chunk_threshold:
+            # Long shots: blip a playback-range window at a time so SynthEyes never holds
+            # blips for thousands of 4K frames at once (that OOMs -> 'Imminent Crash').
+            self._blip_peel_chunked(shot, start_frame, end_frame, frame_count,
+                                    blip_timeout, peel_timeout)
         else:
-            self.log("   Win32 peel unavailable - falling back to SyPy3 dispatch")
-            if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
-                raise RuntimeError("Peel All failed")
-
-        self.log("-> Clearing blips...")
-        if not self._win32_click_button("Clear blips", ["Clear all blips"]):
-            self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
+            self._blip_peel_full(frame_count, blip_timeout, peel_timeout)
 
         # 2026: there is no "Trackers" room -- trackers live on the Summary panel.
         # Feeding SetRoom() an invalid name DESYNCS the SyPy3 socket (all later

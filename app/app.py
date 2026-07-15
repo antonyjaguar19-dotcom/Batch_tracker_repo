@@ -530,6 +530,8 @@ class AppState:
     log_history: List[str] = field(default_factory=list)
     filter_query: str = ""
     motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
+    chunk_long_shots: bool = True  # SynthEyes: blip/peel long shots per window (avoid OOM)
+    chunk_threshold: int = 1000    # frames above which SynthEyes chunks blip/peel
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
@@ -1170,6 +1172,8 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
         "sensor_width":  float(getattr(state, "sensor_width", 36.0) or 36.0),
         "sensor_height": float(getattr(state, "sensor_height", 24.0) or 24.0),
         "focal_length":  float(getattr(state, "focal_length", 35.0) or 35.0),
+        "chunk_long_shots": bool(getattr(state, "chunk_long_shots", True)),
+        "chunk_threshold":  int(getattr(state, "chunk_threshold", 1000) or 1000),
     }
     use_matte = bool(getattr(state, "use_sam3_matte", True))
     preset = str(getattr(state, "track_preset", "Normal / Handheld") or "Normal / Handheld")
