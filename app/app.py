@@ -530,7 +530,6 @@ class AppState:
     log_history: List[str] = field(default_factory=list)
     filter_query: str = ""
     motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
-    save_previews: bool = False    # SAM3 QC preview PNGs OFF by default (masks still written); ~1.8s/frame @ 4K
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
@@ -1041,16 +1040,12 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
 
         if not os.path.isfile(weights): raise FileNotFoundError(f"SAM3 Weights file not found: {weights}")
         mb = bool(getattr(state, "motion_backstop", True))
-        sp = bool(getattr(state, "save_previews", True))
-        logger(f"CV motion backstop: {'ON' if mb else 'OFF'} | QC previews: {'ON' if sp else 'OFF'}")
+        logger(f"CV motion backstop: {'ON' if mb else 'OFF'}")
         try:
-            cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights), motion_backstop=mb, save_previews=sp)
+            cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights), motion_backstop=mb)
         except TypeError:
-            # Older SamConfig without one/both newer fields — retry progressively.
-            try:
-                cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights), motion_backstop=mb)
-            except TypeError:
-                cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights))
+            # Older SamConfig without the motion_backstop field
+            cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights))
         run_sam3_batch(cfg, log_cb=logger, progress_cb=lambda d,t: _set_progress(f"{d}/{t} frames"), status_cb=logger)
         _free_vram("after SAM3")
         logger("Masking Complete.")

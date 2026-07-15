@@ -40,7 +40,6 @@ def _task_dict(task_id: str, track_mode: str, inc: List[str], exc: List[str]) ->
         "sam3_include_prompt": sam["sam3_include_prompt"],
         "sam3_exclude_prompt": sam["sam3_exclude_prompt"],
         "mask_subdir": f"masks_{task_id}",
-        "preview_subdir": f"preview_{task_id}",
     }
 
 

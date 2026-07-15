@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -39,11 +38,6 @@ class RunnerConfig:
     # (hair, motion-blur fringes) -- mirrors SynthEyes Mask ML's "Mask Dilation".
     # 0 = off (tight SAM edges). Try ~8-15 to match SynthEyes tracking behavior.
     mask_dilation_px: int = 0
-    # Preview PNGs (preview_<frame>.png) are QC-only — the tracker reads masks/, never
-    # preview/. Rendering them costs an extra full-res decode + RGBA composite + PNG
-    # encode PER FRAME (~1.8s/frame @ 4K, ~5min per 180-frame shot). OFF by default;
-    # flip on (or env BTR_SAVE_PREVIEWS=1) only when you want the QC overlays.
-    save_previews: bool = False
 
 
 def load_masking_guide(path: str | Path) -> Dict[str, Any]:
@@ -60,10 +54,10 @@ def normalize_shots(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Supports BOTH legacy single-task schema and new multi-task schema:
       shots[].tasks = [ {task_id, include_prompts/mask_includes, exclude_prompts/mask_excludes,
-                         track_mode, mask_subdir, preview_subdir}, ... ]
+                         track_mode, mask_subdir}, ... ]
 
     Each task becomes an individual normalized entry, but keeps the same shot_name
-    for frame discovery. Output directories are separated via mask_subdir/preview_subdir.
+    for frame discovery. Output directories are separated via mask_subdir.
     """
     shots = data.get("shots", data.get("Shots", []))
     if not isinstance(shots, list):
@@ -133,7 +127,6 @@ def normalize_shots(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     mask_mode = "include"
 
                 mask_subdir = str(t.get("mask_subdir") or f"masks_{task_id}").strip()
-                preview_subdir = str(t.get("preview_subdir") or f"preview_{task_id}").strip()
 
                 norm.append(
                     {
@@ -145,7 +138,6 @@ def normalize_shots(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "exclude_prompts": exclude_prompts,
                         "input_dir": str(input_dir) if input_dir else None,
                         "mask_subdir": mask_subdir,
-                        "preview_subdir": preview_subdir,
                         "frame_start": int(combined.get("frame_start") or 0),
                         "frame_end": int(combined.get("frame_end") or 0),
                     }
@@ -180,7 +172,6 @@ def normalize_shots(data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "exclude_prompts": exclude_prompts,
                 "input_dir": str(input_dir) if input_dir else None,
                 "mask_subdir": "masks",
-                "preview_subdir": "preview",
                 "frame_start": int(combined.get("frame_start") or 0),
                 "frame_end": int(combined.get("frame_end") or 0),
             }
@@ -439,32 +430,16 @@ def write_full_white_mask(frame_path: Path, out_path: Path) -> None:
     alpha.save(out_path)
 
 
-def save_preview(frame_path: Path, alpha_np: np.ndarray, preview_path: Path) -> None:
-    img = Image.open(frame_path).convert("RGBA")
-    w, h = img.size
-    if alpha_np.shape != (h, w):
-        alpha_np = np.array(Image.fromarray(alpha_np).resize((w, h), Image.NEAREST))
-
-    mask_ignored = (alpha_np == 0).astype(np.uint8) * 160
-    overlay = Image.new("RGBA", (w, h), (255, 0, 0, 0))
-    overlay.putalpha(Image.fromarray(mask_ignored, mode="L"))
-    out = Image.alpha_composite(img, overlay)
-    out.save(preview_path)
-
-
-def ensure_out_dirs(out_root: Path, shot_name: str, masks_subdir: str = "masks", preview_subdir: str = "preview") -> Tuple[Path, Path]:
-    """Create output directories for a shot.
+def ensure_out_dirs(out_root: Path, shot_name: str, masks_subdir: str = "masks") -> Path:
+    """Create the masks output directory for a shot.
 
     Supports multi-task outputs by allowing per-task subdirectories, e.g.:
       OUT/Shot_01/masks_camera
       OUT/Shot_01/masks_object
     """
-    out_shot = out_root / shot_name
-    masks_dir = out_shot / (masks_subdir or "masks")
-    preview_dir = out_shot / (preview_subdir or "preview")
+    masks_dir = out_root / shot_name / (masks_subdir or "masks")
     masks_dir.mkdir(parents=True, exist_ok=True)
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    return masks_dir, preview_dir
+    return masks_dir
 
 
 def union_masks_from_results(results: Any, frame_path: Path, keep: bool) -> np.ndarray:
@@ -643,7 +618,7 @@ def run_sam3_batch(
         frames = per_shot_frames[shot_name]
         log(f"  frames_dir: {frames_dir}")
 
-        masks_dir, preview_dir = ensure_out_dirs(cfg.output_root, shot_name, masks_subdir=str(shot.get("mask_subdir") or "masks"), preview_subdir=str(shot.get("preview_subdir") or "preview"))
+        masks_dir = ensure_out_dirs(cfg.output_root, shot_name, masks_subdir=str(shot.get("mask_subdir") or "masks"))
 
         track_mode = (shot.get("track_mode") or "").strip().lower()
         mask_mode = (shot.get("mask_mode") or "include").strip().lower()
@@ -668,16 +643,6 @@ def run_sam3_batch(
             log("  motion backstop: ON (mask pixels moving independently of camera)")
         prev_frame_path: Optional[Path] = None
 
-        # QC preview render is optional + OFF by default (masks are always written).
-        # env BTR_SAVE_PREVIEWS overrides the config either way; render time is logged so
-        # the cost is visible when it IS on.
-        _env_prev = os.environ.get("BTR_SAVE_PREVIEWS")
-        if _env_prev is not None:
-            previews_on = _env_prev.strip().lower() not in ("0", "false", "no", "")
-        else:
-            previews_on = bool(getattr(cfg, "save_previews", False))
-        prev_secs = 0.0
-
         for frame_path in frames:
             # Frame number must be the TRAILING token (name_####.png) so SynthEyes
             # detects it as a numbered image sequence for +Alpha matte loading.
@@ -687,14 +652,9 @@ def run_sam3_batch(
             # (tracker_core get_global_mask_idx, existing-mask glob) use sorted order,
             # not the filename, so this rename is safe; sort order is preserved.
             out_mask = masks_dir / f"mask_{frame_path.stem}.png"
-            out_prev = preview_dir / f"preview_{frame_path.stem}.png"
 
             if track_mode == "no_mask_needed" and not motion_on:
                 write_full_white_mask(frame_path, out_mask)
-                if previews_on:
-                    _t = time.perf_counter()
-                    save_preview(frame_path, np.full(frame_hw(frame_path), 255, dtype=np.uint8), out_prev)
-                    prev_secs += time.perf_counter() - _t
                 prev_frame_path = frame_path
                 done += 1
                 if progress_cb:
@@ -738,19 +698,10 @@ def run_sam3_batch(
                 alpha_keep = cv2.erode(alpha_keep, dk)
 
             Image.fromarray(alpha_keep, mode="L").save(out_mask)
-            if previews_on:
-                _t = time.perf_counter()
-                save_preview(frame_path, alpha_keep, out_prev)
-                prev_secs += time.perf_counter() - _t
 
             prev_frame_path = frame_path
             done += 1
             if progress_cb:
                 progress_cb(done, max(total_frames, 1))
-
-        if previews_on:
-            log(f"  previews: rendered {len(frames)} frame(s) in {prev_secs:.1f}s")
-        else:
-            log(f"  previews: SKIPPED {len(frames)} frame(s) (save_previews off / BTR_SAVE_PREVIEWS=0)")
 
     status("All shots complete.")
