@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,6 +39,11 @@ class RunnerConfig:
     # (hair, motion-blur fringes) -- mirrors SynthEyes Mask ML's "Mask Dilation".
     # 0 = off (tight SAM edges). Try ~8-15 to match SynthEyes tracking behavior.
     mask_dilation_px: int = 0
+    # Preview PNGs (preview_<frame>.png) are QC-only — the tracker reads masks/, never
+    # preview/. Rendering them costs an extra full-res decode + RGBA composite + PNG
+    # encode PER FRAME, meaningful on 4K batches. Turn off for speed runs (masks still
+    # written). Also gated by env BTR_SAVE_PREVIEWS=0.
+    save_previews: bool = True
 
 
 def load_masking_guide(path: str | Path) -> Dict[str, Any]:
@@ -662,6 +668,11 @@ def run_sam3_batch(
             log("  motion backstop: ON (mask pixels moving independently of camera)")
         prev_frame_path: Optional[Path] = None
 
+        # QC preview render is optional (masks are always written). Time it so the user
+        # can see the real per-shot saving when it's off.
+        previews_on = bool(getattr(cfg, "save_previews", True)) and (os.environ.get("BTR_SAVE_PREVIEWS", "1") != "0")
+        prev_secs = 0.0
+
         for frame_path in frames:
             # Frame number must be the TRAILING token (name_####.png) so SynthEyes
             # detects it as a numbered image sequence for +Alpha matte loading.
@@ -675,7 +686,10 @@ def run_sam3_batch(
 
             if track_mode == "no_mask_needed" and not motion_on:
                 write_full_white_mask(frame_path, out_mask)
-                save_preview(frame_path, np.full(frame_hw(frame_path), 255, dtype=np.uint8), out_prev)
+                if previews_on:
+                    _t = time.perf_counter()
+                    save_preview(frame_path, np.full(frame_hw(frame_path), 255, dtype=np.uint8), out_prev)
+                    prev_secs += time.perf_counter() - _t
                 prev_frame_path = frame_path
                 done += 1
                 if progress_cb:
@@ -719,11 +733,19 @@ def run_sam3_batch(
                 alpha_keep = cv2.erode(alpha_keep, dk)
 
             Image.fromarray(alpha_keep, mode="L").save(out_mask)
-            save_preview(frame_path, alpha_keep, out_prev)
+            if previews_on:
+                _t = time.perf_counter()
+                save_preview(frame_path, alpha_keep, out_prev)
+                prev_secs += time.perf_counter() - _t
 
             prev_frame_path = frame_path
             done += 1
             if progress_cb:
                 progress_cb(done, max(total_frames, 1))
+
+        if previews_on:
+            log(f"  previews: rendered {len(frames)} frame(s) in {prev_secs:.1f}s")
+        else:
+            log(f"  previews: SKIPPED {len(frames)} frame(s) (save_previews off / BTR_SAVE_PREVIEWS=0)")
 
     status("All shots complete.")
