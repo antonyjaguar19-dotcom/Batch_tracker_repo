@@ -569,6 +569,7 @@ class SynthEyesEngine:
           C) crash-guarded -- if the 'Imminent Crash' dialog fires mid-blip, dismiss it,
              halve the window, and retry.
         chunk_size>0 forces a fixed window (manual override)."""
+        import threading
         try:
             import psutil
         except ImportError:
@@ -596,8 +597,7 @@ class SynthEyesEngine:
         if img_w and img_h:
             mp = max(0.5, (float(img_w) * float(img_h)) / 1e6)
         frames_per_mp = float(self._s("chunk_frames_per_mp") or 5000.0)
-        seed = fixed if fixed > 0 else int(frames_per_mp / mp)
-        win0 = max(min_win, min(frame_count, seed))
+        res_seed = fixed if fixed > 0 else int(frames_per_mp / mp)
 
         # B) RAM ceiling for adaptive sizing
         ram_frac = float(self._s("chunk_ram_frac") or 0.5)
@@ -608,6 +608,16 @@ class SynthEyesEngine:
                 ceiling = base0 + int(psutil.virtual_memory().available * ram_frac)
             except Exception:
                 ceiling = None
+
+        # Cap the SEED window by the RAM ceiling too (via a resolution-based MB/frame prior),
+        # so the FIRST window -- before live calibration -- can't itself OOM when free RAM is
+        # tight (the full pipeline keeps torch/SAM3 resident in-process, leaving less free RAM
+        # than a bare tracking run; that's what hung the first full-bot attempt on SH005).
+        win0 = max(min_win, min(frame_count, res_seed))
+        if fixed <= 0 and ceiling:
+            prior_bytes_per_frame = 7.5e6 * mp    # ~60 MB/frame @ 4K (8.3 MP), scales w/ res
+            room = max(0, ceiling - base0)
+            win0 = max(min_win, min(win0, int(room / prior_bytes_per_frame)))
         rss_per_frame = None
 
         self.log(f"-> Long shot ({frame_count} frames, ~{mp:.1f}MP): "
@@ -628,50 +638,74 @@ class SynthEyesEngine:
                 win = max(min_win, min(win0, int(room / rss_per_frame)))
             b = min(a + win - 1, end)
 
-            # C) blip the window; on a crash/OOM dialog, shrink and retry
-            attempt = 0
-            rss_before = rss()
-            while True:
-                attempt += 1
-                self._set_frame_range(shot, a, b)
-                self._ensure_features_room()
-                self._bring_foreground()
-                wto = max(120, int((b - a + 1) * 0.3))
-                if self._win32_click_button("Blips playback range",
-                                            ["Blips playback range", "Blip playback range"]):
-                    ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
-                else:
-                    self.log("   'Blips playback range' not found - falling back to Blip All")
-                    self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
-                    ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
-                if ok or getattr(self, "_stop_requested", False):
-                    break
-                # crash/OOM signal -> recover + shrink + retry
-                self._dismiss_error_dialog()
-                self._win32_click_button("Clear blips", ["Clear all blips"])
-                if not self.is_alive():
-                    raise RuntimeError("SynthEyes crashed during chunked blip (OOM)")
-                shrunk = max(min_win, (b - a + 1) // 2)
-                if shrunk >= (b - a + 1) or attempt > 6:
-                    self.log(f"   window {a}-{b}: cannot shrink further -> proceeding"); break
-                win = shrunk
-                b = min(a + win - 1, end)
-                self.log(f"   memory pressure -> shrink window to {a}-{b} ({win}f) and retry")
+            # Per-window HANG WATCHDOG: a stuck SynthEyes blocks SyPy3 socket calls with no
+            # timeout (that hung the first full-bot SH005 run at _set_frame_range). If a window
+            # overruns its hard deadline, kill SynthEyes to unblock the socket, then abort the
+            # shot cleanly (worker_track logs it) instead of hanging forever.
+            wd_fired = {"v": False}
+            deadline = max(300.0, (b - a + 1) * 2.0)
 
-            # B) calibrate MB/frame from the first successful window
-            if fixed <= 0 and rss_per_frame is None and proc:
-                peak = rss()
-                frames = max(1, b - a + 1)
-                if peak > rss_before:
-                    rss_per_frame = (peak - rss_before) / frames
-                    self.log(f"   calibrated ~{rss_per_frame/1e6:.1f} MB/frame @ {mp:.1f}MP; "
-                             f"later windows sized to the RAM ceiling")
+            def _watchdog(a=a, b=b, deadline=deadline):
+                wd_fired["v"] = True
+                self.log(f"   window {a}-{b}: watchdog {deadline:.0f}s exceeded -> killing hung SynthEyes")
+                try:
+                    self.kill_syntheyes()
+                except Exception:
+                    pass
 
-            self.log(f"   [window {idx}] frames {a}-{b} ({b - a + 1}f) blipped")
-            if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-                self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
-                                         max_timeout=max(200, int((b - a + 1) * 1.2)))
-            self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
+            wd = threading.Timer(deadline, _watchdog)
+            wd.daemon = True
+            wd.start()
+            try:
+                # C) blip the window; on a crash/OOM dialog, shrink and retry
+                attempt = 0
+                rss_before = rss()
+                while True:
+                    attempt += 1
+                    self._set_frame_range(shot, a, b)
+                    self._ensure_features_room()
+                    self._bring_foreground()
+                    wto = max(120, int((b - a + 1) * 0.3))
+                    if self._win32_click_button("Blips playback range",
+                                                ["Blips playback range", "Blip playback range"]):
+                        ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
+                    else:
+                        self.log("   'Blips playback range' not found - falling back to Blip All")
+                        self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
+                        ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
+                    if ok or getattr(self, "_stop_requested", False):
+                        break
+                    # crash/OOM signal -> recover + shrink + retry
+                    self._dismiss_error_dialog()
+                    self._win32_click_button("Clear blips", ["Clear all blips"])
+                    if not self.is_alive():
+                        raise RuntimeError("SynthEyes crashed during chunked blip (OOM)")
+                    shrunk = max(min_win, (b - a + 1) // 2)
+                    if shrunk >= (b - a + 1) or attempt > 6:
+                        self.log(f"   window {a}-{b}: cannot shrink further -> proceeding"); break
+                    win = shrunk
+                    b = min(a + win - 1, end)
+                    self.log(f"   memory pressure -> shrink window to {a}-{b} ({win}f) and retry")
+
+                # B) calibrate MB/frame from the first successful window
+                if fixed <= 0 and rss_per_frame is None and proc:
+                    peak = rss()
+                    frames = max(1, b - a + 1)
+                    if peak > rss_before:
+                        rss_per_frame = (peak - rss_before) / frames
+                        self.log(f"   calibrated ~{rss_per_frame/1e6:.1f} MB/frame @ {mp:.1f}MP; "
+                                 f"later windows sized to the RAM ceiling")
+
+                self.log(f"   [window {idx}] frames {a}-{b} ({b - a + 1}f) blipped")
+                if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+                    self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
+                                             max_timeout=max(200, int((b - a + 1) * 1.2)))
+                self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
+            finally:
+                wd.cancel()
+
+            if wd_fired["v"] or not self.is_alive():
+                raise RuntimeError(f"SynthEyes hung/crashed on window {a}-{b} (watchdog); shot aborted")
 
             if b >= end:
                 break
@@ -923,6 +957,10 @@ class SynthEyesEngine:
         return True
 
     def is_alive(self):
+        # Check the OS process FIRST: if SynthEyes is gone, never call Version() — a SyPy3
+        # socket read against a dead/hung instance can block the caller indefinitely.
+        if self._syntheyes_pid() is None:
+            return False
         try:
             v = self.hlev.Version()
             return v is not None and len(str(v)) > 0
