@@ -498,93 +498,104 @@ with ui.row().classes("w-full no-wrap"):
             ui.button(icon="description", on_click=lambda: pick_file(req_file)).props("flat dense")
 
         with ui.expansion("Settings", icon="tune").classes("w-full"):
+            # ---- Universal (both backends / AI pipeline) ----
             ui.label("Qwen2 Sample Density")
             qwen_fps = ui.slider(min=1, max=8, value=4).props("label-always")
-            ui.label("Grid Size")
-            grid_size = ui.slider(min=4, max=20, value=10).props("label-always")
             ui.label("Seed Count (Max Tracks)")
             seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
-            ui.label("Min Seed Distance (px)")
-            seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
-            ui.label("Track chunks (TAPNext++ fallback only · 0 = Auto)")
-            track_chunks = ui.number(value=0, min=0, max=16, precision=0).classes("w-full")
-            track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
-            track_chunks.tooltip("TAPNext++ fallback only. Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
-                                 "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
-
-            ui.label("Track spacing (px · TAPNext++ · density dial)")
-            track_spacing = ui.slider(min=10, max=120, value=int(getattr(state, "track_spacing_px", 40)), step=5).props("label-always")
-            track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 40)))
-            track_spacing.tooltip("TAPNext++ only. Min pixel gap between kept tracks. Small = denser/more tracks, large = sparser/fewer. "
-                                  "Collapses duplicate passes and spreads the strongest tracks evenly; count floats with footage texture/parallax.")
-            ui.label("Max tracks per task (TAPNext++ · 0 = auto)")
-            track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0).classes("w-full")
-            track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
-            track_max.tooltip("TAPNext++ only. Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
-
-            sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
-                                   on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
-            sw_movtile.tooltip("TAPNext++ only. Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
-                               "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
-                               "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
-            sw_reseed = ui.switch("Re-seed tracks (fast/low-angle shots)", value=getattr(state, "reseed", True),
-                                  on_change=lambda e: setattr(state, "reseed", bool(e.value)))
-            sw_reseed.tooltip("TAPNext++ only. Seed fresh features periodically across the clip (not just at frame 0) so the "
-                              "frame stays populated when the initial points sweep out on fast/low-angle shots. Re-seeded tracks "
-                              "pass through the same mover-gating + motion filter + spread selection, so movers/junk are still dropped.")
-            ui.label("Re-seed interval (frames)")
-            reseed_every = ui.slider(min=10, max=90, value=int(getattr(state, "reseed_every", 30)), step=5).props("label-always")
-            reseed_every.on_value_change(lambda e: setattr(state, "reseed_every", int(e.value or 30)))
-            reseed_every.tooltip("Max frames between re-seeds. Smaller = denser replenishment (better on very fast shots), more compute.")
-            sw_edge = ui.switch("Track to frame edge", value=getattr(state, "edge_track", True),
-                                on_change=lambda e: setattr(state, "edge_track", bool(e.value)))
-            sw_edge.tooltip("TAPNext++ only. Keep refining a point right up to the frame border instead of trimming it when "
-                            "the NCC search box / native tile clamps against the edge. Preserves the edge tracks that anchor "
-                            "lens distortion and solve corners.")
-            sw_gap = ui.switch("Keep disappear/reappear as one track", value=getattr(state, "gap_aware_refine", True),
-                               on_change=lambda e: setattr(state, "gap_aware_refine", bool(e.value)))
-            sw_gap.tooltip("TAPNext++ only. When a point is occluded then reappears, refine each visible segment on its own "
-                           "reference patch and keep them under ONE track id -> the reappeared frames are re-acquired and kept, "
-                           "not trimmed away by the pre-occlusion pattern.")
-            sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
-                                  on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
-            sw_refine.tooltip("TAPNext++ only. After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
-                              "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
-                              "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
-            ui.label("Pattern box (px · odd)")
-            refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
-            refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
-            refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
 
             ui.separator()
             ui.label("Tracking backend")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
                                     on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")).classes("w-full")
-            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback.")
+            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback. "
+                                "The settings below switch to match the selected backend.")
 
-            with ui.row().classes("w-full no-wrap items-end gap-1"):
-                se_exe = ui.input("SynthEyes .exe", value=state.syntheyes_exe,
-                                  placeholder=r"C:\Program Files\Andersson Technologies LLC\SynthEyes\SynthEyes64.exe").classes("grow")
-                ui.button(icon="folder", on_click=lambda: pick_file(se_exe)).props("flat dense")
-            se_exe.on_value_change(lambda e: setattr(state, "syntheyes_exe", e.value or ""))
+            # ---- SynthEyes-only (shown when backend = syntheyes) ----
+            with ui.column().classes("w-full gap-2") as syn_box:
+                ui.label("SynthEyes settings").classes("text-xs text-grey-6 q-mt-sm")
+                with ui.row().classes("w-full no-wrap items-end gap-1"):
+                    se_exe = ui.input("SynthEyes .exe", value=state.syntheyes_exe,
+                                      placeholder=r"C:\Program Files\Andersson Technologies LLC\SynthEyes\SynthEyes64.exe").classes("grow")
+                    ui.button(icon="folder", on_click=lambda: pick_file(se_exe)).props("flat dense")
+                se_exe.on_value_change(lambda e: setattr(state, "syntheyes_exe", e.value or ""))
 
-            se_preset = ui.select(be.SE_PRESET_NAMES or ["Normal / Handheld"], value=state.track_preset,
-                                  label="SynthEyes preset (max tracks)",
-                                  on_change=lambda e: setattr(state, "track_preset", e.value or "Normal / Handheld")).classes("w-full")
-            se_preset.tooltip("Locked 100 / Slow 500 / Normal 800 / Fast 2000. Custom = use Seed Count slider above.")
+                se_preset = ui.select(be.SE_PRESET_NAMES or ["Normal / Handheld"], value=state.track_preset,
+                                      label="SynthEyes preset (max tracks)",
+                                      on_change=lambda e: setattr(state, "track_preset", e.value or "Normal / Handheld")).classes("w-full")
+                se_preset.tooltip("Locked 100 / Slow 500 / Normal 800 / Fast 2000. Custom = use Seed Count slider above.")
 
-            sw_matte = ui.switch("Use SAM3 masks as matte", value=state.use_sam3_matte,
-                                 on_change=lambda e: setattr(state, "use_sam3_matte", bool(e.value)))
-            sw_matte.tooltip("Feed SAM3 per-frame masks into SynthEyes so trackers avoid masked regions. Off = track full frame.")
+                sw_matte = ui.switch("Use SAM3 masks as matte", value=state.use_sam3_matte,
+                                     on_change=lambda e: setattr(state, "use_sam3_matte", bool(e.value)))
+                sw_matte.tooltip("Feed SAM3 per-frame masks into SynthEyes so trackers avoid masked regions. Off = track full frame.")
 
-            sw_3de = ui.switch("Auto-create .3de project", value=state.auto_3de,
-                               on_change=lambda e: setattr(state, "auto_3de", bool(e.value)))
-            sw_3de.tooltip("After export, build a 3DEqualizer .3de project from the 2D tracks. Needs the 3DE4 exe below.")
-            with ui.row().classes("w-full no-wrap items-end gap-1"):
-                tde_exe = ui.input("3DEqualizer4 .exe (for auto .3de)", value=state.tde4_exe,
-                                   placeholder=r"C:\Program Files\3DE4\bin\3DE4.exe").classes("grow")
-                ui.button(icon="folder", on_click=lambda: pick_file(tde_exe)).props("flat dense")
-            tde_exe.on_value_change(lambda e: setattr(state, "tde4_exe", e.value or ""))
+                sw_3de = ui.switch("Auto-create .3de project", value=state.auto_3de,
+                                   on_change=lambda e: setattr(state, "auto_3de", bool(e.value)))
+                sw_3de.tooltip("After export, build a 3DEqualizer .3de project from the 2D tracks. Needs the 3DE4 exe below.")
+                with ui.row().classes("w-full no-wrap items-end gap-1"):
+                    tde_exe = ui.input("3DEqualizer4 .exe (for auto .3de)", value=state.tde4_exe,
+                                       placeholder=r"C:\Program Files\3DE4\bin\3DE4.exe").classes("grow")
+                    ui.button(icon="folder", on_click=lambda: pick_file(tde_exe)).props("flat dense")
+                tde_exe.on_value_change(lambda e: setattr(state, "tde4_exe", e.value or ""))
+            syn_box.bind_visibility_from(backend_sel, "value", value="syntheyes")
+
+            # ---- TAPNext++-only (shown when backend = tapnext) ----
+            with ui.column().classes("w-full gap-2") as tap_box:
+                ui.label("TAPNext++ settings").classes("text-xs text-grey-6 q-mt-sm")
+                ui.label("Grid Size")
+                grid_size = ui.slider(min=4, max=20, value=10).props("label-always")
+                ui.label("Min Seed Distance (px)")
+                seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
+                ui.label("Track chunks (0 = Auto)")
+                track_chunks = ui.number(value=0, min=0, max=16, precision=0).classes("w-full")
+                track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
+                track_chunks.tooltip("Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
+                                     "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
+
+                ui.label("Track spacing (px · density dial)")
+                track_spacing = ui.slider(min=10, max=120, value=int(getattr(state, "track_spacing_px", 40)), step=5).props("label-always")
+                track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 40)))
+                track_spacing.tooltip("Min pixel gap between kept tracks. Small = denser/more tracks, large = sparser/fewer. "
+                                      "Collapses duplicate passes and spreads the strongest tracks evenly; count floats with footage texture/parallax.")
+                ui.label("Max tracks per task (0 = auto)")
+                track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0).classes("w-full")
+                track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
+                track_max.tooltip("Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
+
+                sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
+                                       on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
+                sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
+                                   "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
+                                   "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
+                sw_reseed = ui.switch("Re-seed tracks (fast/low-angle shots)", value=getattr(state, "reseed", True),
+                                      on_change=lambda e: setattr(state, "reseed", bool(e.value)))
+                sw_reseed.tooltip("Seed fresh features periodically across the clip (not just at frame 0) so the "
+                                  "frame stays populated when the initial points sweep out on fast/low-angle shots. Re-seeded tracks "
+                                  "pass through the same mover-gating + motion filter + spread selection, so movers/junk are still dropped.")
+                ui.label("Re-seed interval (frames)")
+                reseed_every = ui.slider(min=10, max=90, value=int(getattr(state, "reseed_every", 30)), step=5).props("label-always")
+                reseed_every.on_value_change(lambda e: setattr(state, "reseed_every", int(e.value or 30)))
+                reseed_every.tooltip("Max frames between re-seeds. Smaller = denser replenishment (better on very fast shots), more compute.")
+                sw_edge = ui.switch("Track to frame edge", value=getattr(state, "edge_track", True),
+                                    on_change=lambda e: setattr(state, "edge_track", bool(e.value)))
+                sw_edge.tooltip("Keep refining a point right up to the frame border instead of trimming it when "
+                                "the NCC search box / native tile clamps against the edge. Preserves the edge tracks that anchor "
+                                "lens distortion and solve corners.")
+                sw_gap = ui.switch("Keep disappear/reappear as one track", value=getattr(state, "gap_aware_refine", True),
+                                   on_change=lambda e: setattr(state, "gap_aware_refine", bool(e.value)))
+                sw_gap.tooltip("When a point is occluded then reappears, refine each visible segment on its own "
+                               "reference patch and keep them under ONE track id -> the reappeared frames are re-acquired and kept, "
+                               "not trimmed away by the pre-occlusion pattern.")
+                sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
+                                      on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
+                sw_refine.tooltip("After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
+                                  "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
+                                  "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
+                ui.label("Pattern box (px · odd)")
+                refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
+                refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
+                refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
+            tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
 
         ui.markdown("### Run · do in order")
         btn_scan = ui.button("1 · Scan inputs", on_click=do_scan).props("outline").classes("w-full")
