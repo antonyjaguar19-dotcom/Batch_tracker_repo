@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import queue
 import importlib.util
 from pathlib import Path
@@ -470,6 +471,37 @@ def start_track():
     dlg.open()
 
 
+def _launch_pipeline():
+    msg = be.run_step_thread(
+        be.worker_pipeline,
+        (in_dir.value, out_dir.value, req_file.value, int(qwen_fps.value), be.DEFAULT_OLLAMA_URL,
+         be.DEFAULT_SAM3_WEIGHTS, int(grid_size.value), int(seed_count.value),
+         int(seed_min_dist.value), state),
+        "Run Pipeline")
+    ui.notify(msg)
+
+
+def start_pipeline():
+    sel = [n for n, d in state.shots_data.items() if getattr(d, "use", False)]
+    if not sel:
+        ui.notify("Tick at least one shot first.", type="warning")
+        return
+    dlg = ui.dialog()
+    with dlg, ui.card():
+        ui.label(f"Run the full pipeline on {len(sel)} shot(s)?").classes("text-bold")
+        ui.label(", ".join(sorted(sel))).classes("text-caption")
+        ui.label("Analyze (Qwen) → Generate masks (SAM3) → Track, back-to-back. "
+                 "Shots that already have masks reuse them. Stop halts between stages.")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+
+            def _go():
+                dlg.close(); _launch_pipeline()
+
+            ui.button("Run pipeline", on_click=_go, color="primary")
+    dlg.open()
+
+
 def stop_job():
     ui.notify(be.on_stop_job())
 
@@ -545,14 +577,28 @@ def poll():
         refresh_table()
         ed_pick.set_options(_visible_names())
 
-    # status + button busy-state
+    # status + progress bar + elapsed + button busy-state
     running = be._job_running()
+    bar.visible = running
     if running:
         prog = f" · {be.LAST_PROGRESS}" if be.LAST_PROGRESS else ""
-        lbl_status.set_content(f"⏳ **{be.CURRENT_JOB_NAME}** running…{prog}")
+        start = getattr(be, "CURRENT_JOB_START", 0.0) or 0.0
+        el = ""
+        if start:
+            secs = int(time.time() - start)
+            el = f" · {secs // 60}:{secs % 60:02d}"
+        frac = getattr(be, "LAST_PROGRESS_FRAC", None)
+        if frac is None:
+            # unknown total (e.g. Qwen) -> keep it moving rather than fake a number
+            bar.props("indeterminate")
+        else:
+            bar.props(remove="indeterminate")
+            bar.value = float(frac)
+            prog += f" · {int(frac * 100)}%"
+        lbl_status.set_content(f"⏳ **{be.CURRENT_JOB_NAME}** running…{prog}{el}")
     else:
         lbl_status.set_content("🟢 Idle")
-    for b in (btn_scan, btn_analyze, btn_mask, btn_track):
+    for b in (btn_pipe, btn_scan, btn_analyze, btn_mask, btn_track):
         b.set_enabled(not running)
     btn_stop.set_enabled(running)
 
@@ -683,7 +729,13 @@ with ui.row().classes("w-full no-wrap"):
                 refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
             tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
 
-        ui.markdown("### Run · do in order")
+        ui.markdown("### Run")
+        btn_pipe = ui.button("▶ Run Pipeline (Analyze → Mask → Track)",
+                             on_click=start_pipeline, color="primary").classes("w-full")
+        btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
+                         "have to click 2/3/4 and wait between each. Existing masks are reused "
+                         "(use 3 · Generate masks to force a regen). Stop halts between stages.")
+        ui.markdown("##### …or run them one at a time")
         btn_scan = ui.button("1 · Scan inputs", on_click=do_scan).props("outline").classes("w-full")
         btn_analyze = ui.button("2 · Analyze (AI)", on_click=start_analyze, color="red").classes("w-full")
         btn_mask = ui.button("3 · Generate masks", on_click=start_mask).props("outline").classes("w-full")
@@ -705,6 +757,10 @@ with ui.row().classes("w-full no-wrap"):
         with ui.row().classes("w-full justify-between"):
             lbl_status = ui.markdown("🟢 Idle")
             lbl_selcount = ui.markdown("No shots yet — set Input Folder and press **1 · Scan inputs**.")
+        # Progress bar: determinate when the stage reports done/total (masking = frames,
+        # tracking = shots), indeterminate otherwise (Qwen exposes no numeric hook).
+        bar = ui.linear_progress(value=0, show_value=False, size="10px").classes("w-full")
+        bar.visible = False
 
         ui.markdown("### Shots · tick the box to include · click a row to edit · active rows highlight")
         table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple").classes("w-full")

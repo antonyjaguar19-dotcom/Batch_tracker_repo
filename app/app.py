@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 import threading
 import queue
 import traceback
@@ -565,12 +566,21 @@ class AppState:
 JOB_QUEUE = queue.Queue()
 CURRENT_JOB_THREAD = None
 CURRENT_JOB_NAME = ""
+CURRENT_JOB_START = 0.0     # epoch secs; drives the UI's elapsed timer
 LAST_PROGRESS = ""
+LAST_PROGRESS_FRAC = None   # 0..1 for a determinate bar; None = indeterminate (unknown total)
 STOP_EVENT = threading.Event()
 
-def _set_progress(msg: str):
-    global LAST_PROGRESS
+def _set_progress(msg: str, done=None, total=None):
+    """Progress text + (optionally) a real fraction for the UI bar. Callers that know a
+    done/total pass both; those that don't leave the fraction None -> indeterminate bar."""
+    global LAST_PROGRESS, LAST_PROGRESS_FRAC
     LAST_PROGRESS = str(msg or "")
+    try:
+        LAST_PROGRESS_FRAC = (max(0.0, min(1.0, float(done) / float(total)))
+                              if done is not None and total else None)
+    except Exception:
+        LAST_PROGRESS_FRAC = None
 
 def _job_running() -> bool:
     return CURRENT_JOB_THREAD is not None and CURRENT_JOB_THREAD.is_alive()
@@ -996,12 +1006,19 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
             json.dump(guide_data, f, indent=2)
             
         logger("Analysis Complete.")
+        # Set guide_path DIRECTLY as well as queueing it: the queue is only drained by the
+        # UI's poll(), so a chained run (worker_pipeline calls analyze->mask in one thread)
+        # would otherwise reach worker_mask with guide_path still unset and silently mask
+        # against a fresh overdrive_guide instead of this analysis.
+        state.guide_path = str(guide_path)
         JOB_QUEUE.put(f"GUIDE_PATH_UPDATE:{str(guide_path)}")
         JOB_QUEUE.put("DONE_ANALYSIS")
+        return True
     except Exception as e:
         logger(f"ERROR in Analysis: {e}")
         traceback.print_exc()
         JOB_QUEUE.put("DONE_ANALYSIS")   # signal end on failure too, so the UI settles
+        return False
 
 def _shot_mask_dirs(out_dir: str, shot_name: str) -> List[str]:
     """Return mask dirs (containing >=1 .png) already present for a shot in OUT.
@@ -1073,7 +1090,7 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
         if n_sel == 0:
             logger("No shots selected. Tick the 'Use' box on at least one shot, then retry.")
             JOB_QUEUE.put("DONE_MASKING")
-            return
+            return False
         # Free analysis models before loading SAM3: clear any leftover Qwen VRAM.
         # (No Ollama LLM to unload — decisioning is Qwen-only now.)
         _free_vram("before SAM3")
@@ -1152,7 +1169,7 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
                 logger("All selected shots already have masks. Nothing to generate.")
                 _free_vram("after SAM3")
                 JOB_QUEUE.put("DONE_MASKING")
-                return
+                return True   # success: masks are present — a chained pipeline must continue
         elif existing and not reuse:
             logger(f"Regenerating (overwriting) masks for {len(existing)} shot(s) with existing masks.")
 
@@ -1170,14 +1187,16 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
         except TypeError:
             # Older SamConfig without the motion_backstop field
             cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights))
-        run_sam3_batch(cfg, log_cb=logger, progress_cb=lambda d,t: _set_progress(f"{d}/{t} frames"), status_cb=logger)
+        run_sam3_batch(cfg, log_cb=logger, progress_cb=lambda d,t: _set_progress(f"{d}/{t} frames", d, t), status_cb=logger)
         _free_vram("after SAM3")
         logger("Masking Complete.")
         JOB_QUEUE.put("DONE_MASKING")
+        return True
     except Exception as e:
         logger(f"ERROR in Masking: {e}")
         traceback.print_exc()
         JOB_QUEUE.put("DONE_MASKING")   # signal end on failure too (also refreshes the table)
+        return False
 
 def _find_mask_dir(out_root, shot_name, mask_subdir):
     """Locate a SAM3 mask folder for a shot (case-insensitive child), trying the
@@ -1208,6 +1227,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
     """TAPNext++ tracking path (Apache-2.0 GPU tracker, fallback backend)."""
     any_ran = False
     stopped = False
+    sel_total = sum(1 for d in state.shots_data.values() if getattr(d, "use", False))
+    sel_done = 0
     for shot_name, data in state.shots_data.items():
         if STOP_EVENT.is_set():
             logger("Tracking stopped by user."); stopped = True; break
@@ -1238,7 +1259,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             mask_subdir = str(t.get("mask_subdir") or ("masks_" + task_id)).strip()
             output_tag = "" if task_id.lower() == "camera" else task_id
 
-            _set_progress(f"{shot_name} · {task_id}")
+            _set_progress(f"{shot_name} · {task_id}", sel_done, sel_total)
             logger(f"Tracking: {shot_name} | {task_id} | {mode.upper()}")
             cfg = RunnerConfig(
                 input_dir=str(video_dir), output_dir=str(out_root), mask_root_dir=str(out_root),
@@ -1277,6 +1298,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             except Exception as e:
                 logger(f"QC metrics failed for {shot_name}/{task_id}: {e}")
         if qc_parts: data.track_metrics_summary = " | ".join(qc_parts)
+        sel_done += 1
+        _set_progress(f"{shot_name} · done", sel_done, sel_total)
         if stopped: break
     return any_ran, stopped
 
@@ -1285,6 +1308,8 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
     """SynthEyes tracking path: drive one SynthEyes instance over SyPy3 across shots."""
     any_ran = False
     stopped = False
+    sel_total = sum(1 for d in state.shots_data.values() if getattr(d, "use", False))
+    sel_done = 0
 
     settings = {
         "syntheyes_exe": str(getattr(state, "syntheyes_exe", "") or ""),
@@ -1394,7 +1419,7 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                 if use_matte and not mask_dir:
                     logger(f"  No SAM3 masks for {shot_name}/{task_id} — tracking full frame.")
 
-                _set_progress(f"{shot_name} · {task_id}")
+                _set_progress(f"{shot_name} · {task_id}", sel_done, sel_total)
                 logger(f"Tracking (SynthEyes): {shot_name} | {task_id} | tracks={track_count} | matte={'yes' if mask_dir else 'no'}")
                 try:
                     n_trk, _ = engine.process_shot(
@@ -1429,6 +1454,8 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
             except Exception as e:
                 logger(f"  Post-shot flush failed: {e}")
 
+            sel_done += 1
+            _set_progress(f"{shot_name} · done", sel_done, sel_total)
             prev_was_heavy = (frame_count >= 1000)
             if stopped: break
     finally:
@@ -1447,7 +1474,7 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
         if n_sel == 0:
             logger("No shots selected. Tick the 'Use' box on at least one shot, then retry.")
             JOB_QUEUE.put("DONE_TRACKING")
-            return
+            return False
         in_root = Path(in_dir) if in_dir else None
         out_root = Path(out_dir) if out_dir else None
         if not in_root or not in_root.exists(): raise RuntimeError("Input folder does not exist.")
@@ -1491,10 +1518,47 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                    "SynthEyes errored on it. Confirm the Input Folder is set and the shot is ticked.")
         else: logger("Tracking Complete.")
         JOB_QUEUE.put("DONE_TRACKING")
+        return not stopped
     except Exception as e:
         logger(f"ERROR in Tracking: {e}")
         traceback.print_exc()
         JOB_QUEUE.put("DONE_TRACKING")   # signal end on failure too (also refreshes the table)
+        return False
+
+
+def worker_pipeline(in_dir, out_dir, req_path, fps, ollama_url, weights,
+                    grid, seed_count, seed_min_dist, state: AppState):
+    """Run the whole chain for the ticked shots in ONE job: Analyze -> Mask -> Track.
+
+    Each stage is the same worker the numbered buttons call, so behavior is identical; they
+    return False on failure and queue their own DONE_* (which drives the UI refresh). We stop
+    the chain on the first failed stage or a Stop press, rather than masking/tracking against
+    a broken analysis. Existing masks are reused (regenerating is the manual Mask button's
+    job) so re-running the pipeline doesn't burn SAM3 time redoing work.
+    """
+    stages = [("Analyze", lambda: worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state)),
+              ("Mask",    lambda: worker_mask(in_dir, out_dir, weights, state)),
+              ("Track",   lambda: worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state))]
+    try:
+        n_sel = sum(1 for d in state.shots_data.values() if getattr(d, "use", False))
+        logger(f"=== Run Pipeline: Analyze -> Mask -> Track on {n_sel} shot(s) ===")
+        state.reuse_existing_masks = True
+        for i, (label, fn) in enumerate(stages, 1):
+            if STOP_EVENT.is_set():
+                logger(f"Pipeline stopped by user before {label}."); return False
+            logger(f"--- Pipeline {i}/{len(stages)}: {label} ---")
+            if not fn():
+                logger(f"Pipeline aborted: {label} did not complete. See the errors above.")
+                return False
+            if STOP_EVENT.is_set():
+                logger(f"Pipeline stopped by user after {label}."); return False
+        logger("=== Run Pipeline: complete ===")
+        return True
+    except Exception as e:
+        logger(f"ERROR in Pipeline: {e}")
+        traceback.print_exc()
+        return False
+
 
 # -----------------------------------------------------------------------------
 # 6. HANDLERS (Editor & Polling Logic)
@@ -1726,11 +1790,12 @@ def on_save_overdrive(st: AppState, inc, exc, scale, use_flag, fstart, fend):
     return gr.update(), st, "Error: No shot selected."
 
 def run_step_thread(target_fn, args, name: str = "Job"):
-    global CURRENT_JOB_THREAD, CURRENT_JOB_NAME
+    global CURRENT_JOB_THREAD, CURRENT_JOB_NAME, CURRENT_JOB_START
     if _job_running(): return f"{CURRENT_JOB_NAME} already running — wait or press Stop."
     STOP_EVENT.clear()
     _set_progress("")
     CURRENT_JOB_NAME = name
+    CURRENT_JOB_START = time.time()
     CURRENT_JOB_THREAD = threading.Thread(target=target_fn, args=args, daemon=True)
     CURRENT_JOB_THREAD.start()
     return f"Started: {name}…"
