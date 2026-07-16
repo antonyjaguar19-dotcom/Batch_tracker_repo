@@ -1030,6 +1030,33 @@ def shots_with_existing_masks(out_dir: str, state: AppState) -> List[str]:
     return names
 
 
+def shots_missing_masks(out_dir: str, state: AppState) -> List[str]:
+    """Selected shots with NO masks on disk. These will track the FULL PLATE (both backends
+    fall back to un-gated tracking when a shot has no mask dir), so the UI warns first."""
+    names = []
+    for name, d in state.shots_data.items():
+        if not getattr(d, "use", False):
+            continue
+        if not _shot_mask_dirs(out_dir, name):
+            names.append(name)
+    return names
+
+
+def shots_missing_analysis(out_dir: str, state: AppState) -> List[str]:
+    """Selected shots absent from the newest guide (i.e. never analyzed). Context only."""
+    g = _latest_guide_file(out_dir)
+    analyzed = set()
+    if g:
+        try:
+            with open(g, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            analyzed = {_norm_shot_name(_guide_shot_name(s)) for s in data.get("shots", [])}
+        except Exception:
+            analyzed = set()
+    return [name for name, d in state.shots_data.items()
+            if getattr(d, "use", False) and _norm_shot_name(name) not in analyzed]
+
+
 def worker_mask(in_dir, out_dir, weights, state: AppState):
     try:
         logger("--- Starting Step 3: Mask Generation ---")

@@ -428,11 +428,46 @@ def start_mask():
     dlg.open()
 
 
-def start_track():
+def _launch_track():
     msg = be.run_step_thread(be.worker_track,
                              (in_dir.value, out_dir.value, int(grid_size.value), int(seed_count.value), int(seed_min_dist.value), state),
                              "Tracking")
     ui.notify(msg)
+
+
+def start_track():
+    # Guard: shots with no masks track the FULL PLATE (no mover exclusion) — warn first.
+    # Shots that DO have masks still use them, so a mixed selection is fine to continue.
+    missing = be.shots_missing_masks(out_dir.value, state)
+    if not missing:
+        _launch_track()
+        return
+
+    unanalyzed = set(be.shots_missing_analysis(out_dir.value, state))
+    never = sorted(s for s in missing if s in unanalyzed)
+    masked_ok = [n for n, d in state.shots_data.items()
+                 if getattr(d, "use", False) and n not in missing]
+
+    dlg = ui.dialog()
+    with dlg, ui.card():
+        ui.label(f"No masks for {len(missing)} selected shot(s):").classes("text-bold")
+        ui.label(", ".join(sorted(missing))).classes("text-caption")
+        if never:
+            ui.label(f"Never analyzed: {', '.join(never)}").classes("text-caption text-orange")
+        ui.label("These will be tracked on the FULL PLATE with no masking — moving objects "
+                 "(people, vehicles) get tracked too, which can wreck a camera solve.")
+        if masked_ok:
+            ui.label(f"Shots that do have masks still use them: {', '.join(sorted(masked_ok))}"
+                     ).classes("text-caption")
+        ui.label("Run Analyze + Generate masks first, or continue anyway?").classes("text-caption")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+
+            def _go():
+                dlg.close(); _launch_track()
+
+            ui.button("Track full plate anyway", on_click=_go).props("color=negative")
+    dlg.open()
 
 
 def stop_job():
