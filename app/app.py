@@ -1271,7 +1271,12 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
     if not engine.setup_sypy():
         logger("ERROR: SyPy3 not found — install SynthEyes / check its bundled Python.")
         return any_ran, stopped
-    if not engine.connect_or_launch():
+    # Force a CLEAN instance for the batch: reusing a stale/hung SynthEyes left over from a
+    # prior run desyncs the socket and makes process_shot fail (shots then get swallowed ->
+    # a bland "Nothing to track"). launch() kills any existing instance first, so this
+    # guarantees a fresh, in-sync SynthEyes. (connect_or_launch would silently reuse it.)
+    logger("Starting a clean SynthEyes instance for this batch…")
+    if not engine.launch() or not engine.connect():
         logger("ERROR: Could not start/connect to SynthEyes.")
         return any_ran, stopped
 
@@ -1443,7 +1448,10 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
             _free_vram("after TAPNext")
 
         if stopped: logger("Tracking halted.")
-        elif not any_ran: logger("Nothing to track.")
+        elif not any_ran:
+            logger("Nothing to track — no selected shot produced tracks. Check the lines above: "
+                   "a shot was skipped (no image sequence/movie under the Input Folder) or "
+                   "SynthEyes errored on it. Confirm the Input Folder is set and the shot is ticked.")
         else: logger("Tracking Complete.")
         JOB_QUEUE.put("DONE_TRACKING")
     except Exception as e:
