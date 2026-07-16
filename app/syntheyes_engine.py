@@ -624,10 +624,16 @@ class SynthEyesEngine:
                  f"{'fixed' if fixed > 0 else 'adaptive'} chunking, seed window {win0}"
                  + (f", RSS base {base0/1e9:.1f}GB" if proc else " (no psutil)"))
 
-        a = start
+        # SynthEyes frames + playback range are 0-BASED (probe: a 300-frame shot reports
+        # shot.start 0 / shot.stop 299). The caller's start/end are 1-based plate numbers, so
+        # window the loop in 0-based indices -- otherwise 'Blips playback range' on [1..] skips
+        # raw frame 0 (= plate frame 1) and that frame exports with no tracks.
+        s0 = max(0, start - 1)
+        e0 = max(s0, end - 1)
+        a = s0
         idx = 0
         win = win0
-        while a <= end:
+        while a <= e0:
             if getattr(self, "_stop_requested", False):
                 self.log("   chunked blip/peel stopped by user."); return
             idx += 1
@@ -636,7 +642,7 @@ class SynthEyesEngine:
             if fixed <= 0 and rss_per_frame and ceiling:
                 room = max(0, ceiling - rss())
                 win = max(min_win, min(win0, int(room / rss_per_frame)))
-            b = min(a + win - 1, end)
+            b = min(a + win - 1, e0)
 
             # Per-window HANG WATCHDOG: a stuck SynthEyes blocks SyPy3 socket calls with no
             # timeout (that hung the first full-bot SH005 run at _set_frame_range). If a window
@@ -684,8 +690,8 @@ class SynthEyesEngine:
                     if shrunk >= (b - a + 1) or attempt > 6:
                         self.log(f"   window {a}-{b}: cannot shrink further -> proceeding"); break
                     win = shrunk
-                    b = min(a + win - 1, end)
-                    self.log(f"   memory pressure -> shrink window to {a}-{b} ({win}f) and retry")
+                    b = min(a + win - 1, e0)
+                    self.log(f"   memory pressure -> shrink window to plate {a+1}-{b+1} ({win}f) and retry")
 
                 # B) calibrate MB/frame from the first successful window
                 if fixed <= 0 and rss_per_frame is None and proc:
@@ -696,7 +702,7 @@ class SynthEyesEngine:
                         self.log(f"   calibrated ~{rss_per_frame/1e6:.1f} MB/frame @ {mp:.1f}MP; "
                                  f"later windows sized to the RAM ceiling")
 
-                self.log(f"   [window {idx}] frames {a}-{b} ({b - a + 1}f) blipped")
+                self.log(f"   [window {idx}] plate frames {a+1}-{b+1} ({b - a + 1}f) blipped")
                 if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
                     self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
                                              max_timeout=max(200, int((b - a + 1) * 1.2)))
@@ -707,12 +713,12 @@ class SynthEyesEngine:
             if wd_fired["v"] or not self.is_alive():
                 raise RuntimeError(f"SynthEyes hung/crashed on window {a}-{b} (watchdog); shot aborted")
 
-            if b >= end:
+            if b >= e0:
                 break
             a = b + 1 - overlap
 
-        # restore the full range so the Sizzle export walks the whole shot
-        self._set_frame_range(shot, start, end)
+        # restore the full (0-based) range so the Sizzle export walks the whole shot
+        self._set_frame_range(shot, s0, e0)
         self.log(f"-> Adaptive chunked blip/peel done ({idx} windows); trackers accumulated.")
 
     def _bring_foreground(self):
