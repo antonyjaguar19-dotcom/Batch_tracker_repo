@@ -613,48 +613,101 @@ def on_search(e):
 # LAYOUT
 # -----------------------------------------------------------------------------
 ui.dark_mode(True)
-ui.markdown("# Batch Tracker").classes("text-2xl")
+ui.colors(primary="#4c8dff", secondary="#2dd4bf", accent="#a78bfa",
+          positive="#22c55e", negative="#f43f5e", warning="#f59e0b", info="#38bdf8",
+          dark="#12151c", dark_page="#0d1017")
 
-with ui.row().classes("w-full no-wrap"):
-    # ---------- LEFT RAIL ----------
-    with ui.column().classes("w-80 gap-2"):
-        ui.markdown("### Project")
+ui.add_head_html("""
+<style>
+  body { background: #0d1017; }
+  .bt-header  { background: linear-gradient(90deg,#141a26 0%,#101623 60%,#0d1017 100%);
+                border-bottom: 1px solid rgba(255,255,255,.07); }
+  .bt-rail    { background: #10141d; border-right: 1px solid rgba(255,255,255,.07); }
+  .bt-card    { background: #141924; border: 1px solid rgba(255,255,255,.07);
+                border-radius: 10px; box-shadow: none; }
+  .bt-card > .q-card__section { padding: 12px 14px; }
+  .bt-section { font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+                color: #8a94a6; font-weight: 600; }
+  .bt-status  { font-size: 13px; color: #cbd5e1; }
+  .bt-status p { margin: 0; }
+  .bt-hint    { font-size: 12px; color: #7c8698; }
+  .bt-chip    { background: rgba(76,141,255,.14); color: #9dc0ff; border-radius: 999px;
+                padding: 2px 10px; font-size: 12px; }
+  .bt-chip p  { margin: 0; }
+  .bt-editor  { width: 780px; max-width: 94vw; background: #141924; }
+</style>
+""")
+
+# ---------- HEADER: identity, live status, kill switches ----------
+with ui.header().classes("bt-header items-center px-4 py-2"):
+    with ui.row().classes("w-full items-center justify-between no-wrap"):
+        with ui.row().classes("items-center gap-2 no-wrap"):
+            ui.button(icon="menu", on_click=lambda: rail.toggle()).props("flat dense round color=white")
+            ui.icon("track_changes").classes("text-2xl text-blue-4")
+            ui.label("Batch Tracker").classes("text-h6 text-weight-bold")
+        with ui.row().classes("items-center gap-3 no-wrap"):
+            lbl_status = ui.markdown("🟢 Idle").classes("bt-status")
+            btn_stop = ui.button("Stop", icon="stop", on_click=stop_job).props("flat dense color=white")
+            btn_stop.set_enabled(False)
+            ui.button(icon="power_settings_new", on_click=shutdown_bot
+                      ).props("flat dense round color=red-4").tooltip("Shut down Batch Tracker")
+
+# ---------- LEFT RAIL: project paths + settings + find ----------
+with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes("bt-rail p-3 gap-3") as rail:
+    with ui.card().classes("w-full bt-card"):
+        ui.label("Project").classes("bt-section")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            in_dir = ui.input("Input Folder", placeholder=r"D:\shots\IN").classes("grow")
+            in_dir = ui.input("Input Folder", placeholder=r"D:\shots\IN").props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(in_dir)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            out_dir = ui.input("Output Folder", placeholder=r"D:\shots\OUT").classes("grow")
+            out_dir = ui.input("Output Folder", placeholder=r"D:\shots\OUT").props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(out_dir)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            req_file = ui.input("Client Requirements (optional)", placeholder=r"D:\shots\reqs.xlsx").classes("grow")
+            req_file = ui.input("Client Requirements (optional)", placeholder=r"D:\shots\reqs.xlsx"
+                                ).props("dense outlined").classes("grow")
             ui.button(icon="description", on_click=lambda: pick_file(req_file)).props("flat dense")
 
-        with ui.expansion("Settings", icon="tune").classes("w-full"):
+    with ui.card().classes("w-full bt-card"):
+        ui.label("Find shots").classes("bt-section")
+        ui.input(placeholder="type part of a shot name…"
+                 ).props("dense outlined clearable").classes("w-full").on_value_change(on_search)
+
+    with ui.card().classes("w-full bt-card"):
+        with ui.expansion("Settings", icon="tune", value=False).classes("w-full"):
             # ---- Universal (both backends / AI pipeline) ----
+            ui.label("Analysis & seeding").classes("bt-section q-mt-sm")
             ui.label("Qwen2 Sample Density")
             qwen_fps = ui.slider(min=1, max=8, value=4).props("label-always")
             ui.label("Seed Count (Max Tracks)")
             seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
 
-            ui.separator()
-            ui.label("Tracking backend")
+            sw_motion = ui.switch("CV motion backstop", value=True,
+                                  on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
+            sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
+                              "Turn OFF if it masks things you removed from Exclude.")
+
+            ui.separator().classes("q-my-sm")
+            ui.label("Tracking backend").classes("bt-section")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
-                                    on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")).classes("w-full")
+                                    on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")
+                                    ).props("dense outlined").classes("w-full")
             backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback. "
                                 "The settings below switch to match the selected backend.")
 
             # ---- SynthEyes-only (shown when backend = syntheyes) ----
             with ui.column().classes("w-full gap-2") as syn_box:
-                ui.label("SynthEyes settings").classes("text-xs text-grey-6 q-mt-sm")
+                ui.label("SynthEyes settings").classes("bt-section q-mt-sm")
                 with ui.row().classes("w-full no-wrap items-end gap-1"):
                     se_exe = ui.input("SynthEyes .exe", value=state.syntheyes_exe,
-                                      placeholder=r"C:\Program Files\Andersson Technologies LLC\SynthEyes\SynthEyes64.exe").classes("grow")
+                                      placeholder=r"C:\Program Files\Andersson Technologies LLC\SynthEyes\SynthEyes64.exe"
+                                      ).props("dense outlined").classes("grow")
                     ui.button(icon="folder", on_click=lambda: pick_file(se_exe)).props("flat dense")
                 se_exe.on_value_change(lambda e: setattr(state, "syntheyes_exe", e.value or ""))
 
                 se_preset = ui.select(be.SE_PRESET_NAMES or ["Normal / Handheld"], value=state.track_preset,
                                       label="SynthEyes preset (max tracks)",
-                                      on_change=lambda e: setattr(state, "track_preset", e.value or "Normal / Handheld")).classes("w-full")
+                                      on_change=lambda e: setattr(state, "track_preset", e.value or "Normal / Handheld")
+                                      ).props("dense outlined").classes("w-full")
                 se_preset.tooltip("Locked 100 / Slow 500 / Normal 800 / Fast 2000. Custom = use Seed Count slider above.")
 
                 sw_matte = ui.switch("Use SAM3 masks as matte", value=state.use_sam3_matte,
@@ -666,20 +719,21 @@ with ui.row().classes("w-full no-wrap"):
                 sw_3de.tooltip("After export, build a 3DEqualizer .3de project from the 2D tracks. Needs the 3DE4 exe below.")
                 with ui.row().classes("w-full no-wrap items-end gap-1"):
                     tde_exe = ui.input("3DEqualizer4 .exe (for auto .3de)", value=state.tde4_exe,
-                                       placeholder=r"C:\Program Files\3DE4\bin\3DE4.exe").classes("grow")
+                                       placeholder=r"C:\Program Files\3DE4\bin\3DE4.exe"
+                                       ).props("dense outlined").classes("grow")
                     ui.button(icon="folder", on_click=lambda: pick_file(tde_exe)).props("flat dense")
                 tde_exe.on_value_change(lambda e: setattr(state, "tde4_exe", e.value or ""))
             syn_box.bind_visibility_from(backend_sel, "value", value="syntheyes")
 
             # ---- TAPNext++-only (shown when backend = tapnext) ----
             with ui.column().classes("w-full gap-2") as tap_box:
-                ui.label("TAPNext++ settings").classes("text-xs text-grey-6 q-mt-sm")
+                ui.label("TAPNext++ settings").classes("bt-section q-mt-sm")
                 ui.label("Grid Size")
                 grid_size = ui.slider(min=4, max=20, value=10).props("label-always")
                 ui.label("Min Seed Distance (px)")
                 seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
                 ui.label("Track chunks (0 = Auto)")
-                track_chunks = ui.number(value=0, min=0, max=16, precision=0).classes("w-full")
+                track_chunks = ui.number(value=0, min=0, max=16, precision=0).props("dense outlined").classes("w-full")
                 track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
                 track_chunks.tooltip("Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
                                      "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
@@ -690,7 +744,8 @@ with ui.row().classes("w-full no-wrap"):
                 track_spacing.tooltip("Min pixel gap between kept tracks. Small = denser/more tracks, large = sparser/fewer. "
                                       "Collapses duplicate passes and spreads the strongest tracks evenly; count floats with footage texture/parallax.")
                 ui.label("Max tracks per task (0 = auto)")
-                track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0).classes("w-full")
+                track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0
+                                      ).props("dense outlined").classes("w-full")
                 track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
                 track_max.tooltip("Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
 
@@ -729,41 +784,41 @@ with ui.row().classes("w-full no-wrap"):
                 refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
             tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
 
-        ui.markdown("### Run")
-        btn_pipe = ui.button("▶ Run Pipeline (Analyze → Mask → Track)",
-                             on_click=start_pipeline, color="primary").classes("w-full")
-        btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
-                         "have to click 2/3/4 and wait between each. Existing masks are reused "
-                         "(use 3 · Generate masks to force a regen). Stop halts between stages.")
-        ui.markdown("##### …or run them one at a time")
-        btn_scan = ui.button("1 · Scan inputs", on_click=do_scan).props("outline").classes("w-full")
-        btn_analyze = ui.button("2 · Analyze (AI)", on_click=start_analyze, color="red").classes("w-full")
-        btn_mask = ui.button("3 · Generate masks", on_click=start_mask).props("outline").classes("w-full")
-        btn_track = ui.button("4 · Start tracking", on_click=start_track, color="red").classes("w-full")
-        btn_stop = ui.button("⏹ Stop", on_click=stop_job, color="grey").classes("w-full")
-        btn_stop.set_enabled(False)
-        ui.button("⏻ Shutdown bot", on_click=shutdown_bot).props("outline color=negative").classes("w-full")
+# ---------- MAIN COLUMN ----------
+with ui.column().classes("w-full gap-3 p-3"):
+    # Progress bar: determinate when the stage reports done/total (masking = frames,
+    # tracking = shots), indeterminate otherwise (Qwen exposes no numeric hook).
+    bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-full")
+    bar.visible = False
 
-        sw_motion = ui.switch("CV motion backstop", value=True,
-                              on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
-        sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
-                          "Turn OFF if it masks things you removed from Exclude.")
+    # ---- Run bar: one-click pipeline on the left, the manual stages on the right ----
+    with ui.card().classes("w-full bt-card"):
+        with ui.row().classes("w-full items-center justify-between no-wrap gap-4"):
+            btn_pipe = ui.button("Run Pipeline", icon="play_arrow", on_click=start_pipeline, color="primary")
+            btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
+                             "have to click 2/3/4 and wait between each. Existing masks are reused "
+                             "(use 3 · Generate masks to force a regen). Stop halts between stages.")
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.label("or step through").classes("bt-hint")
+                btn_scan = ui.button("1 · Scan", icon="search", on_click=do_scan).props("outline dense")
+                btn_analyze = ui.button("2 · Analyze", icon="auto_awesome", on_click=start_analyze).props("outline dense color=accent")
+                btn_mask = ui.button("3 · Masks", icon="layers", on_click=start_mask).props("outline dense")
+                btn_track = ui.button("4 · Track", icon="my_location", on_click=start_track).props("outline dense color=secondary")
 
-        ui.markdown("### Find shots")
-        ui.input("Find shots", placeholder="type part of a shot name…").classes("w-full").on_value_change(on_search)
+    # ---- Shots table ----
+    with ui.card().classes("w-full bt-card"):
+        with ui.row().classes("w-full items-center justify-between no-wrap gap-3"):
+            with ui.column().classes("gap-0"):
+                ui.label("Shots").classes("bt-section")
+                ui.label("tick to include · click a row to edit · trash clears that shot's memory"
+                         ).classes("bt-hint")
+            lbl_selcount = ui.markdown("No shots yet — set Input Folder and press **1 · Scan**."
+                                       ).classes("bt-chip")
+            ed_pick = ui.select([], label="Edit shot", with_input=True).props("dense outlined").classes("w-64")
+            ed_pick.on_value_change(on_pick_edit)
 
-    # ---------- MAIN AREA ----------
-    with ui.column().classes("grow gap-2"):
-        with ui.row().classes("w-full justify-between"):
-            lbl_status = ui.markdown("🟢 Idle")
-            lbl_selcount = ui.markdown("No shots yet — set Input Folder and press **1 · Scan inputs**.")
-        # Progress bar: determinate when the stage reports done/total (masking = frames,
-        # tracking = shots), indeterminate otherwise (Qwen exposes no numeric hook).
-        bar = ui.linear_progress(value=0, show_value=False, size="10px").classes("w-full")
-        bar.visible = False
-
-        ui.markdown("### Shots · tick the box to include · click a row to edit · active rows highlight")
-        table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple").classes("w-full")
+        table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple"
+                         ).props("flat dense").classes("w-full")
         table.on("selection", on_selection_change)
         table.on("rowClick", on_row_click)
         # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
@@ -778,34 +833,49 @@ with ui.row().classes("w-full no-wrap"):
         ''')
         table.on("clearmem", lambda e: on_clear_mem(e.args))
 
-        ed_pick = ui.select([], label="✏️ Edit shot", with_input=True).classes("w-full")
-        ed_pick.on_value_change(on_pick_edit)
-
-        with ui.expansion("Edit selected shot", icon="edit", value=False).classes("w-full") as editor:
-            ed_title = ui.markdown("#### Select a shot")
-            ed_meta = ui.markdown("")
-            with ui.row().classes("w-full no-wrap gap-2"):
-                ed_scale = ui.select(["100%", "75%", "50%", "25%"], value="100%", label="Downscale")
-                ed_fstart = ui.number("Frame Start (0 = first)", value=0, min=0, precision=0)
-                ed_fend = ui.number("Frame End (0 = last)", value=0, min=0, precision=0)
-            ed_req = ui.textarea("Client requirement (manual)",
-                                 placeholder="e.g. Camera track / Face track / track car, exclude crowd"
-                                 ).classes("w-full")
-            ed_req.tooltip("Per-shot brief used by Analyze. Saved to "
-                           "<OUT>/manual_requirements.json and reloaded on Scan.")
-            with ui.row().classes("w-full no-wrap gap-2"):
-                ed_inc = ui.input("Include Prompts (track inside)").classes("grow")
-                ed_exc = ui.input("Exclude Prompts (mask out)").classes("grow")
-            with ui.expansion("AI object suggestions", icon="auto_awesome").classes("w-full"):
-                ed_things = ui.select([], multiple=True, label="Detected objects").classes("w-full")
-                with ui.row():
-                    ui.button("Add → Include", on_click=lambda: add_things_to(ed_inc)).props("outline")
-                    ui.button("Add → Exclude", on_click=lambda: add_things_to(ed_exc), color="red")
-            ui.button("💾 Save shot settings", on_click=save_shot, color="red")
-            ed_analysis = ui.markdown("Select a shot to see its AI analysis.")
-
+    # ---- Logs ----
+    with ui.card().classes("w-full bt-card"):
         with ui.expansion("Logs", icon="article", value=True).classes("w-full"):
             log_view = ui.log(max_lines=400).classes("w-full h-64")
+
+# ---------- SHOT EDITOR (dialog; load_editor() calls editor.open()) ----------
+with ui.dialog() as editor, ui.card().classes("bt-editor"):
+    with ui.row().classes("w-full items-center justify-between no-wrap"):
+        ed_title = ui.markdown("#### Select a shot")
+        ui.button(icon="close", on_click=editor.close).props("flat dense round")
+    ed_meta = ui.markdown("").classes("bt-hint")
+    ui.separator()
+
+    ui.label("Scope").classes("bt-section")
+    with ui.row().classes("w-full no-wrap gap-2"):
+        ed_scale = ui.select(["100%", "75%", "50%", "25%"], value="100%", label="Downscale"
+                             ).props("dense outlined").classes("grow")
+        ed_fstart = ui.number("Frame Start (0 = first)", value=0, min=0, precision=0
+                              ).props("dense outlined").classes("grow")
+        ed_fend = ui.number("Frame End (0 = last)", value=0, min=0, precision=0
+                            ).props("dense outlined").classes("grow")
+
+    ui.label("Brief").classes("bt-section q-mt-sm")
+    ed_req = ui.textarea(placeholder="e.g. Camera track / Face track / track car, exclude crowd"
+                         ).props("dense outlined autogrow").classes("w-full")
+    ed_req.tooltip("Per-shot brief used by Analyze. Saved to "
+                   "<OUT>/manual_requirements.json and reloaded on Scan.")
+
+    ui.label("Prompts").classes("bt-section q-mt-sm")
+    with ui.row().classes("w-full no-wrap gap-2"):
+        ed_inc = ui.input("Include Prompts (track inside)").props("dense outlined").classes("grow")
+        ed_exc = ui.input("Exclude Prompts (mask out)").props("dense outlined").classes("grow")
+    with ui.expansion("AI object suggestions", icon="auto_awesome").classes("w-full"):
+        ed_things = ui.select([], multiple=True, label="Detected objects").props("dense outlined").classes("w-full")
+        with ui.row().classes("gap-2"):
+            ui.button("Add → Include", on_click=lambda: add_things_to(ed_inc)).props("outline dense")
+            ui.button("Add → Exclude", on_click=lambda: add_things_to(ed_exc)).props("outline dense color=negative")
+    with ui.expansion("AI analysis", icon="psychology", value=False).classes("w-full"):
+        ed_analysis = ui.markdown("Select a shot to see its AI analysis.")
+
+    with ui.row().classes("w-full justify-end gap-2 q-mt-sm"):
+        ui.button("Close", on_click=editor.close).props("flat")
+        ui.button("Save shot settings", icon="save", on_click=save_shot, color="primary")
 
 ui.timer(1.0, poll)
 
