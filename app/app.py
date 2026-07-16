@@ -578,8 +578,16 @@ def _job_running() -> bool:
 def logger(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     full_msg = f"[{ts}] {msg}"
-    JOB_QUEUE.put(full_msg)
-    print(full_msg)
+    JOB_QUEUE.put(full_msg)   # UI log keeps full unicode - the browser renders it fine
+    try:
+        print(full_msg)
+    except UnicodeEncodeError:
+        # Windows consoles default to cp1252, which can't encode plenty of what flows
+        # through here: Qwen-derived mask prompts (sam3_runner logs include/exclude), shot
+        # names, and exception text. A bare print would raise INSIDE logger and kill the
+        # worker mid-stage, so degrade the CONSOLE copy only. (SynthEyesEngine.log does the
+        # same for its own output.)
+        print(full_msg.encode("ascii", "replace").decode("ascii"))
 
 # -----------------------------------------------------------------------------
 # Track QC Metrics
@@ -993,6 +1001,7 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
     except Exception as e:
         logger(f"ERROR in Analysis: {e}")
         traceback.print_exc()
+        JOB_QUEUE.put("DONE_ANALYSIS")   # signal end on failure too, so the UI settles
 
 def _shot_mask_dirs(out_dir: str, shot_name: str) -> List[str]:
     """Return mask dirs (containing >=1 .png) already present for a shot in OUT.
@@ -1168,6 +1177,7 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
     except Exception as e:
         logger(f"ERROR in Masking: {e}")
         traceback.print_exc()
+        JOB_QUEUE.put("DONE_MASKING")   # signal end on failure too (also refreshes the table)
 
 def _find_mask_dir(out_root, shot_name, mask_subdir):
     """Locate a SAM3 mask folder for a shot (case-insensitive child), trying the
@@ -1484,6 +1494,7 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
     except Exception as e:
         logger(f"ERROR in Tracking: {e}")
         traceback.print_exc()
+        JOB_QUEUE.put("DONE_TRACKING")   # signal end on failure too (also refreshes the table)
 
 # -----------------------------------------------------------------------------
 # 6. HANDLERS (Editor & Polling Logic)
