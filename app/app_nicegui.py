@@ -635,6 +635,10 @@ ui.add_head_html("""
                 padding: 2px 10px; font-size: 12px; }
   .bt-chip p  { margin: 0; }
   .bt-editor  { width: 780px; max-width: 94vw; background: #141924; }
+  /* Run bar: pipeline button, then the four stages as one evenly-sized sequence. */
+  .bt-run     { min-width: 150px; height: 36px; font-weight: 600; }
+  .bt-step    { min-width: 122px; height: 36px; color: #9dc0ff; }
+  .bt-vsep    { height: 24px; margin: 0 6px; background: rgba(255,255,255,.12); }
 </style>
 """)
 
@@ -791,19 +795,23 @@ with ui.column().classes("w-full gap-3 p-3"):
     bar = ui.linear_progress(value=0, show_value=False, size="6px").classes("w-full")
     bar.visible = False
 
-    # ---- Run bar: one-click pipeline on the left, the manual stages on the right ----
+    # ---- Run bar: one-click pipeline, then the same stages individually ----
     with ui.card().classes("w-full bt-card"):
-        with ui.row().classes("w-full items-center justify-between no-wrap gap-4"):
-            btn_pipe = ui.button("Run Pipeline", icon="play_arrow", on_click=start_pipeline, color="primary")
+        with ui.row().classes("w-full items-center no-wrap gap-2"):
+            btn_pipe = ui.button("Run Pipeline", icon="play_arrow", on_click=start_pipeline, color="primary"
+                                 ).props("unelevated no-caps").classes("bt-run")
             btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
                              "have to click 2/3/4 and wait between each. Existing masks are reused "
                              "(use 3 · Generate masks to force a regen). Stop halts between stages.")
-            with ui.row().classes("items-center gap-2 no-wrap"):
-                ui.label("or step through").classes("bt-hint")
-                btn_scan = ui.button("1 · Scan", icon="search", on_click=do_scan).props("outline dense")
-                btn_analyze = ui.button("2 · Analyze", icon="auto_awesome", on_click=start_analyze).props("outline dense color=accent")
-                btn_mask = ui.button("3 · Masks", icon="layers", on_click=start_mask).props("outline dense")
-                btn_track = ui.button("4 · Track", icon="my_location", on_click=start_track).props("outline dense color=secondary")
+            ui.separator().props("vertical").classes("bt-vsep")
+            btn_scan = ui.button("1 · Scan", icon="search", on_click=do_scan
+                                 ).props("outline no-caps").classes("bt-step")
+            btn_analyze = ui.button("2 · Analyze", icon="auto_awesome", on_click=start_analyze
+                                    ).props("outline no-caps").classes("bt-step")
+            btn_mask = ui.button("3 · Masks", icon="layers", on_click=start_mask
+                                 ).props("outline no-caps").classes("bt-step")
+            btn_track = ui.button("4 · Track", icon="my_location", on_click=start_track
+                                  ).props("outline no-caps").classes("bt-step")
 
     # ---- Shots table ----
     with ui.card().classes("w-full bt-card"):
