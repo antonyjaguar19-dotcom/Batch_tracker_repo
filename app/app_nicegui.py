@@ -46,6 +46,7 @@ TABLE_COLS = [
     {"name": "scale", "label": "Scale", "field": "scale", "align": "left"},
     {"name": "range", "label": "Range / Frames", "field": "range", "align": "left"},
     {"name": "metrics", "label": "Track Metrics", "field": "metrics", "align": "left"},
+    {"name": "clear", "label": "", "field": "clear", "align": "right"},
 ]
 
 _suppress_select = False  # guard so programmatic selection doesn't re-trigger handlers
@@ -73,6 +74,7 @@ def _build_rows():
             "scale": d.scale,
             "range": be._range_cell(d),
             "metrics": d.track_metrics_summary or "",
+            "clear": "",
         })
     return rows
 
@@ -134,6 +136,55 @@ def on_row_click(e):
     if name:
         ed_pick.set_value(name)  # keeps dropdown in sync; its change loads the editor
         load_editor(name)
+
+
+def _reset_shot_analysis(d):
+    """Wipe a shot's analysis/scope in memory (keep identity + tracking metrics)."""
+    d.strategy = "Pending"
+    d.include_prompts = ""
+    d.exclude_prompts = ""
+    d.detected_things = []
+    d.frame_start = 0
+    d.frame_end = 0
+    d.moving_things = []
+    d.bad_track_regions = []
+    d.foreground_occluders = []
+    d.quality_flags = []
+    d.depth_layers = {"fg": "", "mg": "", "bg": ""}
+    d.parallax = ""
+    d.notes = ""
+
+
+def on_clear_mem(row):
+    """Per-shot 'clear memory': confirm, then drop the shot's stored analysis (guide entry +
+    manual note) and reset it in the table."""
+    if isinstance(row, list):
+        row = row[0] if row else None
+    name = (row or {}).get("name") if isinstance(row, dict) else None
+    if not name or name not in state.shots_data:
+        return
+    dlg = ui.dialog()
+    with dlg, ui.card():
+        ui.markdown(f"**Clear analysis memory for `{name}`?**")
+        ui.label("Removes its scope, prompts and Qwen analysis (guide entry + manual brief). "
+                 "Tracking metrics and the shot itself stay. This cannot be undone.")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+
+            def _do():
+                try:
+                    be.clear_shot_memory(out_dir.value, name)
+                except Exception as ex:
+                    print(f"clear_shot_memory: {ex}")
+                _reset_shot_analysis(state.shots_data[name])
+                if isinstance(getattr(state, "manual_notes", None), dict):
+                    state.manual_notes.pop(name, None)
+                refresh_table()
+                dlg.close()
+                ui.notify(f"Cleared memory for {name}", type="warning")
+
+            ui.button("Clear memory", on_click=_do, color="negative")
+    dlg.open()
 
 
 def on_pick_edit(e):
@@ -624,6 +675,17 @@ with ui.row().classes("w-full no-wrap"):
         table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple").classes("w-full")
         table.on("selection", on_selection_change)
         table.on("rowClick", on_row_click)
+        # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
+        # editor via rowClick; emits the row up to the Python handler.
+        table.add_slot("body-cell-clear", r'''
+          <q-td :props="props" auto-width>
+            <q-btn dense flat round color="grey-6" icon="delete_outline"
+                   @click.stop="() => $parent.$emit('clearmem', props.row)">
+              <q-tooltip>Clear this shot's analysis memory</q-tooltip>
+            </q-btn>
+          </q-td>
+        ''')
+        table.on("clearmem", lambda e: on_clear_mem(e.args))
 
         ed_pick = ui.select([], label="✏️ Edit shot", with_input=True).classes("w-full")
         ed_pick.on_value_change(on_pick_edit)

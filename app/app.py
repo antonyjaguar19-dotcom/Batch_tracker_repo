@@ -831,6 +831,88 @@ def _ensure_ollama(base_url: str = None, model: str = "llama3.1:8b", timeout: fl
     return True
 
 
+def _latest_guide_file(out_root, exclude_dir=None):
+    """Newest mask_guidance.json / overdrive_guide.json across <out>/_batches (or None)."""
+    broot = Path(out_root) / "_batches"
+    if not broot.exists():
+        return None
+    cands = []
+    for d in broot.iterdir():
+        if not d.is_dir():
+            continue
+        if exclude_dir and Path(d).resolve() == Path(exclude_dir).resolve():
+            continue
+        for fn in ("mask_guidance.json", "overdrive_guide.json"):
+            g = d / fn
+            if g.exists():
+                cands.append(g)
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def _guide_shot_name(s: dict) -> str:
+    return str(s.get("shot_name") or s.get("shot") or s.get("name") or "")
+
+
+def _merge_prior_guide_shots(guide_data, out_root, exclude_batch=None):
+    """Cumulative analysis memory: copy shots from the most recent PRIOR guide that are NOT
+    in this run into guide_data, so analyzing a new subset never forgets earlier shots."""
+    prior = _latest_guide_file(out_root, exclude_dir=exclude_batch)
+    if not prior:
+        return
+    try:
+        with open(prior, "r", encoding="utf-8") as f:
+            pdata = json.load(f)
+    except Exception as e:
+        logger(f"  (cumulative memory: could not read prior guide: {e})")
+        return
+    have = {_norm_shot_name(_guide_shot_name(s)) for s in guide_data.get("shots", [])}
+    carried = 0
+    for s in pdata.get("shots", []):
+        nm = _norm_shot_name(_guide_shot_name(s))
+        if nm and nm not in have:
+            guide_data.setdefault("shots", []).append(s)
+            have.add(nm)
+            carried += 1
+    if carried:
+        logger(f"Carried forward {carried} previously-analyzed shot(s) (cumulative memory).")
+
+
+def clear_shot_memory(out_root, shot_name):
+    """Forget one shot's analysis: drop it from the latest guide + its manual requirement
+    note. Returns True if anything was removed."""
+    norm = _norm_shot_name(shot_name)
+    removed = False
+    g = _latest_guide_file(out_root)
+    if g:
+        try:
+            with open(g, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            shots = data.get("shots", [])
+            kept = [s for s in shots if _norm_shot_name(_guide_shot_name(s)) != norm]
+            if len(kept) != len(shots):
+                data["shots"] = kept
+                with open(g, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                removed = True
+        except Exception as e:
+            logger(f"clear_shot_memory (guide): {e}")
+    mr = Path(out_root) / "manual_requirements.json"
+    if mr.exists():
+        try:
+            with open(mr, "r", encoding="utf-8") as f:
+                notes = json.load(f)
+            newnotes = {k: v for k, v in notes.items() if _norm_shot_name(k) != norm}
+            if len(newnotes) != len(notes):
+                with open(mr, "w", encoding="utf-8") as f:
+                    json.dump(newnotes, f, indent=2)
+                removed = True
+        except Exception as e:
+            logger(f"clear_shot_memory (notes): {e}")
+    logger(f"Cleared analysis memory for '{shot_name}'." if removed
+           else f"No stored analysis found for '{shot_name}'.")
+    return removed
+
+
 def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
     try:
         logger("--- Starting Step 2: Analysis & Decision ---")
@@ -896,7 +978,11 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
             logger(f"Skipped {before - len(reqs)} requirement(s) for shots not analyzed this run.")
 
         guide_data = build_batch_tracker_json(items=reqs, qwen2_map=qmap)
-        
+
+        # Cumulative memory: fold in previously-analyzed shots not in this run so the newest
+        # guide always holds ALL analyzed shots (Scan restore + Mask both read the newest).
+        _merge_prior_guide_shots(guide_data, out_dir, exclude_batch=batch_dir)
+
         guide_path = batch_dir / "mask_guidance.json"
         with open(guide_path, "w", encoding="utf-8") as f:
             json.dump(guide_data, f, indent=2)
