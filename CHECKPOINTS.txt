@@ -1,0 +1,145 @@
+=============================================================================
+ Batch Tracker - model weights / checkpoint download sheet
+=============================================================================
+ None of these ship in the repo (too big). Pip installs (requirements.txt) get
+ you the code; this file gets you the brains. Fetch them into the exact paths
+ below - the loaders are OFFLINE by design (local_files_only=True) and will
+ error rather than download at runtime.
+
+ All paths are relative to the repo root (the folder holding launch_nicegui.bat).
+ clone_and_setup.bat downloads every one of these automatically; this sheet is
+ for doing it by hand / later / on a machine where the script was skipped.
+
+ Downloads go through huggingface_hub's Python API, NOT the `hf` CLI - the CLI
+ imports the stdlib `venv` module, which the embeddable interpreter omits.
+
+ PY = runtime\python311\python.exe   (or any Python 3.11 with huggingface_hub)
+
+-----------------------------------------------------------------------------
+ SUMMARY
+-----------------------------------------------------------------------------
+ Stage      What                     Size    Gated  Needed for
+ ---------  -----------------------  ------  -----  ------------------------
+ Qwen       Qwen2.5-VL-7B-Instruct   16 GB   no     Analyze (shot describe)
+   (or)     Qwen2.5-VL-3B-Instruct   7.1 GB  no     Analyze, light box
+ SAM3       sam3.pt                  3.3 GB  YES    Mask
+ TAPNext++  tapnextpp_ckpt.pt        2.4 GB  no     Track (fallback backend)
+ TAPNext++  tapnet repo (git)        ~50 MB  no     Track (fallback backend)
+
+ Budget ~22 GB of disk for the 7B path (everything except the pip installs).
+ Sizes are measured off this working install, not estimates.
+
+ SynthEyes = the DEFAULT tracking backend and has NO checkpoint - it is a
+ licensed installed app. See requirements.txt prereqs. TAPNext++ below is only
+ the GPU fallback backend; skip it if you always track in SynthEyes.
+
+
+=============================================================================
+ 1. QWEN2.5-VL  (Analyze stage)
+=============================================================================
+ Dest:  pipeline\qwen\models\<model-folder-name>
+
+ The resolver (pipeline\qwen\run_qwen2_shot_describer.py:_resolve_model_dir)
+ picks the FIRST folder that exists, in this order:
+
+   1. $QWEN2_MODEL_DIR            (env override, any path)
+   2. Qwen2.5-VL-7B-Instruct-AWQ  <- preferred (int4 AWQ)
+   3. Qwen2.5-VL-7B-Instruct      <- what setup downloads; int4 via bitsandbytes
+                                     NF4 at load (~5.5 GB VRAM)
+   4. Qwen2.5-VL-3B-Instruct      <- legacy / light box (7.1 GB on disk)
+
+ The folder name must match exactly - the resolver looks for these literal names
+ under pipeline\qwen\models\. Pick ONE (7B unless the box is small).
+
+ Repos:
+   https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+   https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct
+   https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct
+
+ Download (7B, the default):
+   PY -c "from huggingface_hub import snapshot_download as s; s(repo_id='Qwen/Qwen2.5-VL-7B-Instruct', local_dir=r'pipeline\qwen\models\Qwen2.5-VL-7B-Instruct')"
+
+ Download (3B, light box):
+   PY -c "from huggingface_hub import snapshot_download as s; s(repo_id='Qwen/Qwen2.5-VL-3B-Instruct', local_dir=r'pipeline\qwen\models\Qwen2.5-VL-3B-Instruct')"
+
+ Verify: the folder holds config.json + the model-*.safetensors shards.
+
+
+=============================================================================
+ 2. SAM3  (Mask stage)   *** GATED - needs a Hugging Face token ***
+=============================================================================
+ Dest:  pipeline\sam3\weights\sam3.pt
+ Override: env BTR_SAM3_WEIGHTS (absolute path to the .pt).
+ launch_nicegui.bat sets BTR_SAM3_WEIGHTS to the dest above.
+
+ Repo: https://huggingface.co/facebook/sam3   (file: sam3.pt)
+
+ facebook/sam3 is a gated repo. Before the download works you must:
+   1. Log in to Hugging Face and ACCEPT the license on the repo page above.
+   2. Make a token: https://huggingface.co/settings/tokens
+   3. Put it in the environment for the download shell:
+        set HF_TOKEN=hf_xxxxxxxxxxxxxxxxx
+
+ Download:
+   PY -c "from huggingface_hub import hf_hub_download as d; d(repo_id='facebook/sam3', filename='sam3.pt', local_dir=r'pipeline\sam3\weights')"
+
+ A 401/403 here means the license was not accepted on that account, or the token
+ is not in the environment.
+
+
+=============================================================================
+ 3. TAPNext++  (Track stage - fallback GPU backend)
+=============================================================================
+ Two pieces: the upstream code repo, and the checkpoint.
+
+ 3a. tapnet repo (google-deepmind/tapnet, Apache-2.0 -> commercial-safe)
+     Dest: pipeline\tapnext-main\
+     Vendored read-only dep, not tracked in this repo - re-clone per machine.
+
+       git clone https://github.com/google-deepmind/tapnet pipeline\tapnext-main
+
+     app\tapnext_engine.py:_add_tapnext_to_path also accepts these dest names,
+     searched in this order:
+       pipeline\tapnext-main, pipeline\tapnext, pipeline\tapnet-main,
+       pipeline\tapnet, then the same four under thirdparty\
+     Whichever it is, it must contain tapnet\tapnext\tapnext_torch.py.
+
+ 3b. checkpoint tapnextpp_ckpt.pt
+     Dest: pipeline\tapnext-main\checkpoints\tapnextpp_ckpt.pt
+
+       curl -L -o pipeline\tapnext-main\checkpoints\tapnextpp_ckpt.pt https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt
+
+     Resolved by app\tapnext_engine.py:_resolve_ckpt, first hit wins:
+       1. $BTR_TAPNEXT_CKPT           (env override, full path to the .pt)
+       2. <repo-root>\checkpoints\tapnextpp_ckpt.pt
+       3. <tool_root>\checkpoints\tapnextpp_ckpt.pt
+     (the name tapnext_ckpt.pt is also accepted in those dirs)
+
+ Model is fixed 256x256, causal/streaming - no config to match, the .pt above is
+ the whole thing.
+
+
+=============================================================================
+ NOT A CHECKPOINT - do not go looking for these
+=============================================================================
+ - Ollama / llama3.1:8b : REMOVED (2026-07). Decisioning is Qwen-only +
+   deterministic heuristics. Do not install Ollama, do not pull the model.
+ - CoTracker3            : REMOVED (was CC-BY-NC, non-commercial). Replaced by
+   TAPNext++ (Apache-2.0).
+ - SynthEyes / SyPy3     : licensed app install, not a download here. SyPy3 is
+   auto-discovered next to the SynthEyes .exe (override: BTR_SYPY3_DIR).
+
+
+=============================================================================
+ QUICK CHECK - everything landed?
+=============================================================================
+ From the repo root:
+
+   dir pipeline\qwen\models\
+   dir pipeline\sam3\weights\sam3.pt
+   dir pipeline\tapnext-main\tapnet\tapnext\tapnext_torch.py
+   dir pipeline\tapnext-main\checkpoints\tapnextpp_ckpt.pt
+
+ If Analyze/Mask/Track fail at runtime, the stage loaders in app\app.py FAIL
+ SILENT into *_IMPORT_ERROR globals rather than raising - so a missing weight
+ shows up as a stage that does nothing. Check the paths above first.
