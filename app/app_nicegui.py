@@ -720,7 +720,7 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             ui.button(icon="folder", on_click=lambda: pick_folder(shows_root)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
             show_sel = ui.select([], label="Show", with_input=True,
-                                 on_change=lambda e: do_scan_show()).props("dense outlined").classes("grow")
+                                 on_change=do_scan_show).props("dense outlined").classes("grow")
             ui.button(icon="refresh", on_click=load_shows).props("flat dense").tooltip("Load shows")
         ui.separator().classes("q-my-xs")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
