@@ -395,44 +395,7 @@ def est_vram(w: int, h: int, frames: int, grid_size: int = 10) -> str:
     gb = _gb(video_bytes + tracks_bytes)
     return f"{gb:.2f} GB"
 
-ALLOWED_PLATE_EXTENSIONS = {".exr", ".jpeg", ".jpg", ".png", ".mov", ".mp4"}
-
-def scan_show_plates(show_root: str) -> Dict[str, Dict[str, Any]]:
-    if not show_root or not os.path.exists(show_root):
-        return {}
-    root = Path(show_root)
-    shots_info = {}
-    
-    for shot_dir in sorted(root.iterdir()):
-        if not shot_dir.is_dir() or shot_dir.name.startswith("."):
-            continue
-        plates_dir = shot_dir / "in" / "plates"
-        if not plates_dir.exists() or not plates_dir.is_dir():
-            continue
-        version_dirs = sorted([v for v in plates_dir.iterdir() if v.is_dir() and not v.name.startswith(".")], key=lambda x: x.name)
-        if not version_dirs:
-            continue
-            
-        latest_version_dir = version_dirs[-1]
-        plate_files = sorted([f for f in latest_version_dir.iterdir() if f.is_file() and f.suffix.lower() in ALLOWED_PLATE_EXTENSIONS])
-        
-        if plate_files:
-            shots_info[shot_dir.name] = {
-                "shot_name": shot_dir.name,
-                "latest_version": latest_version_dir.name,
-                "all_versions": [v.name for v in version_dirs],
-                "plate_dir": str(latest_version_dir),
-                "first_file": str(plate_files[0]),
-                "extension": plate_files[0].suffix.lower(),
-                "file_count": len(plate_files),
-            }
-    return shots_info
-
 def list_shots(in_root: str) -> List[str]:
-    shots_info = scan_show_plates(in_root)
-    if shots_info: 
-        return sorted(list(shots_info.keys()))
-        
     if not in_root or not os.path.exists(in_root): return []
     root = Path(in_root)
     dirs = [d.name for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -440,6 +403,147 @@ def list_shots(in_root: str) -> List[str]:
     exts = {".mp4", ".mov", ".avi", ".mkv"}
     files = [f.stem for f in root.iterdir() if f.is_file() and f.suffix.lower() in exts]
     return sorted(list(set(files)))
+
+# -----------------------------------------------------------------------------
+# Studio network plate structure:
+#   <shows_root>/<show>/<shot>/in/plates/<version>/<plate.exr | .jpg | .jpeg>
+# The show dropdown scans <shows_root>; each shot exposes its own version list
+# (folders vNNN under in/plates), defaulting to the highest = latest.
+# -----------------------------------------------------------------------------
+_VER_RE = re.compile(r"^[vV](\d+)$")
+
+def list_shows(shows_root: str) -> List[str]:
+    """Immediate subfolders of the shows root (each one is a show)."""
+    if not shows_root or not os.path.exists(shows_root):
+        return []
+    root = Path(shows_root)
+    try:
+        return sorted(d.name for d in root.iterdir()
+                      if d.is_dir() and not d.name.startswith("."))
+    except OSError:
+        return []
+
+def list_shots_for_show(shows_root: str, show: str) -> List[str]:
+    """Shot folders under <shows_root>/<show>."""
+    if not shows_root or not show:
+        return []
+    base = Path(shows_root) / show
+    if not base.exists():
+        return []
+    try:
+        return sorted(d.name for d in base.iterdir()
+                      if d.is_dir() and not d.name.startswith("."))
+    except OSError:
+        return []
+
+def list_shot_versions(shows_root: str, show: str, shot: str) -> List[str]:
+    """Version folders under <show>/<shot>/in/plates, sorted ascending by number.
+    e.g. ['v001','v002','v010'] — the last (highest) is the latest."""
+    if not (shows_root and show and shot):
+        return []
+    plates = Path(shows_root) / show / shot / "in" / "plates"
+    if not plates.exists():
+        return []
+    try:
+        vers = [d.name for d in plates.iterdir() if d.is_dir() and _VER_RE.match(d.name)]
+    except OSError:
+        return []
+    return sorted(vers, key=lambda v: int(_VER_RE.match(v).group(1)))
+
+def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
+    """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
+    if not (shows_root and show and shot and version):
+        return ""
+    return str(Path(shows_root) / show / shot / "in" / "plates" / version)
+
+
+_EXR_EXTS = {".exr"}
+_PROXY_OK_EXTS = {".jpg", ".jpeg", ".png"}
+
+def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None) -> str:
+    """SAM3 (PIL) and Qwen (cv2.imread) cannot decode EXR. If `plate_dir` holds .exr
+    frames, tonemap each to an 8-bit JPG under <cache_root>/_proxies/<key>/ and return
+    that dir. If frames are already jpg/jpeg/png, return `plate_dir` unchanged.
+    Idempotent: skips regen when the proxy count already matches the source count.
+
+    SynthEyes reads EXR natively, so it should keep using the raw plate_dir (not this)."""
+    def _log(m):
+        if log_cb:
+            try: log_cb(m)
+            except Exception: pass
+    if not plate_dir or not os.path.exists(plate_dir):
+        return plate_dir or ""
+    src = Path(plate_dir)
+    try:
+        files = sorted(f for f in src.iterdir() if f.is_file())
+    except OSError:
+        return plate_dir
+    exr = [f for f in files if f.suffix.lower() in _EXR_EXTS]
+    if not exr:
+        # Already viewable by PIL/cv2 — no proxy needed.
+        return plate_dir
+
+    import hashlib
+    key = hashlib.md5(str(src.resolve()).encode("utf-8", "ignore")).hexdigest()[:16]
+    pdir = Path(cache_root) / "_proxies" / key
+    pdir.mkdir(parents=True, exist_ok=True)
+    existing = [f for f in pdir.iterdir() if f.is_file() and f.suffix.lower() == ".jpg"] if pdir.exists() else []
+    if len(existing) >= len(exr):
+        return str(pdir)  # already generated
+
+    # OpenCV needs this set BEFORE importing/first use to enable the OpenEXR codec.
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    import numpy as _np
+    try:
+        import cv2 as _cv2
+    except Exception:
+        _cv2 = None
+
+    def _read_exr_linear(fp: str):
+        """Return an HxWx3 float32 linear RGB image in [0,inf), or None."""
+        if _cv2 is not None:
+            img = _cv2.imread(fp, _cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                if img.ndim == 2:
+                    img = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
+                if img.shape[2] >= 3:
+                    return img[:, :, :3].astype(_np.float32)  # BGR order kept; written by cv2
+        # Fallback: imageio (+ freeimage plugin) reads EXR without the cv2 codec.
+        try:
+            import imageio.v3 as _iio
+            arr = _iio.imread(fp)
+            arr = _np.asarray(arr, dtype=_np.float32)
+            if arr.ndim == 2:
+                arr = _np.stack([arr] * 3, axis=-1)
+            rgb = arr[:, :, :3]
+            return rgb[:, :, ::-1].copy()  # RGB -> BGR for cv2.imwrite
+        except Exception as ex:
+            _log(f"EXR read failed for {os.path.basename(fp)}: {ex}")
+            return None
+
+    if _cv2 is None:
+        _log("cv2 unavailable — cannot write JPG proxies; returning raw EXR dir.")
+        return plate_dir
+
+    _log(f"Generating {len(exr)} JPG proxy frame(s) from EXR → {pdir}")
+    made = 0
+    for f in exr:
+        lin = _read_exr_linear(str(f))
+        if lin is None:
+            continue
+        # Linear -> sRGB-ish (gamma 2.2) tonemap, clip, 8-bit.
+        disp = _np.clip(lin, 0.0, None)
+        disp = _np.power(disp / (disp.max() if disp.max() > 1.0 else 1.0), 1.0 / 2.2) if disp.max() > 1.0 \
+            else _np.power(_np.clip(disp, 0.0, 1.0), 1.0 / 2.2)
+        out8 = _np.clip(disp * 255.0, 0, 255).astype(_np.uint8)
+        outfp = pdir / (f.stem + ".jpg")
+        try:
+            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 95])
+            made += 1
+        except Exception as ex:
+            _log(f"EXR proxy write failed for {f.name}: {ex}")
+    _log(f"Proxy generation done: {made}/{len(exr)} frame(s).")
+    return str(pdir) if made else plate_dir
 
 def _extract_prompt_list(shot_dict: dict, keys: list) -> str:
     found_list = []
@@ -559,6 +663,11 @@ class ShotData:
     quality_flags: List[str] = field(default_factory=list)
     depth_layers: Dict[str, str] = field(default_factory=lambda: {"fg": "", "mg": "", "bg": ""})
     parallax: str = ""
+    # Studio plate-versioning (network fetch): <show>/<shot>/in/plates/<version>
+    show: str = ""
+    version: str = ""
+    versions: List[str] = field(default_factory=list)
+    plate_dir: str = ""
 
 @dataclass
 class AppState:
@@ -989,8 +1098,13 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         selected = [n for n, d in state.shots_data.items() if getattr(d, "use", False)]
         if selected:
             logger(f"Analyzing {len(selected)} selected shot(s): {', '.join(sorted(selected))}")
+        # Per-shot plate dirs (network fetch). EXR gets JPG proxies since Qwen reads via cv2.
+        plate_map = {n: ensure_plate_proxies(d.plate_dir, str(batch_dir), logger)
+                     for n, d in state.shots_data.items()
+                     if getattr(d, "use", False) and getattr(d, "plate_dir", "")}
         qwen_json = run_qwen2_batch(in_dir=in_dir, out_dir=str(batch_dir), fps=int(fps),
-                                    use_int4=True, log_cb=logger, only_shots=(selected or None))
+                                    use_int4=True, log_cb=logger, only_shots=(selected or None),
+                                    shot_dirs=(plate_map or None))
         
         logger("Building mask guidance (Qwen signals + deterministic heuristics)...")
         reqs = []
@@ -1162,6 +1276,13 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
             # Carry the per-shot frame range into the guide so SAM3 masks only that range.
             sh["frame_start"] = int(getattr(data, "frame_start", 0) or 0)
             sh["frame_end"] = int(getattr(data, "frame_end", 0) or 0)
+
+            # Point SAM3 at this shot's chosen plate version (network fetch). SAM3's
+            # resolver honors shot["input_dir"] first. EXR plates get JPG proxies since
+            # SAM3 (PIL/cv2) can't decode EXR.
+            pd = str(getattr(data, "plate_dir", "") or "")
+            if pd:
+                sh["input_dir"] = ensure_plate_proxies(pd, out_dir, logger)
 
             # User edits are AUTHORITATIVE: write inc/exc verbatim (empty list CLEARS the
             # old value) so removing a term in the UI actually removes it from masking.
@@ -1386,7 +1507,10 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                 logger("Tracking stopped by user."); stopped = True; break
             if not getattr(data, "use", False): continue
 
-            shot_dir = in_root / shot_name
+            # Chosen plate version (network fetch) wins; SynthEyes reads EXR natively so
+            # it uses the raw plate dir, no proxy. Falls back to the flat <in_root>/<shot>.
+            pd = str(getattr(data, "plate_dir", "") or "")
+            shot_dir = Path(pd) if pd else (in_root / shot_name)
             seq = se_find_shot_frames(str(shot_dir)) if shot_dir.exists() else None
             movie_path = None
             if seq:
@@ -1608,35 +1732,20 @@ def on_browse_folder(current):
 
 def on_scan(in_dir, out_dir, state_store):
     st = state_store or AppState()
-    plates_map = scan_show_plates(in_dir)
-    shots = sorted(list(plates_map.keys())) if plates_map else list_shots(in_dir)
+    shots = list_shots(in_dir)
     st.shots_data = {}
     st.log_history = []
     
     for s in shots:
         w, h, frames = 0, 0, 0
-        
-        if s in plates_map:
-            info = plates_map[s]
-            frames = info["file_count"]
-            if probe_video_meta and info["first_file"]:
-                meta = probe_video_meta(info["first_file"])
-                w, h = int(meta.get("width", 0)), int(meta.get("height", 0))
-                if not frames:
-                    frames = int(meta.get("total_frames", 0))
-        elif probe_video_meta:
+        if probe_video_meta:
             p = Path(in_dir)
             fpath = next((f for f in p.glob(f"{s}.*") if f.suffix.lower() in {'.mp4','.mov','.avi','.mkv'}), None)
             if fpath:
                 meta = probe_video_meta(str(fpath))
                 w, h = int(meta.get("width",0)), int(meta.get("height",0))
                 frames = int(meta.get("total_frames",0))
-                
-        note = f"Plate: {plates_map[s]['latest_version']}" if s in plates_map else ""
-        st.shots_data[s] = ShotData(
-            name=s, res=f"{w}x{h}", width=w, height=h, 
-            frames=frames, scale="100%", vram=est_vram(w,h,frames), notes=note
-        )
+        st.shots_data[s] = ShotData(name=s, res=f"{w}x{h}", width=w, height=h, frames=frames, scale="100%", vram=est_vram(w,h,frames))
     
     msg_extra = ""
     if out_dir and os.path.exists(out_dir):
