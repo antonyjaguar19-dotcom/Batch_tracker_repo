@@ -15,7 +15,7 @@ LogCb = Callable[[str], None]
 ProgressCb = Callable[[int, int], None]
 StatusCb = Callable[[str], None]
 
-FRAME_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+FRAME_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr")
 VIDEO_EXTS = (".mov", ".mp4", ".m4v", ".avi", ".mkv")
 
 

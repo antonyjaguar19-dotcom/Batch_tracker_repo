@@ -102,7 +102,8 @@ def _ensure_offline_env() -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
-def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, only_shots=None) -> Path:
+def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, only_shots=None,
+              shot_dirs=None) -> Path:
     _ensure_offline_env()
 
     out_dir_p = Path(out_dir)
@@ -143,9 +144,14 @@ def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, 
     describer = QwenShotDescriber(cfg)
     log(f"Model loaded. Precision: {getattr(describer, 'quant_mode', 'unknown')}")
 
-    shots = list_shots_in_folder(in_dir)
+    def _norm(s): return re.sub(r"[\s_\-]+", "", str(s).strip()).lower()
+    if shot_dirs:
+        # Explicit per-shot dirs (studio network plate fetch): frames live outside in_dir.
+        shots = [(n, Path(d)) for n, d in shot_dirs.items() if d]
+        log(f"Using {len(shots)} explicit per-shot plate dir(s).")
+    else:
+        shots = list_shots_in_folder(in_dir)
     if only_shots:
-        def _norm(s): return re.sub(r"[\s_\-]+", "", str(s).strip()).lower()
         want = {_norm(s) for s in only_shots}
         shots = [(n, p) for (n, p) in shots if _norm(n) in want]
         log(f"Restricted to {len(shots)} selected shot(s).")
