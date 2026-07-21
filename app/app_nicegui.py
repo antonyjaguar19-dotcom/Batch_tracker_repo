@@ -41,6 +41,7 @@ state = be.AppState()
 
 TABLE_COLS = [
     {"name": "name", "label": "Shot", "field": "name", "align": "left", "sortable": True},
+    {"name": "version", "label": "Version", "field": "version", "align": "left"},
     {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left"},
     {"name": "quality", "label": "Quality", "field": "quality", "align": "left"},
     {"name": "prompts", "label": "Prompts", "field": "prompts", "align": "left"},
@@ -69,6 +70,8 @@ def _build_rows():
             prompts = prompts[:57] + "..."
         rows.append({
             "name": name,
+            "version": d.version,
+            "versions": d.versions or [],
             "strategy": d.strategy,
             "quality": be._quality_cell(d),
             "prompts": prompts,
@@ -278,6 +281,56 @@ def do_scan():
     ed_pick.set_options(_visible_names())
     refresh_table()
     ui.notify(f"Found {len(rows)} shots", type="info")
+
+
+async def load_shows():
+    """Scan the shows root for show folders and fill the show dropdown. Runs the
+    (possibly slow UNC) scan off the event loop."""
+    root = shows_root.value
+    shows = await run.io_bound(be.list_shows, root)
+    show_sel.set_options(shows)
+    ui.notify(f"{len(shows)} show(s) under {root}" if shows else f"No shows under {root}",
+              type="info" if shows else "warning")
+
+
+async def do_scan_show():
+    """Studio flow: list shots under the picked show, resolve each shot's plate
+    versions (default = latest vNNN) and plate dir. Replaces the flat-folder scan."""
+    show = show_sel.value
+    if not (shows_root.value and show):
+        return
+    shots = await run.io_bound(be.list_shots_for_show, shows_root.value, show)
+    state.shots_data = {}
+    state.log_history = []
+    for s in shots:
+        vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
+        latest = vers[-1] if vers else ""
+        pdir = be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else ""
+        state.shots_data[s] = be.ShotData(name=s, scale="100%", show=show,
+                                          versions=vers, version=latest, plate_dir=pdir)
+    state.manual_notes = be.load_manual_notes(out_dir.value)
+    try:
+        _scan_load_prev_guide()
+    except Exception as ex:
+        print(f"prev guide load: {ex}")
+    ed_pick.set_options(_visible_names())
+    refresh_table()
+    ui.notify(f"{show}: {len(shots)} shot(s)", type="info")
+
+
+def on_pick_version(args):
+    """A shot row's version dropdown changed — re-resolve that shot's plate dir."""
+    if isinstance(args, list):
+        args = args[0] if args else None
+    name = (args or {}).get("name") if isinstance(args, dict) else None
+    ver = (args or {}).get("version") if isinstance(args, dict) else None
+    d = state.shots_data.get(name)
+    if not d or not ver:
+        return
+    d.version = ver
+    d.plate_dir = be.resolve_plate_dir(shows_root.value, d.show, name, ver)
+    refresh_table()
+    ui.notify(f"{name} → {ver}", type="info")
 
 
 def _scan_load_prev_guide():
@@ -660,8 +713,19 @@ with ui.header().classes("bt-header items-center px-4 py-2"):
 with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes("bt-rail p-3 gap-3") as rail:
     with ui.card().classes("w-full bt-card"):
         ui.label("Project").classes("bt-section")
+        # ---- Studio network plate fetch: <shows_root>/<show>/<shot>/in/plates/<version> ----
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            in_dir = ui.input("Input Folder", placeholder=r"D:\shots\IN").props("dense outlined").classes("grow")
+            shows_root = ui.input("Shows Root", value=r"\\liv1\shows",
+                                  placeholder=r"\\liv1\shows").props("dense outlined").classes("grow")
+            ui.button(icon="folder", on_click=lambda: pick_folder(shows_root)).props("flat dense")
+        with ui.row().classes("w-full no-wrap items-end gap-1"):
+            show_sel = ui.select([], label="Show", with_input=True,
+                                 on_change=lambda e: do_scan_show()).props("dense outlined").classes("grow")
+            ui.button(icon="refresh", on_click=load_shows).props("flat dense").tooltip("Load shows")
+        ui.separator().classes("q-my-xs")
+        with ui.row().classes("w-full no-wrap items-end gap-1"):
+            in_dir = ui.input("Input Folder (legacy / fallback)", placeholder=r"D:\shots\IN"
+                              ).props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(in_dir)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
             out_dir = ui.input("Output Folder", placeholder=r"D:\shots\OUT").props("dense outlined").classes("grow")
@@ -840,6 +904,22 @@ with ui.column().classes("w-full gap-3 p-3"):
           </q-td>
         ''')
         table.on("clearmem", lambda e: on_clear_mem(e.args))
+        # Per-shot plate-version dropdown. Emits {name, version} up to Python, which
+        # re-resolves that shot's plate_dir. @click.stop so it doesn't open the editor.
+        table.add_slot("body-cell-version", r'''
+          <q-td :props="props" auto-width>
+            <q-select dense options-dense borderless
+                      v-model="props.row.version" :options="props.row.versions"
+                      @click.stop
+                      @update:model-value="(val) => $parent.$emit('pickversion', {name: props.row.name, version: val})"
+                      style="min-width:88px">
+              <template v-slot:no-option>
+                <q-item><q-item-section class="text-grey">no versions</q-item-section></q-item>
+              </template>
+            </q-select>
+          </q-td>
+        ''')
+        table.on("pickversion", lambda e: on_pick_version(e.args))
 
     # ---- Logs ----
     with ui.card().classes("w-full bt-card"):
