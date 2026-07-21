@@ -651,7 +651,7 @@ def poll():
         lbl_status.set_content(f"⏳ **{be.CURRENT_JOB_NAME}** running…{prog}{el}")
     else:
         lbl_status.set_content("🟢 Idle")
-    for b in (btn_pipe, btn_scan, btn_analyze, btn_mask, btn_track):
+    for b in (btn_pipe, btn_analyze, btn_mask, btn_track):
         b.set_enabled(not running)
     btn_stop.set_enabled(running)
 
@@ -865,16 +865,14 @@ with ui.column().classes("w-full gap-3 p-3"):
             btn_pipe = ui.button("Run Pipeline", icon="play_arrow", on_click=start_pipeline, color="primary"
                                  ).props("unelevated no-caps").classes("bt-run")
             btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
-                             "have to click 2/3/4 and wait between each. Existing masks are reused "
-                             "(use 3 · Generate masks to force a regen). Stop halts between stages.")
+                             "have to click 1/2/3 and wait between each. Existing masks are reused "
+                             "(use 2 · Masks to force a regen). Stop halts between stages.")
             ui.separator().props("vertical").classes("bt-vsep")
-            btn_scan = ui.button("1 · Scan", icon="search", on_click=do_scan
-                                 ).props("outline no-caps").classes("bt-step")
-            btn_analyze = ui.button("2 · Analyze", icon="auto_awesome", on_click=start_analyze
+            btn_analyze = ui.button("1 · Analyze", icon="auto_awesome", on_click=start_analyze
                                     ).props("outline no-caps").classes("bt-step")
-            btn_mask = ui.button("3 · Masks", icon="layers", on_click=start_mask
+            btn_mask = ui.button("2 · Masks", icon="layers", on_click=start_mask
                                  ).props("outline no-caps").classes("bt-step")
-            btn_track = ui.button("4 · Track", icon="my_location", on_click=start_track
+            btn_track = ui.button("3 · Track", icon="my_location", on_click=start_track
                                   ).props("outline no-caps").classes("bt-step")
 
     # ---- Shots table ----
@@ -884,7 +882,7 @@ with ui.column().classes("w-full gap-3 p-3"):
                 ui.label("Shots").classes("bt-section")
                 ui.label("tick to include · click a row to edit · trash clears that shot's memory"
                          ).classes("bt-hint")
-            lbl_selcount = ui.markdown("No shots yet — set Input Folder and press **1 · Scan**."
+            lbl_selcount = ui.markdown("No shots yet — set **Shows Root**, load shows, then pick a **Show**."
                                        ).classes("bt-chip")
             ed_pick = ui.select([], label="Edit shot", with_input=True).props("dense outlined").classes("w-64")
             ed_pick.on_value_change(on_pick_edit)
