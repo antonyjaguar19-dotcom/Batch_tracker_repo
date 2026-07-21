@@ -395,7 +395,44 @@ def est_vram(w: int, h: int, frames: int, grid_size: int = 10) -> str:
     gb = _gb(video_bytes + tracks_bytes)
     return f"{gb:.2f} GB"
 
+ALLOWED_PLATE_EXTENSIONS = {".exr", ".jpeg", ".jpg", ".png", ".mov", ".mp4"}
+
+def scan_show_plates(show_root: str) -> Dict[str, Dict[str, Any]]:
+    if not show_root or not os.path.exists(show_root):
+        return {}
+    root = Path(show_root)
+    shots_info = {}
+    
+    for shot_dir in sorted(root.iterdir()):
+        if not shot_dir.is_dir() or shot_dir.name.startswith("."):
+            continue
+        plates_dir = shot_dir / "in" / "plates"
+        if not plates_dir.exists() or not plates_dir.is_dir():
+            continue
+        version_dirs = sorted([v for v in plates_dir.iterdir() if v.is_dir() and not v.name.startswith(".")], key=lambda x: x.name)
+        if not version_dirs:
+            continue
+            
+        latest_version_dir = version_dirs[-1]
+        plate_files = sorted([f for f in latest_version_dir.iterdir() if f.is_file() and f.suffix.lower() in ALLOWED_PLATE_EXTENSIONS])
+        
+        if plate_files:
+            shots_info[shot_dir.name] = {
+                "shot_name": shot_dir.name,
+                "latest_version": latest_version_dir.name,
+                "all_versions": [v.name for v in version_dirs],
+                "plate_dir": str(latest_version_dir),
+                "first_file": str(plate_files[0]),
+                "extension": plate_files[0].suffix.lower(),
+                "file_count": len(plate_files),
+            }
+    return shots_info
+
 def list_shots(in_root: str) -> List[str]:
+    shots_info = scan_show_plates(in_root)
+    if shots_info: 
+        return sorted(list(shots_info.keys()))
+        
     if not in_root or not os.path.exists(in_root): return []
     root = Path(in_root)
     dirs = [d.name for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -1571,20 +1608,35 @@ def on_browse_folder(current):
 
 def on_scan(in_dir, out_dir, state_store):
     st = state_store or AppState()
-    shots = list_shots(in_dir)
+    plates_map = scan_show_plates(in_dir)
+    shots = sorted(list(plates_map.keys())) if plates_map else list_shots(in_dir)
     st.shots_data = {}
     st.log_history = []
     
     for s in shots:
         w, h, frames = 0, 0, 0
-        if probe_video_meta:
+        
+        if s in plates_map:
+            info = plates_map[s]
+            frames = info["file_count"]
+            if probe_video_meta and info["first_file"]:
+                meta = probe_video_meta(info["first_file"])
+                w, h = int(meta.get("width", 0)), int(meta.get("height", 0))
+                if not frames:
+                    frames = int(meta.get("total_frames", 0))
+        elif probe_video_meta:
             p = Path(in_dir)
             fpath = next((f for f in p.glob(f"{s}.*") if f.suffix.lower() in {'.mp4','.mov','.avi','.mkv'}), None)
             if fpath:
                 meta = probe_video_meta(str(fpath))
                 w, h = int(meta.get("width",0)), int(meta.get("height",0))
                 frames = int(meta.get("total_frames",0))
-        st.shots_data[s] = ShotData(name=s, res=f"{w}x{h}", width=w, height=h, frames=frames, scale="100%", vram=est_vram(w,h,frames))
+                
+        note = f"Plate: {plates_map[s]['latest_version']}" if s in plates_map else ""
+        st.shots_data[s] = ShotData(
+            name=s, res=f"{w}x{h}", width=w, height=h, 
+            frames=frames, scale="100%", vram=est_vram(w,h,frames), notes=note
+        )
     
     msg_extra = ""
     if out_dir and os.path.exists(out_dir):
