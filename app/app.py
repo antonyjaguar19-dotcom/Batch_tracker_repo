@@ -476,6 +476,25 @@ def count_plate_frames(plate_dir: str) -> int:
     except OSError:
         return 0
 
+def probe_plate_range(plate_dir: str):
+    """(frame_count, start_frame, end_frame) for a plate/version dir. Uses the SAME
+    scanner the SynthEyes tracker uses (find_shot_frames), so the table matches what
+    will actually load: it finds frames directly in the dir OR one subfolder deep and
+    parses real frame numbers from the filenames (e.g. plate.1001.exr -> 1001). Falls
+    back to a flat count when the scanner is unavailable or finds nothing."""
+    if not plate_dir or not os.path.exists(plate_dir):
+        return 0, 0, 0
+    try:
+        if se_find_shot_frames:
+            seq = se_find_shot_frames(str(plate_dir))
+            if seq:
+                return (int(seq.get("frame_count", 0)),
+                        int(seq.get("start_frame", 0)),
+                        int(seq.get("end_frame", 0)))
+    except Exception:
+        pass
+    return count_plate_frames(plate_dir), 0, 0
+
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
@@ -694,6 +713,8 @@ class ShotData:
     version: str = ""
     versions: List[str] = field(default_factory=list)
     plate_dir: str = ""
+    plate_start: int = 0   # absolute first frame number parsed from filenames
+    plate_end: int = 0     # absolute last frame number
 
 @dataclass
 class AppState:
@@ -1827,6 +1848,11 @@ def _range_cell(d: "ShotData") -> str:
     fs = int(getattr(d, "frame_start", 0) or 0)
     fe = int(getattr(d, "frame_end", 0) or 0)
     if fs <= 0 and fe <= 0:
+        # No user sub-range: show the real plate frame range if we parsed it.
+        ps = int(getattr(d, "plate_start", 0) or 0)
+        pe = int(getattr(d, "plate_end", 0) or 0)
+        if pe > 0:
+            return f"{ps}-{pe} · {tot_s}"
         return f"all · {tot_s}"
     return f"{fs or 1}-{fe or total or '?'} · {tot_s}"
 
