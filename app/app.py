@@ -1871,13 +1871,18 @@ def _range_cell(d: "ShotData") -> str:
     tot_s = f"{total}f" if total > 0 else "?f"
     fs = int(getattr(d, "frame_start", 0) or 0)
     fe = int(getattr(d, "frame_end", 0) or 0)
+    ps = int(getattr(d, "plate_start", 0) or 0)
+    pe = int(getattr(d, "plate_end", 0) or 0)
     if fs <= 0 and fe <= 0:
         # No user sub-range: show the real plate frame range if we parsed it.
-        ps = int(getattr(d, "plate_start", 0) or 0)
-        pe = int(getattr(d, "plate_end", 0) or 0)
         if pe > 0:
             return f"{ps}-{pe} · {tot_s}"
         return f"all · {tot_s}"
+    if ps > 0:
+        # Sub-range stored as positions; display it back in absolute frame numbers.
+        a = ps + (fs or 1) - 1
+        b = ps + (fe or total) - 1
+        return f"{a}-{b} · {tot_s}"
     return f"{fs or 1}-{fe or total or '?'} · {tot_s}"
 
 def _visible_names(st: AppState) -> List[str]:

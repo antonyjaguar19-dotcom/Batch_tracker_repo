@@ -113,15 +113,29 @@ def load_editor(name: str):
     d = state.shots_data[name]
     state.current_shot_name = name
     total = int(getattr(d, "frames", 0) or 0)
-    avail = f" · {total} frames (1-{total})" if total > 0 else ""
+    ps = int(getattr(d, "plate_start", 0) or 0)
+    pe = int(getattr(d, "plate_end", 0) or 0)
+    fs_pos = int(getattr(d, "frame_start", 0) or 0)
+    fe_pos = int(getattr(d, "frame_end", 0) or 0)
+    if ps > 0 and pe >= ps:
+        # Studio plate: user enters ABSOLUTE frame numbers (e.g. 1100-1200).
+        avail = f" · {ps}-{pe} ({total}f)"
+        ed_fstart.set_value(ps + fs_pos - 1 if fs_pos > 0 else ps)
+        ed_fend.set_value(ps + fe_pos - 1 if fe_pos > 0 else pe)
+        ed_fstart.props(f"min={ps} max={pe}")
+        ed_fend.props(f"min={ps} max={pe}")
+        ed_frange_hint.set_text(f"Absolute frame numbers ({ps}-{pe}). Leave at the ends for the full clip.")
+    else:
+        avail = f" · {total} frames (1-{total})" if total > 0 else ""
+        ed_fstart.set_value(fs_pos)
+        ed_fend.set_value(fe_pos)
+        if total > 0:
+            ed_fstart.props(f"min=0 max={total}")
+            ed_fend.props(f"min=0 max={total}")
+        ed_frange_hint.set_text("Frame positions (1 = first). 0 = full clip.")
     ed_title.set_content(f"#### ✏️ {name}{avail}")
     ed_meta.set_content(be._shot_meta_md(d))
     ed_scale.set_value(d.scale)
-    ed_fstart.set_value(int(getattr(d, "frame_start", 0) or 0))
-    ed_fend.set_value(int(getattr(d, "frame_end", 0) or 0))
-    if total > 0:
-        ed_fstart.props(f"max={total}")
-        ed_fend.props(f"max={total}")
     ed_req.set_value(state.manual_notes.get(name, ""))
     ed_inc.set_value(d.include_prompts)
     ed_exc.set_value(d.exclude_prompts)
@@ -218,12 +232,22 @@ def save_shot():
     d.exclude_prompts = ed_exc.value or ""
     d.scale = ed_scale.value or "100%"
     total = int(getattr(d, "frames", 0) or 0)
-    try: fs = max(0, int(ed_fstart.value or 0))
-    except Exception: fs = 0
-    try: fe = max(0, int(ed_fend.value or 0))
-    except Exception: fe = 0
-    if total > 0:
-        fs = min(fs, total); fe = min(fe, total)
+    ps = int(getattr(d, "plate_start", 0) or 0)
+    pe = int(getattr(d, "plate_end", 0) or 0)
+    try: a = max(0, int(ed_fstart.value or 0))
+    except Exception: a = 0
+    try: b = max(0, int(ed_fend.value or 0))
+    except Exception: b = 0
+    if ps > 0 and pe >= ps:
+        # Inputs are ABSOLUTE frame numbers -> convert to 1-based positions the
+        # downstream stages expect. Clamp to the plate range; the ends mean "full".
+        a = min(max(a, ps), pe) if a > 0 else 0
+        b = min(max(b, ps), pe) if b > 0 else 0
+        fs = 0 if (a == 0 or a <= ps) else (a - ps + 1)
+        fe = 0 if (b == 0 or b >= pe) else (b - ps + 1)
+    else:
+        fs = min(a, total) if total > 0 else a
+        fe = min(b, total) if total > 0 else b
     if fs and fe and fs > fe:
         fs, fe = fe, fs
     d.frame_start, d.frame_end = fs, fe
@@ -939,10 +963,11 @@ with ui.dialog() as editor, ui.card().classes("bt-editor"):
     with ui.row().classes("w-full no-wrap gap-2"):
         ed_scale = ui.select(["100%", "75%", "50%", "25%"], value="100%", label="Downscale"
                              ).props("dense outlined").classes("grow")
-        ed_fstart = ui.number("Frame Start (0 = first)", value=0, min=0, precision=0
+        ed_fstart = ui.number("Frame Start", value=0, min=0, precision=0
                               ).props("dense outlined").classes("grow")
-        ed_fend = ui.number("Frame End (0 = last)", value=0, min=0, precision=0
+        ed_fend = ui.number("Frame End", value=0, min=0, precision=0
                             ).props("dense outlined").classes("grow")
+    ed_frange_hint = ui.label("").classes("bt-hint")
 
     ui.label("Brief").classes("bt-section q-mt-sm")
     ed_req = ui.textarea(placeholder="e.g. Camera track / Face track / track car, exclude crowd"
