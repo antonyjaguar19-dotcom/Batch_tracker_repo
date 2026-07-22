@@ -495,6 +495,30 @@ def probe_plate_range(plate_dir: str):
         pass
     return count_plate_frames(plate_dir), 0, 0
 
+def find_frames_subdir(version_dir: str):
+    """Descend from a version dir to the folder that actually holds the frames.
+    Studio plates nest several levels below vNNN (clip-id / resolution folders), e.g.
+      <version>/<clip_id>/<6144x3240_exr>/plate.####.exr
+    find_shot_frames only looks one level deep, so we walk the whole subtree and pick
+    the folder with the MOST image frames (the real sequence). Returns
+    (frames_dir, frame_count, start_frame, end_frame); frames_dir falls back to
+    version_dir when nothing is found. This resolved dir is what every stage consumes,
+    so SynthEyes (1-level scan), SAM3 and Qwen all get the exact frames folder."""
+    if not version_dir or not os.path.exists(version_dir):
+        return version_dir or "", 0, 0, 0
+    best_dir, best_n = None, 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(version_dir, onerror=lambda e: None):
+            n = sum(1 for f in filenames if os.path.splitext(f)[1].lower() in _SEQ_EXTS)
+            if n > best_n:
+                best_n, best_dir = n, dirpath
+    except OSError:
+        pass
+    if not best_dir:
+        return version_dir, 0, 0, 0
+    cnt, s, e = probe_plate_range(best_dir)
+    return best_dir, cnt, s, e
+
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
