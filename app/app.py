@@ -519,6 +519,58 @@ def find_frames_subdir(version_dir: str):
     cnt, s, e = probe_plate_range(best_dir)
     return best_dir, cnt, s, e
 
+_RENDER_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+
+def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 24) -> bool:
+    """Encode an 8-bit image sequence (jpg/jpeg/png/tif) into an mp4 so the TAPNext
+    (mp4-only) tracker can read a user-pointed render. Descends nested folders, orders
+    frames by trailing number. Idempotent: reuses an existing non-empty mp4. Returns
+    True on success."""
+    def _log(m):
+        if log_cb:
+            try: log_cb(m)
+            except Exception: pass
+    if not seq_dir or not os.path.exists(seq_dir):
+        return False
+    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+        return True
+    try:
+        import cv2
+    except Exception:
+        _log("cv2 unavailable — cannot render sequence to mp4.")
+        return False
+    fdir, _n, _s, _e = find_frames_subdir(seq_dir)
+    def _num(p: Path):
+        m = re.search(r"(\d+)$", p.stem)
+        return int(m.group(1)) if m else 0
+    try:
+        imgs = sorted((f for f in Path(fdir).iterdir()
+                       if f.is_file() and f.suffix.lower() in _RENDER_EXTS), key=_num)
+    except OSError:
+        imgs = []
+    if not imgs:
+        _log(f"No 8-bit frames (jpg/png) to render in {fdir}. Point at a JPEG/PNG render.")
+        return False
+    first = cv2.imread(str(imgs[0]))
+    if first is None:
+        _log(f"Could not read first frame {imgs[0].name}.")
+        return False
+    h, w = first.shape[:2]
+    Path(out_mp4).parent.mkdir(parents=True, exist_ok=True)
+    vw = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), int(fps), (w, h))
+    written = 0
+    for f in imgs:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        if img.shape[:2] != (h, w):
+            img = cv2.resize(img, (w, h))
+        vw.write(img); written += 1
+    vw.release()
+    ok = os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0 and written > 0
+    _log(f"Rendered {written} frame(s) -> {out_mp4}" if ok else "mp4 render failed.")
+    return ok
+
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
@@ -739,6 +791,7 @@ class ShotData:
     plate_dir: str = ""
     plate_start: int = 0   # absolute first frame number parsed from filenames
     plate_end: int = 0     # absolute last frame number
+    render_path: str = ""  # TAPNext: user-pointed .mp4 file OR jpeg/png render folder
 
 @dataclass
 class AppState:
@@ -1464,15 +1517,31 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
         if not getattr(data, "use", False): continue
 
         video_dir, filename = None, None
-        shot_dir = in_root / shot_name
-        if shot_dir.exists() and shot_dir.is_dir():
-            mp4s = sorted([p for p in shot_dir.iterdir() if p.suffix.lower() == ".mp4"])
-            if mp4s: video_dir, filename = shot_dir, mp4s[0].name
+        # Studio flow: TAPNext is mp4-only, so use the user-pointed render — either an
+        # .mp4 file directly, or a JPEG/PNG sequence folder we encode to a temp mp4.
+        rp = str(getattr(data, "render_path", "") or "").strip()
+        if rp and os.path.exists(rp):
+            if os.path.isfile(rp) and rp.lower().endswith(".mp4"):
+                video_dir, filename = Path(rp).parent, Path(rp).name
+            elif os.path.isdir(rp):
+                mp4 = Path(out_root) / "_renders" / f"{shot_name}.mp4"
+                if render_sequence_to_mp4(rp, str(mp4), logger):
+                    video_dir, filename = mp4.parent, mp4.name
+                else:
+                    logger(f"Skip {shot_name}: could not build mp4 from render '{rp}'.")
+            else:
+                logger(f"{shot_name}: render_path '{rp}' is not an .mp4 or a folder.")
+        if not video_dir:
+            shot_dir = in_root / shot_name
+            if shot_dir.exists() and shot_dir.is_dir():
+                mp4s = sorted([p for p in shot_dir.iterdir() if p.suffix.lower() == ".mp4"])
+                if mp4s: video_dir, filename = shot_dir, mp4s[0].name
         if not video_dir:
             exact = in_root / f"{shot_name}.mp4"
             if exact.exists(): video_dir, filename = in_root, exact.name
         if not video_dir:
-            logger(f"Skip {shot_name}: No video found."); continue
+            logger(f"Skip {shot_name}: No video found. For TAPNext, point the shot at a "
+                   f"render (.mp4 or JPEG folder) in the editor."); continue
 
         tasks = shot_tasks_map.get(shot_name)
         if not tasks:
@@ -1871,13 +1940,18 @@ def _range_cell(d: "ShotData") -> str:
     tot_s = f"{total}f" if total > 0 else "?f"
     fs = int(getattr(d, "frame_start", 0) or 0)
     fe = int(getattr(d, "frame_end", 0) or 0)
+    ps = int(getattr(d, "plate_start", 0) or 0)
+    pe = int(getattr(d, "plate_end", 0) or 0)
     if fs <= 0 and fe <= 0:
         # No user sub-range: show the real plate frame range if we parsed it.
-        ps = int(getattr(d, "plate_start", 0) or 0)
-        pe = int(getattr(d, "plate_end", 0) or 0)
         if pe > 0:
             return f"{ps}-{pe} · {tot_s}"
         return f"all · {tot_s}"
+    if ps > 0:
+        # Sub-range stored as positions; display it back in absolute frame numbers.
+        a = ps + (fs or 1) - 1
+        b = ps + (fe or total) - 1
+        return f"{a}-{b} · {tot_s}"
     return f"{fs or 1}-{fe or total or '?'} · {tot_s}"
 
 def _visible_names(st: AppState) -> List[str]:
