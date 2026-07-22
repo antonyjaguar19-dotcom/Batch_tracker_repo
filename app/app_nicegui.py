@@ -306,8 +306,10 @@ async def do_scan_show():
         vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
         latest = vers[-1] if vers else ""
         pdir = be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else ""
+        frames = await run.io_bound(be.count_plate_frames, pdir) if pdir else 0
         state.shots_data[s] = be.ShotData(name=s, scale="100%", show=show,
-                                          versions=vers, version=latest, plate_dir=pdir)
+                                          versions=vers, version=latest, plate_dir=pdir,
+                                          frames=frames)
     state.manual_notes = be.load_manual_notes(out_dir.value)
     try:
         _scan_load_prev_guide()
@@ -329,8 +331,9 @@ def on_pick_version(args):
         return
     d.version = ver
     d.plate_dir = be.resolve_plate_dir(shows_root.value, d.show, name, ver)
+    d.frames = be.count_plate_frames(d.plate_dir)
     refresh_table()
-    ui.notify(f"{name} → {ver}", type="info")
+    ui.notify(f"{name} → {ver} · {d.frames}f", type="info")
 
 
 def _scan_load_prev_guide():
@@ -905,10 +908,9 @@ with ui.column().classes("w-full gap-3 p-3"):
         # Per-shot plate-version dropdown. Emits {name, version} up to Python, which
         # re-resolves that shot's plate_dir. @click.stop so it doesn't open the editor.
         table.add_slot("body-cell-version", r'''
-          <q-td :props="props" auto-width>
+          <q-td :props="props" auto-width @click.stop>
             <q-select dense options-dense borderless
                       v-model="props.row.version" :options="props.row.versions"
-                      @click.stop
                       @update:model-value="(val) => $parent.$emit('pickversion', {name: props.row.name, version: val})"
                       style="min-width:88px">
               <template v-slot:no-option>
