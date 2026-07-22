@@ -412,29 +412,45 @@ def list_shots(in_root: str) -> List[str]:
 # -----------------------------------------------------------------------------
 _VER_RE = re.compile(r"^[vV](\d+)$")
 
+# Studio pipeline folders that live alongside real shots under <shows_root>/<show>
+# but are NOT shots (some are admin-only and raise on stat). Compared case-insensitively.
+_NON_SHOT_DIRS = {"assets", "bid", "bip", "common", "home", "ingest", "lib", "shots"}
+
+def _iter_subdir_names(path: Path):
+    """Yield immediate subdirectory names, skipping hidden dirs and any entry that
+    raises (permission-denied / offline share). One unreadable folder must NOT abort
+    the whole scan — protected pipeline dirs are simply skipped."""
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return
+    for d in entries:
+        name = d.name
+        if name.startswith("."):
+            continue
+        try:
+            if d.is_dir():
+                yield name
+        except OSError:
+            continue  # admin-only / unreadable folder — skip, keep scanning
+
 def list_shows(shows_root: str) -> List[str]:
     """Immediate subfolders of the shows root (each one is a show)."""
     if not shows_root or not os.path.exists(shows_root):
         return []
-    root = Path(shows_root)
-    try:
-        return sorted(d.name for d in root.iterdir()
-                      if d.is_dir() and not d.name.startswith("."))
-    except OSError:
-        return []
+    return sorted(_iter_subdir_names(Path(shows_root)))
 
 def list_shots_for_show(shows_root: str, show: str) -> List[str]:
-    """Shot folders under <shows_root>/<show>."""
+    """Shot folders under <shows_root>/<show>, excluding studio pipeline dirs and any
+    folder we can't stat (admin-only). Resilient: skips bad entries, never returns []
+    just because one sibling folder is locked."""
     if not shows_root or not show:
         return []
     base = Path(shows_root) / show
     if not base.exists():
         return []
-    try:
-        return sorted(d.name for d in base.iterdir()
-                      if d.is_dir() and not d.name.startswith("."))
-    except OSError:
-        return []
+    return sorted(n for n in _iter_subdir_names(base)
+                  if n.lower() not in _NON_SHOT_DIRS)
 
 def list_shot_versions(shows_root: str, show: str, shot: str) -> List[str]:
     """Version folders under <show>/<shot>/in/plates, sorted ascending by number.
@@ -444,10 +460,7 @@ def list_shot_versions(shows_root: str, show: str, shot: str) -> List[str]:
     plates = Path(shows_root) / show / shot / "in" / "plates"
     if not plates.exists():
         return []
-    try:
-        vers = [d.name for d in plates.iterdir() if d.is_dir() and _VER_RE.match(d.name)]
-    except OSError:
-        return []
+    vers = [n for n in _iter_subdir_names(plates) if _VER_RE.match(n)]
     return sorted(vers, key=lambda v: int(_VER_RE.match(v).group(1)))
 
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
