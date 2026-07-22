@@ -305,8 +305,9 @@ async def do_scan_show():
     for s in shots:
         vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
         latest = vers[-1] if vers else ""
-        pdir = be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else ""
-        frames, pstart, pend = await run.io_bound(be.probe_plate_range, pdir) if pdir else (0, 0, 0)
+        vdir = be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else ""
+        # Descend past clip-id / resolution subfolders to the actual frames dir.
+        pdir, frames, pstart, pend = await run.io_bound(be.find_frames_subdir, vdir) if vdir else ("", 0, 0, 0)
         state.shots_data[s] = be.ShotData(name=s, scale="100%", show=show,
                                           versions=vers, version=latest, plate_dir=pdir,
                                           frames=frames, plate_start=pstart, plate_end=pend)
@@ -330,8 +331,8 @@ def on_pick_version(args):
     if not d or not ver:
         return
     d.version = ver
-    d.plate_dir = be.resolve_plate_dir(shows_root.value, d.show, name, ver)
-    d.frames, d.plate_start, d.plate_end = be.probe_plate_range(d.plate_dir)
+    vdir = be.resolve_plate_dir(shows_root.value, d.show, name, ver)
+    d.plate_dir, d.frames, d.plate_start, d.plate_end = be.find_frames_subdir(vdir)
     refresh_table()
     ui.notify(f"{name} → {ver} · {d.frames}f", type="info")
 
