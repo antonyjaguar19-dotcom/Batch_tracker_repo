@@ -136,6 +136,7 @@ def load_editor(name: str):
     ed_title.set_content(f"#### ✏️ {name}{avail}")
     ed_meta.set_content(be._shot_meta_md(d))
     ed_scale.set_value(d.scale)
+    ed_render.set_value(getattr(d, "render_path", "") or "")
     ed_req.set_value(state.manual_notes.get(name, ""))
     ed_inc.set_value(d.include_prompts)
     ed_exc.set_value(d.exclude_prompts)
@@ -251,6 +252,7 @@ def save_shot():
     if fs and fe and fs > fe:
         fs, fe = fe, fs
     d.frame_start, d.frame_end = fs, fe
+    d.render_path = (ed_render.value or "").strip()
     # Persist the manual client requirement so it survives restarts (reloaded on Scan).
     note = (ed_req.value or "").strip()
     if note:
@@ -968,6 +970,18 @@ with ui.dialog() as editor, ui.card().classes("bt-editor"):
         ed_fend = ui.number("Frame End", value=0, min=0, precision=0
                             ).props("dense outlined").classes("grow")
     ed_frange_hint = ui.label("").classes("bt-hint")
+
+    ui.label("TAPNext render (optional)").classes("bt-section q-mt-sm")
+    with ui.row().classes("w-full no-wrap items-end gap-1"):
+        ed_render = ui.input("Render (.mp4 or JPEG/PNG folder)",
+                             placeholder=r"…\render_folder  or  …\shot.mp4"
+                             ).props("dense outlined").classes("grow")
+        ui.button(icon="folder", on_click=lambda: pick_folder(ed_render)
+                  ).props("flat dense").tooltip("Pick a JPEG/PNG render folder")
+        ui.button(icon="movie", on_click=lambda: pick_file(ed_render)
+                  ).props("flat dense").tooltip("Pick an .mp4 render")
+    ui.label("TAPNext is mp4-only. Point it at an .mp4 or a JPEG/PNG render folder "
+             "(auto-encoded to mp4). SynthEyes ignores this.").classes("bt-hint")
 
     ui.label("Brief").classes("bt-section q-mt-sm")
     ed_req = ui.textarea(placeholder="e.g. Camera track / Face track / track car, exclude crowd"
