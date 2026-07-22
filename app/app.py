@@ -463,6 +463,19 @@ def list_shot_versions(shows_root: str, show: str, shot: str) -> List[str]:
     vers = [n for n in _iter_subdir_names(plates) if _VER_RE.match(n)]
     return sorted(vers, key=lambda v: int(_VER_RE.match(v).group(1)))
 
+_SEQ_EXTS = {".exr", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".dpx"}
+
+def count_plate_frames(plate_dir: str) -> int:
+    """Number of image frames in a plate/version dir. Cheap listing only (no decode),
+    so it stays fast over the network. Tolerant of unreadable dirs."""
+    if not plate_dir or not os.path.exists(plate_dir):
+        return 0
+    try:
+        return sum(1 for f in Path(plate_dir).iterdir()
+                   if f.is_file() and f.suffix.lower() in _SEQ_EXTS)
+    except OSError:
+        return 0
+
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
