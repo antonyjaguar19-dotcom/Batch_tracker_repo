@@ -319,27 +319,44 @@ async def load_shows():
               type="info" if shows else "warning")
 
 
+_scan_token = {"n": 0}
+
 async def do_scan_show():
-    """Studio flow: list shots under the picked show, resolve each shot's plate
-    versions (default = latest vNNN) and plate dir. Replaces the flat-folder scan."""
+    """Studio flow: list shots under the picked show, then resolve each shot's plate
+    versions + frame range. Two-phase so the shot list appears immediately on a show
+    switch; the heavier per-shot frame walk fills the range afterwards. Resilient: a
+    single unreadable shot never aborts the list, and the table always refreshes."""
     show = show_sel.value
+    # New scan supersedes any in-flight one (fast show switching).
+    _scan_token["n"] += 1
+    token = _scan_token["n"]
+    # Clear immediately so the switch is visible even before the network responds.
+    state.shots_data = {}
+    state.log_history = []
+    refresh_table()
     if not (shows_root.value and show):
         return
     # Pipeline runs in a hidden local cache; results publish to the studio tree per shot.
     out_dir.set_value(be.work_dir_for_show(show))
-    shots = await run.io_bound(be.list_shots_for_show, shows_root.value, show)
-    state.shots_data = {}
-    state.log_history = []
+    ui.notify(f"Scanning {show}…", type="info")
+    try:
+        shots = await run.io_bound(be.list_shots_for_show, shows_root.value, show)
+    except Exception as ex:
+        ui.notify(f"Scan failed for {show}: {ex}", type="negative")
+        return
+    if token != _scan_token["n"]:
+        return  # a newer show was picked while we were listing
+    # Phase 1 (cheap): show names + version dropdowns right away.
     for s in shots:
-        vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
+        try:
+            vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
+        except Exception:
+            vers = []
         latest = vers[-1] if vers else ""
-        vdir = be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else ""
-        # Descend past clip-id / resolution subfolders to the actual frames dir.
-        pdir, frames, pstart, pend = await run.io_bound(be.find_frames_subdir, vdir) if vdir else ("", 0, 0, 0)
-        state.shots_data[s] = be.ShotData(name=s, scale="100%", show=show,
-                                          versions=vers, version=latest, plate_dir=pdir,
-                                          frames=frames, plate_start=pstart, plate_end=pend,
-                                          studio_dir=be.shot_bot_tracks_dir(shows_root.value, show, s))
+        state.shots_data[s] = be.ShotData(
+            name=s, scale="100%", show=show, versions=vers, version=latest,
+            plate_dir=be.resolve_plate_dir(shows_root.value, show, s, latest) if latest else "",
+            studio_dir=be.shot_bot_tracks_dir(shows_root.value, show, s))
     state.manual_notes = be.load_manual_notes(out_dir.value)
     try:
         _scan_load_prev_guide()
@@ -348,6 +365,20 @@ async def do_scan_show():
     ed_pick.set_options(_visible_names())
     refresh_table()
     ui.notify(f"{show}: {len(shots)} shot(s)", type="info")
+    # Phase 2 (heavier): descend to the real frames dir + parse the range per shot.
+    for s in shots:
+        if token != _scan_token["n"]:
+            return  # superseded by a newer show switch
+        d = state.shots_data.get(s)
+        if not d or not d.plate_dir:
+            continue
+        try:
+            pdir, frames, pstart, pend = await run.io_bound(be.find_frames_subdir, d.plate_dir)
+            d.plate_dir, d.frames, d.plate_start, d.plate_end = pdir, frames, pstart, pend
+        except Exception:
+            continue
+    if token == _scan_token["n"]:
+        refresh_table()
 
 
 def on_pick_version(args):
