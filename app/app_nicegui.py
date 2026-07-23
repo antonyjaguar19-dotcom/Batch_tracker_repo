@@ -325,6 +325,8 @@ async def do_scan_show():
     show = show_sel.value
     if not (shows_root.value and show):
         return
+    # Pipeline runs in a hidden local cache; results publish to the studio tree per shot.
+    out_dir.set_value(be.work_dir_for_show(show))
     shots = await run.io_bound(be.list_shots_for_show, shows_root.value, show)
     state.shots_data = {}
     state.log_history = []
@@ -336,7 +338,8 @@ async def do_scan_show():
         pdir, frames, pstart, pend = await run.io_bound(be.find_frames_subdir, vdir) if vdir else ("", 0, 0, 0)
         state.shots_data[s] = be.ShotData(name=s, scale="100%", show=show,
                                           versions=vers, version=latest, plate_dir=pdir,
-                                          frames=frames, plate_start=pstart, plate_end=pend)
+                                          frames=frames, plate_start=pstart, plate_end=pend,
+                                          studio_dir=be.shot_bot_tracks_dir(shows_root.value, show, s))
     state.manual_notes = be.load_manual_notes(out_dir.value)
     try:
         _scan_load_prev_guide()
@@ -757,9 +760,11 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             in_dir = ui.input("Input Folder (legacy / fallback)", placeholder=r"D:\shots\IN"
                               ).props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(in_dir)).props("flat dense")
-        with ui.row().classes("w-full no-wrap items-end gap-1"):
-            out_dir = ui.input("Output Folder", placeholder=r"D:\shots\OUT").props("dense outlined").classes("grow")
-            ui.button(icon="folder", on_click=lambda: pick_folder(out_dir)).props("flat dense")
+        # Output is no longer user-set: the pipeline runs in a hidden local cache and
+        # publishes each shot's results to <show>/<shot>/mid/cmm/bot_tracks. Kept as a
+        # hidden holder so the existing out_dir.value plumbing is unchanged.
+        out_dir = ui.input("Output Folder").props("dense outlined").classes("grow")
+        out_dir.set_visibility(False)
         with ui.row().classes("w-full no-wrap items-end gap-1"):
             req_file = ui.input("Client Requirements (optional)", placeholder=r"D:\shots\reqs.xlsx"
                                 ).props("dense outlined").classes("grow")
