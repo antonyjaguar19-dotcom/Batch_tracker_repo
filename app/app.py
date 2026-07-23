@@ -571,6 +571,112 @@ def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 2
     _log(f"Rendered {written} frame(s) -> {out_mp4}" if ok else "mp4 render failed.")
     return ok
 
+# -----------------------------------------------------------------------------
+# Studio output publishing.
+# The pipeline computes in a LOCAL work dir (fast, keeps the cross-shot guide/SAM3
+# logic intact); finished per-shot artifacts are then bulk-copied into the studio
+# tree at <show>/<shot>/mid/cmm/bot_tracks/{tracks, masks/, analysis/, logs/}.
+# -----------------------------------------------------------------------------
+def work_dir_for_show(show: str) -> str:
+    """Local scratch root the pipeline runs in, stable per show so 'reuse existing
+    masks' works across sessions. Override root with env BTR_WORK."""
+    root = os.environ.get("BTR_WORK", "") or str(_HERE / "runtime" / "_work")
+    return str(Path(root) / (show or "_nofolder"))
+
+def shot_bot_tracks_dir(shows_root: str, show: str, shot: str) -> str:
+    """Publish target for a shot: <shows_root>/<show>/<shot>/mid/cmm/bot_tracks."""
+    if not (shows_root and show and shot):
+        return ""
+    return str(Path(shows_root) / show / shot / "mid" / "cmm" / "bot_tracks")
+
+def publish_shot(work_out: str, studio_dir: str, shot: str, backend: str,
+                 scope: str = "all", log_cb=None) -> None:
+    """Copy a shot's finished artifacts from the local work dir into its studio
+    bot_tracks tree, organized. scope = 'analysis' | 'mask' | 'track' | 'all'.
+    Skips anything missing so partial stages are fine; per-file failures are logged
+    and do not abort."""
+    import shutil
+    def _log(m):
+        if log_cb:
+            try: log_cb(m)
+            except Exception: pass
+    if not studio_dir or not work_out:
+        return
+    do_track = scope in ("track", "all")
+    do_mask = scope in ("mask", "all")
+    do_analysis = scope in ("analysis", "all")
+
+    def _copy_file(src, dst):
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            return True
+        except Exception as ex:
+            _log(f"publish: copy failed {os.path.basename(src)} -> {dst}: {ex}")
+            return False
+
+    def _copy_tree(src_dir, dst_dir):
+        n = 0
+        for dp, _dn, fns in os.walk(src_dir):
+            rel = os.path.relpath(dp, src_dir)
+            for f in fns:
+                out = os.path.join(dst_dir, rel, f) if rel != "." else os.path.join(dst_dir, f)
+                if _copy_file(os.path.join(dp, f), out):
+                    n += 1
+        return n
+
+    # --- tracks: <work>/<shot>__*<backend>.txt -> <studio>/<shot>_2Dtracks[__task]__<backend>.txt
+    if do_track:
+        try:
+            for f in os.listdir(work_out):
+                low = f.lower()
+                if not low.endswith(".txt"):
+                    continue
+                if not (low.startswith(f"{shot.lower()}__") and low.endswith(f"__{backend}.txt")):
+                    continue
+                mid = f[len(shot) + 2:-(len(backend) + 6)]  # strip "<shot>__" and "__<backend>.txt"
+                tag = f"__{mid}" if mid else ""
+                dst = os.path.join(studio_dir, f"{shot}_2Dtracks{tag}__{backend}.txt")
+                if _copy_file(os.path.join(work_out, f), dst):
+                    _log(f"published tracks -> {dst}")
+        except OSError:
+            pass
+
+    # --- masks: <work>/<shot>/masks* -> <studio>/masks/
+    if do_mask:
+        for md in _shot_mask_dirs(work_out, shot):
+            n = _copy_tree(md, os.path.join(studio_dir, "masks"))
+            if n:
+                _log(f"published {n} mask file(s) -> {os.path.join(studio_dir, 'masks')}")
+
+    # --- analysis: guide slice for this shot + manual note -> <studio>/analysis/
+    if do_analysis:
+        g = _latest_guide_file(work_out)
+        adir = os.path.join(studio_dir, "analysis")
+        if g and os.path.isfile(g):
+            try:
+                with open(g, "r", encoding="utf-8") as f:
+                    gd = json.load(f)
+                shots = [s for s in (gd.get("shots") or [])
+                         if _norm_shot_name(_guide_shot_name(s)) == _norm_shot_name(shot)]
+                if shots:
+                    os.makedirs(adir, exist_ok=True)
+                    with open(os.path.join(adir, f"{shot}_guide.json"), "w", encoding="utf-8") as f:
+                        json.dump({"shots": shots}, f, indent=2)
+                    _log(f"published analysis -> {adir}")
+            except Exception as ex:
+                _log(f"publish: analysis slice failed: {ex}")
+        notes = load_manual_notes(work_out)
+        note = (notes or {}).get(shot, "")
+        if note:
+            _copy_note = os.path.join(adir, "manual_note.txt")
+            try:
+                os.makedirs(adir, exist_ok=True)
+                with open(_copy_note, "w", encoding="utf-8") as f:
+                    f.write(note)
+            except Exception as ex:
+                _log(f"publish: note failed: {ex}")
+
 def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> str:
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
@@ -792,6 +898,7 @@ class ShotData:
     plate_start: int = 0   # absolute first frame number parsed from filenames
     plate_end: int = 0     # absolute last frame number
     render_path: str = ""  # TAPNext: user-pointed .mp4 file OR jpeg/png render folder
+    studio_dir: str = ""   # publish target: <show>/<shot>/mid/cmm/bot_tracks
 
 @dataclass
 class AppState:
@@ -1286,6 +1393,10 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         # would otherwise reach worker_mask with guide_path still unset and silently mask
         # against a fresh overdrive_guide instead of this analysis.
         state.guide_path = str(guide_path)
+        # Publish each analyzed shot's guide slice + note to its studio tree.
+        for nm, d in state.shots_data.items():
+            if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
+                publish_shot(out_dir, d.studio_dir, nm, "", scope="analysis", log_cb=logger)
         JOB_QUEUE.put(f"GUIDE_PATH_UPDATE:{str(guide_path)}")
         JOB_QUEUE.put("DONE_ANALYSIS")
         return True
@@ -1472,6 +1583,10 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
         run_sam3_batch(cfg, log_cb=logger, progress_cb=lambda d,t: _set_progress(f"{d}/{t} frames", d, t), status_cb=logger)
         _free_vram("after SAM3")
         logger("Masking Complete.")
+        # Publish masks to each selected shot's studio tree.
+        for nm, d in state.shots_data.items():
+            if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
+                publish_shot(out_dir, d.studio_dir, nm, "mask", scope="mask", log_cb=logger)
         JOB_QUEUE.put("DONE_MASKING")
         return True
     except Exception as e:
@@ -1818,6 +1933,11 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                    "a shot was skipped (no image sequence/movie under the Input Folder) or "
                    "SynthEyes errored on it. Confirm the Input Folder is set and the shot is ticked.")
         else: logger("Tracking Complete.")
+        if any_ran:
+            # Publish the 2D tracks to each selected shot's studio bot_tracks folder.
+            for nm, d in state.shots_data.items():
+                if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
+                    publish_shot(str(out_root), d.studio_dir, nm, backend, scope="track", log_cb=logger)
         JOB_QUEUE.put("DONE_TRACKING")
         return not stopped
     except Exception as e:
