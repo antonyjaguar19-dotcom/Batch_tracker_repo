@@ -338,14 +338,17 @@ async def do_scan_show():
         return
     # Pipeline runs in a hidden local cache; results publish to the studio tree per shot.
     out_dir.set_value(be.work_dir_for_show(show))
-    ui.notify(f"Scanning {show}…", type="info")
+    # Show scan progress so it's obvious the bot is working (not idle).
+    scan_prog.set_visibility(True); scan_lbl.set_visibility(True)
+    scan_prog.props("indeterminate"); scan_lbl.set_text(f"Scanning {show}…")
     try:
         shots = await run.io_bound(be.list_shots_for_show, shows_root.value, show)
     except Exception as ex:
+        scan_prog.set_visibility(False); scan_lbl.set_visibility(False)
         ui.notify(f"Scan failed for {show}: {ex}", type="negative")
         return
     if token != _scan_token["n"]:
-        return  # a newer show was picked while we were listing
+        return  # a newer show was picked while we were listing (it owns the bar now)
     # Phase 1 (cheap): show names + version dropdowns right away.
     for s in shots:
         try:
@@ -366,9 +369,13 @@ async def do_scan_show():
     refresh_table()
     ui.notify(f"{show}: {len(shots)} shot(s)", type="info")
     # Phase 2 (heavier): descend to the real frames dir + parse the range per shot.
-    for s in shots:
+    total = len(shots)
+    scan_prog.props(remove="indeterminate"); scan_prog.set_value(0.0)
+    for i, s in enumerate(shots):
         if token != _scan_token["n"]:
-            return  # superseded by a newer show switch
+            return  # superseded by a newer show switch (it owns the bar now)
+        scan_lbl.set_text(f"Resolving frames {i + 1}/{total} · {s}")
+        scan_prog.set_value((i + 1) / total if total else 1.0)
         d = state.shots_data.get(s)
         if not d or not d.plate_dir:
             continue
@@ -379,6 +386,7 @@ async def do_scan_show():
             continue
     if token == _scan_token["n"]:
         refresh_table()
+        scan_prog.set_visibility(False); scan_lbl.set_visibility(False)
 
 
 def on_pick_version(args):
@@ -786,6 +794,11 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             show_sel = ui.select([], label="Show", with_input=True,
                                  on_change=do_scan_show).props("dense outlined").classes("grow")
             ui.button(icon="refresh", on_click=load_shows).props("flat dense").tooltip("Load shows")
+        # Scan progress (driven only by do_scan_show; poll() never touches it).
+        scan_prog = ui.linear_progress(value=0, show_value=False).props("rounded").classes("w-full")
+        scan_lbl = ui.label("").classes("bt-hint")
+        scan_prog.set_visibility(False)
+        scan_lbl.set_visibility(False)
         ui.separator().classes("q-my-xs")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
             in_dir = ui.input("Input Folder (legacy / fallback)", placeholder=r"D:\shots\IN"
