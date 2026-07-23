@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+# OpenCV only reads this at cv2 init, so it MUST be set before cv2 is imported anywhere
+# in the process — otherwise EXR decode fails with "OpenEXR codec is disabled".
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import re
 import sys
 import time
@@ -600,6 +603,20 @@ def shot_cache_dir(studio_dir: str, work_out: str = "", shot: str = "") -> str:
         return str(Path(work_out) / "_cache" / (shot or "_shot"))
     return work_out or ""
 
+def clear_shot_cache(studio_dir: str, work_out: str = "", shot: str = "") -> int:
+    """Delete a shot's bot cache (proxies + renders). Returns the number of files
+    removed. Safe if the cache doesn't exist."""
+    import shutil
+    removed = 0
+    for cdir in {shot_cache_dir(studio_dir), shot_cache_dir("", work_out, shot)}:
+        if cdir and os.path.isdir(cdir):
+            try:
+                removed += sum(1 for p in Path(cdir).rglob("*") if p.is_file())
+                shutil.rmtree(cdir, ignore_errors=True)
+            except Exception:
+                pass
+    return removed
+
 def publish_shot(work_out: str, studio_dir: str, shot: str, backend: str,
                  scope: str = "all", log_cb=None) -> None:
     """Copy a shot's finished artifacts from the local work dir into its studio
@@ -740,7 +757,12 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None) -> str:
     def _read_exr_linear(fp: str):
         """Return an HxWx3 float32 linear RGB image in [0,inf), or None."""
         if _cv2 is not None:
-            img = _cv2.imread(fp, _cv2.IMREAD_UNCHANGED)
+            try:
+                img = _cv2.imread(fp, _cv2.IMREAD_UNCHANGED)
+            except Exception as ex:
+                # e.g. "OpenEXR codec is disabled" when the env var wasn't set at init.
+                _log(f"cv2 EXR read failed ({os.path.basename(fp)}: {ex}); trying imageio.")
+                img = None
             if img is not None:
                 if img.ndim == 2:
                     img = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
