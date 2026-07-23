@@ -589,6 +589,17 @@ def shot_bot_tracks_dir(shows_root: str, show: str, shot: str) -> str:
         return ""
     return str(Path(shows_root) / show / shot / "mid" / "cmm" / "bot_tracks")
 
+def shot_cache_dir(studio_dir: str, work_out: str = "", shot: str = "") -> str:
+    """Persistent per-shot cache for bot-made JPG proxies + mp4 renders, kept in the
+    shot's OWN folder (<studio>/cache) so they survive and are reused on future runs.
+    Keyed further by plate version inside ensure_plate_proxies / render paths. Falls
+    back to a local per-shot cache when the studio dir is unknown (legacy flat flow)."""
+    if studio_dir:
+        return str(Path(studio_dir) / "cache")
+    if work_out:
+        return str(Path(work_out) / "_cache" / (shot or "_shot"))
+    return work_out or ""
+
 def publish_shot(work_out: str, studio_dir: str, shot: str, backend: str,
                  scope: str = "all", log_cb=None) -> None:
     """Copy a shot's finished artifacts from the local work dir into its studio
@@ -1330,7 +1341,9 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         if selected:
             logger(f"Analyzing {len(selected)} selected shot(s): {', '.join(sorted(selected))}")
         # Per-shot plate dirs (network fetch). EXR gets JPG proxies since Qwen reads via cv2.
-        plate_map = {n: ensure_plate_proxies(d.plate_dir, str(batch_dir), logger)
+        # Proxies live in each shot's own cache (studio tree) so analyze + mask share
+        # them and future runs reuse them instead of re-tonemapping EXR every time.
+        plate_map = {n: ensure_plate_proxies(d.plate_dir, shot_cache_dir(d.studio_dir, str(batch_dir), n), logger)
                      for n, d in state.shots_data.items()
                      if getattr(d, "use", False) and getattr(d, "plate_dir", "")}
         qwen_json = run_qwen2_batch(in_dir=in_dir, out_dir=str(batch_dir), fps=int(fps),
@@ -1517,7 +1530,7 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
             # SAM3 (PIL/cv2) can't decode EXR.
             pd = str(getattr(data, "plate_dir", "") or "")
             if pd:
-                sh["input_dir"] = ensure_plate_proxies(pd, out_dir, logger)
+                sh["input_dir"] = ensure_plate_proxies(pd, shot_cache_dir(data.studio_dir, out_dir, name), logger)
 
             # User edits are AUTHORITATIVE: write inc/exc verbatim (empty list CLEARS the
             # old value) so removing a term in the UI actually removes it from masking.
@@ -1632,14 +1645,17 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
         if not getattr(data, "use", False): continue
 
         video_dir, filename = None, None
+        # Renders persist in the shot's own cache folder (studio tree) and are reused.
+        cache = shot_cache_dir(getattr(data, "studio_dir", ""), str(out_root), shot_name)
+        renders = Path(cache) / "renders"
         # Studio flow: TAPNext is mp4-only, so use the user-pointed render — either an
-        # .mp4 file directly, or a JPEG/PNG sequence folder we encode to a temp mp4.
+        # .mp4 file directly, or a JPEG/PNG sequence folder we encode to an mp4.
         rp = str(getattr(data, "render_path", "") or "").strip()
         if rp and os.path.exists(rp):
             if os.path.isfile(rp) and rp.lower().endswith(".mp4"):
                 video_dir, filename = Path(rp).parent, Path(rp).name
             elif os.path.isdir(rp):
-                mp4 = Path(out_root) / "_renders" / f"{shot_name}.mp4"
+                mp4 = renders / f"{shot_name}_render.mp4"
                 if render_sequence_to_mp4(rp, str(mp4), logger):
                     video_dir, filename = mp4.parent, mp4.name
                 else:
@@ -1655,8 +1671,18 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             exact = in_root / f"{shot_name}.mp4"
             if exact.exists(): video_dir, filename = in_root, exact.name
         if not video_dir:
-            logger(f"Skip {shot_name}: No video found. For TAPNext, point the shot at a "
-                   f"render (.mp4 or JPEG folder) in the editor."); continue
+            # Auto-render from the plate: reuse the JPG proxies, encode an mp4 keyed by
+            # version into the shot cache, and reuse it on future runs.
+            pd = str(getattr(data, "plate_dir", "") or "")
+            if pd:
+                jpgdir = ensure_plate_proxies(pd, cache, logger)
+                mp4 = renders / f"{shot_name}_{getattr(data, 'version', '') or 'plate'}.mp4"
+                logger(f"{shot_name}: auto-rendering plate -> {mp4.name}")
+                if render_sequence_to_mp4(jpgdir, str(mp4), logger):
+                    video_dir, filename = mp4.parent, mp4.name
+        if not video_dir:
+            logger(f"Skip {shot_name}: No video found and could not auto-render the plate. "
+                   f"Point the shot at a render (.mp4 or JPEG folder) in the editor."); continue
 
         tasks = shot_tasks_map.get(shot_name)
         if not tasks:
