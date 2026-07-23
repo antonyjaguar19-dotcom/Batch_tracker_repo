@@ -10,6 +10,8 @@ Run:  runtime/python311/python.exe app_nicegui.py   (or launch_nicegui.bat)
 from __future__ import annotations
 
 import os
+# Enable OpenCV's EXR codec before ANY cv2 import (OpenCV reads this only at init).
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import re
 import sys
 import time
@@ -262,6 +264,18 @@ def save_shot():
     be.save_manual_notes(out_dir.value, state.manual_notes)
     refresh_table()
     ui.notify(f"Saved {name}", type="positive")
+
+
+async def clear_cache_current():
+    """Delete the currently-edited shot's bot cache (JPG proxies + mp4 renders)."""
+    name = state.current_shot_name
+    d = state.shots_data.get(name) if name else None
+    if not d:
+        ui.notify("No shot selected", type="warning")
+        return
+    n = await run.io_bound(be.clear_shot_cache, getattr(d, "studio_dir", ""), out_dir.value, name)
+    ui.notify(f"Cleared {n} cache file(s) for {name}" if n else f"No cache for {name}",
+              type="positive" if n else "info")
 
 
 # -----------------------------------------------------------------------------
@@ -1050,9 +1064,12 @@ with ui.dialog() as editor, ui.card().classes("bt-editor"):
     with ui.expansion("AI analysis", icon="psychology", value=False).classes("w-full"):
         ed_analysis = ui.markdown("Select a shot to see its AI analysis.")
 
-    with ui.row().classes("w-full justify-end gap-2 q-mt-sm"):
-        ui.button("Close", on_click=editor.close).props("flat")
-        ui.button("Save shot settings", icon="save", on_click=save_shot, color="primary")
+    with ui.row().classes("w-full justify-between gap-2 q-mt-sm"):
+        ui.button("Clear cache", icon="delete_sweep", on_click=clear_cache_current
+                  ).props("flat color=orange").tooltip("Delete this shot's bot cache (JPG proxies + mp4 renders). Rebuilt on next run.")
+        with ui.row().classes("gap-2"):
+            ui.button("Close", on_click=editor.close).props("flat")
+            ui.button("Save shot settings", icon="save", on_click=save_shot, color="primary")
 
 ui.timer(1.0, poll)
 
