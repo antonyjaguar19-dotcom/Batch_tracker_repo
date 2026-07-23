@@ -715,11 +715,17 @@ def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> st
 _EXR_EXTS = {".exr"}
 _PROXY_OK_EXTS = {".jpg", ".jpeg", ".png"}
 
-def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None) -> str:
+def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
+                         max_side: int = 0, workers: int = 8) -> str:
     """SAM3 (PIL) and Qwen (cv2.imread) cannot decode EXR. If `plate_dir` holds .exr
     frames, tonemap each to an 8-bit JPG under <cache_root>/_proxies/<key>/ and return
     that dir. If frames are already jpg/jpeg/png, return `plate_dir` unchanged.
-    Idempotent: skips regen when the proxy count already matches the source count.
+
+    max_side>0 downscales each proxy to that longest edge (analyse only needs ~1280px,
+    so it avoids writing GBs of 6K JPGs to the share and never feeds a 6K frame to the
+    mp4 encoder). Generation is parallel (cv2 releases the GIL) so 200+ frames don't
+    take minutes. Idempotent: skips regen when the proxy count already matches source.
+    Different max_side values cache separately.
 
     SynthEyes reads EXR natively, so it should keep using the raw plate_dir (not this)."""
     def _log(m):
@@ -739,7 +745,7 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None) -> str:
         return plate_dir
 
     import hashlib
-    key = hashlib.md5(str(src.resolve()).encode("utf-8", "ignore")).hexdigest()[:16]
+    key = hashlib.md5(f"{src.resolve()}@{int(max_side)}".encode("utf-8", "ignore")).hexdigest()[:16]
     pdir = Path(cache_root) / "_proxies" / key
     pdir.mkdir(parents=True, exist_ok=True)
     existing = [f for f in pdir.iterdir() if f.is_file() and f.suffix.lower() == ".jpg"] if pdir.exists() else []
@@ -785,23 +791,40 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None) -> str:
         _log("cv2 unavailable — cannot write JPG proxies; returning raw EXR dir.")
         return plate_dir
 
-    _log(f"Generating {len(exr)} JPG proxy frame(s) from EXR → {pdir}")
-    made = 0
-    for f in exr:
+    ms = int(max_side or 0)
+
+    def _one(f):
         lin = _read_exr_linear(str(f))
         if lin is None:
-            continue
+            return 0
         # Linear -> sRGB-ish (gamma 2.2) tonemap, clip, 8-bit.
         disp = _np.clip(lin, 0.0, None)
         disp = _np.power(disp / (disp.max() if disp.max() > 1.0 else 1.0), 1.0 / 2.2) if disp.max() > 1.0 \
             else _np.power(_np.clip(disp, 0.0, 1.0), 1.0 / 2.2)
         out8 = _np.clip(disp * 255.0, 0, 255).astype(_np.uint8)
+        if ms > 0:
+            h, w = out8.shape[:2]
+            m = max(h, w)
+            if m > ms:
+                s = ms / float(m)
+                out8 = _cv2.resize(out8, (int(round(w * s)), int(round(h * s))),
+                                   interpolation=_cv2.INTER_AREA)
         outfp = pdir / (f.stem + ".jpg")
         try:
-            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 95])
-            made += 1
+            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 92])
+            return 1
         except Exception as ex:
             _log(f"EXR proxy write failed for {f.name}: {ex}")
+            return 0
+
+    n_workers = max(1, min(int(workers or 1), len(exr)))
+    _log(f"Generating {len(exr)} JPG proxy frame(s) from EXR "
+         f"({'downscaled ' + str(ms) + 'px' if ms else 'full-res'}, {n_workers} threads) → {pdir}")
+    made = 0
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=n_workers) as ex_pool:
+        for r in ex_pool.map(_one, exr):
+            made += int(r)
     _log(f"Proxy generation done: {made}/{len(exr)} frame(s).")
     return str(pdir) if made else plate_dir
 
@@ -1363,9 +1386,11 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         if selected:
             logger(f"Analyzing {len(selected)} selected shot(s): {', '.join(sorted(selected))}")
         # Per-shot plate dirs (network fetch). EXR gets JPG proxies since Qwen reads via cv2.
-        # Proxies live in each shot's own cache (studio tree) so analyze + mask share
-        # them and future runs reuse them instead of re-tonemapping EXR every time.
-        plate_map = {n: ensure_plate_proxies(d.plate_dir, shot_cache_dir(d.studio_dir, str(batch_dir), n), logger)
+        # Analyse only needs small frames for Qwen — make downscaled proxies (fast, tiny
+        # on the share, and never a 6K frame into the mp4 encoder). Full-res proxies for
+        # masking are made separately at Mask time. Cached per shot + reused.
+        plate_map = {n: ensure_plate_proxies(d.plate_dir, shot_cache_dir(d.studio_dir, str(batch_dir), n),
+                                             logger, max_side=1280)
                      for n, d in state.shots_data.items()
                      if getattr(d, "use", False) and getattr(d, "plate_dir", "")}
         qwen_json = run_qwen2_batch(in_dir=in_dir, out_dir=str(batch_dir), fps=int(fps),
