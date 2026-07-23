@@ -134,7 +134,8 @@ def _find_images_recursive(seq_dir: Path) -> List[Path]:
     return sorted(by_parent[best_parent])
 
 
-def sequence_folder_to_temp_mp4(seq_dir: str | Path, tmp_dir: str | Path) -> str:
+def sequence_folder_to_temp_mp4(seq_dir: str | Path, tmp_dir: str | Path,
+                                max_side: int = 1280) -> str:
     seq_dir = Path(seq_dir)
     tmp_dir = Path(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +156,10 @@ def sequence_folder_to_temp_mp4(seq_dir: str | Path, tmp_dir: str | Path) -> str
             f"If these are EXR/DPX, generate JPG/PNG proxies or add OpenImageIO."
         )
 
+    # Downscale to a safe max side BEFORE encoding: the mp4v (MPEG-4 Part 2) codec
+    # stalls/hangs on frames wider than ~4096 (a 6K/8K plate would freeze here), and
+    # Qwen downsamples the frames for inference anyway, so native res is wasted work.
+    first = _resize_max_side_bgr(first, max_side)
     h, w = first.shape[:2]
     out_path = tmp_dir / f"{seq_dir.name}_tmp.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -167,6 +172,7 @@ def sequence_folder_to_temp_mp4(seq_dir: str | Path, tmp_dir: str | Path) -> str
         frame = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if frame is None:
             continue
+        frame = _resize_max_side_bgr(frame, max_side)
         if frame.shape[1] != w or frame.shape[0] != h:
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         writer.write(frame)
