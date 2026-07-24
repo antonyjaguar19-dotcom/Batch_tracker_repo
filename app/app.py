@@ -524,11 +524,12 @@ def find_frames_subdir(version_dir: str):
 
 _RENDER_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 24) -> bool:
+def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 24,
+                           max_side: int = 0) -> bool:
     """Encode an 8-bit image sequence (jpg/jpeg/png/tif) into an mp4 so the TAPNext
-    (mp4-only) tracker can read a user-pointed render. Descends nested folders, orders
-    frames by trailing number. Idempotent: reuses an existing non-empty mp4. Returns
-    True on success."""
+    (mp4-only) tracker can read it. Descends nested folders, orders frames by trailing
+    number. max_side>0 downscales before encoding (mp4v stalls/crashes above ~4096 wide).
+    Idempotent: reuses an existing non-empty mp4. Returns True on success."""
     def _log(m):
         if log_cb:
             try: log_cb(m)
@@ -554,24 +555,40 @@ def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 2
     if not imgs:
         _log(f"No 8-bit frames (jpg/png) to render in {fdir}. Point at a JPEG/PNG render.")
         return False
+    ms = int(max_side or 0)
+    def _fit(img):
+        if ms > 0:
+            h0, w0 = img.shape[:2]
+            m = max(h0, w0)
+            if m > ms:
+                s = ms / float(m)
+                return cv2.resize(img, (int(round(w0 * s)), int(round(h0 * s))),
+                                  interpolation=cv2.INTER_AREA)
+        return img
     first = cv2.imread(str(imgs[0]))
     if first is None:
         _log(f"Could not read first frame {imgs[0].name}.")
         return False
+    first = _fit(first)
     h, w = first.shape[:2]
     Path(out_mp4).parent.mkdir(parents=True, exist_ok=True)
     vw = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), int(fps), (w, h))
+    if not vw.isOpened():
+        # Broken codec on this box — fail gracefully instead of risking a hard crash.
+        _log(f"VideoWriter could not open (codec issue) for {out_mp4}; skipping mp4 render.")
+        return False
     written = 0
     for f in imgs:
         img = cv2.imread(str(f))
         if img is None:
             continue
+        img = _fit(img)
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h))
         vw.write(img); written += 1
     vw.release()
     ok = os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0 and written > 0
-    _log(f"Rendered {written} frame(s) -> {out_mp4}" if ok else "mp4 render failed.")
+    _log(f"Rendered {written} frame(s) @ {w}x{h} -> {out_mp4}" if ok else "mp4 render failed.")
     return ok
 
 # -----------------------------------------------------------------------------
@@ -1722,10 +1739,12 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             # version into the shot cache, and reuse it on future runs.
             pd = str(getattr(data, "plate_dir", "") or "")
             if pd:
-                jpgdir = ensure_plate_proxies(pd, cache, logger)
+                # Reuse the SAME downscaled JPG proxy Analyse already renders (same cache
+                # key -> no EXR re-decode) and encode the mp4 from it — small + fast + safe.
+                jpgdir = ensure_plate_proxies(pd, cache, logger, max_side=1280)
                 mp4 = renders / f"{shot_name}_{getattr(data, 'version', '') or 'plate'}.mp4"
-                logger(f"{shot_name}: auto-rendering plate -> {mp4.name}")
-                if render_sequence_to_mp4(jpgdir, str(mp4), logger):
+                logger(f"{shot_name}: building mp4 from JPG proxy -> {mp4.name}")
+                if render_sequence_to_mp4(jpgdir, str(mp4), logger, max_side=1280):
                     video_dir, filename = mp4.parent, mp4.name
         if not video_dir:
             logger(f"Skip {shot_name}: No video found and could not auto-render the plate. "
