@@ -1792,9 +1792,21 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()
             any_ran = True
+            # The tracker names its output after the video stem (e.g. WLF0070_v001__tapnext.txt).
+            # Rename to the SHOT name so it publishes as <shot>_2Dtracks[__task]__tapnext.txt.
+            stem = Path(filename).stem
+            src_base = f"{stem}__tapnext.txt" if not output_tag else f"{stem}__{output_tag}__tapnext.txt"
+            out_base = f"{shot_name}__tapnext.txt" if not output_tag else f"{shot_name}__{output_tag}__tapnext.txt"
+            if src_base != out_base:
+                sp = os.path.join(str(out_root), src_base)
+                dp = os.path.join(str(out_root), out_base)
+                if os.path.exists(sp):
+                    try:
+                        os.replace(sp, dp)
+                        logger(f"  tracks: {src_base} -> {out_base}")
+                    except Exception as e:
+                        logger(f"  rename tracks failed: {e}"); out_base = src_base
             try:
-                stem = Path(filename).stem
-                out_base = f"{stem}__tapnext.txt" if not output_tag else f"{stem}__{output_tag}__tapnext.txt"
                 summ, _ = compute_track_metrics(
                     os.path.join(str(out_root), out_base),
                     width=int(getattr(data, "width", 0) or 0), height=int(getattr(data, "height", 0) or 0),
