@@ -288,6 +288,48 @@ def _sample_frames_cv(video_path: str, fps_min: int, cap_frames: int) -> List[np
     return frames if len(frames) >= 2 else []
 
 
+def _sample_frames_from_folder(seq_dir, cap_frames: int) -> List[np.ndarray]:
+    """Evenly-spread sample straight from an image-sequence folder — no mp4 encode.
+    Mirrors _sample_frames' spread so the VLM sees subjects anywhere in the shot."""
+    imgs = _find_images_recursive(Path(seq_dir))
+    if not imgs:
+        raise RuntimeError(f"No images found in sequence folder: {seq_dir}")
+    total = len(imgs)
+    n = max(2, int(cap_frames))
+    if total <= n:
+        targets = list(range(total))
+    else:
+        targets = [int(round(i * (total - 1) / (n - 1))) for i in range(n)]
+    frames: List[np.ndarray] = []
+    for ti in targets:
+        im = cv2.imread(str(imgs[ti]), cv2.IMREAD_COLOR)
+        if im is not None:
+            frames.append(im)
+    if len(frames) < 2:
+        raise RuntimeError(f"Not enough readable frames in: {seq_dir}")
+    return frames
+
+
+def _sample_frames_cv_from_folder(seq_dir, fps_min: int, cap_frames: int,
+                                  src_fps: float = 24.0) -> List[np.ndarray]:
+    """Stride sample from a folder for the CV camera-motion classifier (no mp4)."""
+    imgs = _find_images_recursive(Path(seq_dir))
+    if not imgs:
+        return []
+    step = max(1, int(round(src_fps / float(max(fps_min, 1)))))
+    frames: List[np.ndarray] = []
+    grabbed = 0
+    for i, p in enumerate(imgs):
+        if i % step == 0:
+            im = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            if im is not None:
+                frames.append(im)
+                grabbed += 1
+                if grabbed >= cap_frames:
+                    break
+    return frames if len(frames) >= 2 else []
+
+
 def _estimate_affine(prev_gray: np.ndarray, cur_gray: np.ndarray) -> np.ndarray:
     try:
         orb = cv2.ORB_create(1200)
@@ -576,20 +618,30 @@ class QwenShotDescriber:
         text = self.processor.decode(gen_ids, skip_special_tokens=True)
         return text.strip()
 
+    def _frame_budget(self) -> int:
+        # Frame count nudges with the FPS slider but stays within the VLM sweet spot
+        # [min, cap] (~6-8); more than ~8 images dilutes the VLM, so it plateaus by design.
+        return max(self.cfg.num_frames_min, min(self.cfg.num_frames_cap, int(self.cfg.fps) + 4))
+
     @torch.inference_mode()
     def describe_video_struct(self, video_path: str, client_requirement: Optional[str] = None) -> Dict:
-        # Frame count nudges with the FPS slider but stays within the VLM sweet spot
-        # [min, cap] (~6-8); frames are spread across the whole clip by _sample_frames.
-        # More than ~8 images dilutes the VLM, so the count plateaus by design.
-        n_frames = max(self.cfg.num_frames_min, min(self.cfg.num_frames_cap, int(self.cfg.fps) + 4))
-        frames_bgr = _sample_frames(video_path, fps=self.cfg.fps, cap_frames=n_frames)
+        frames_bgr = _sample_frames(video_path, fps=self.cfg.fps, cap_frames=self._frame_budget())
+        cv_frames = _sample_frames_cv(
+            video_path, fps_min=max(self.cfg.cv_fps_min, self.cfg.fps), cap_frames=self.cfg.cv_frames_cap)
+        return self._describe_from_frames(frames_bgr, cv_frames, client_requirement)
+
+    @torch.inference_mode()
+    def describe_sequence_struct(self, seq_dir, client_requirement: Optional[str] = None) -> Dict:
+        """Same analysis as describe_video_struct but samples directly from an image
+        sequence folder — no mp4 encode, so it can't hit the OpenCV VideoWriter crash."""
+        frames_bgr = _sample_frames_from_folder(seq_dir, cap_frames=self._frame_budget())
+        cv_frames = _sample_frames_cv_from_folder(
+            seq_dir, fps_min=max(self.cfg.cv_fps_min, self.cfg.fps), cap_frames=self.cfg.cv_frames_cap)
+        return self._describe_from_frames(frames_bgr, cv_frames, client_requirement)
+
+    def _describe_from_frames(self, frames_bgr, cv_frames, client_requirement: Optional[str] = None) -> Dict:
         images = [_pil_from_bgr(f, max_side=self.cfg.max_side) for f in frames_bgr]
 
-        cv_frames = _sample_frames_cv(
-            video_path,
-            fps_min=max(self.cfg.cv_fps_min, self.cfg.fps),
-            cap_frames=self.cfg.cv_frames_cap,
-        )
         cam_src = cv_frames if len(cv_frames) >= 2 else frames_bgr
         mags, vecs, scales = _estimate_global_motion(cam_src, scale=self.cfg.cv_scale)
         cam_label = _classify_camera(mags, vecs, scales, self.cfg)
