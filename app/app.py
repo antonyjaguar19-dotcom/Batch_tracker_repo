@@ -814,10 +814,10 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
         lin = _read_exr_linear(str(f))
         if lin is None:
             return 0
-        # Linear -> sRGB-ish (gamma 2.2) tonemap, clip, 8-bit.
-        disp = _np.clip(lin, 0.0, None)
-        disp = _np.power(disp / (disp.max() if disp.max() > 1.0 else 1.0), 1.0 / 2.2) if disp.max() > 1.0 \
-            else _np.power(_np.clip(disp, 0.0, 1.0), 1.0 / 2.2)
+        # FIXED linear->sRGB-ish (gamma 2.2) tonemap. A per-frame max normalization would
+        # vary exposure frame-to-frame (flicker) and wreck NCC/pattern-lock, so use a fixed
+        # curve on clipped-linear — temporally stable local contrast is what tracking needs.
+        disp = _np.power(_np.clip(lin, 0.0, 1.0), 1.0 / 2.2)
         out8 = _np.clip(disp * 255.0, 0, 255).astype(_np.uint8)
         if ms > 0:
             h, w = out8.shape[:2]
@@ -828,7 +828,7 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
                                    interpolation=_cv2.INTER_AREA)
         outfp = pdir / (f.stem + ".jpg")
         try:
-            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 92])
+            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 95])
             return 1
         except Exception as ex:
             _log(f"EXR proxy write failed for {f.name}: {ex}")
@@ -1729,43 +1729,40 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             plate_w = plate_h = 0
         if plate_w and plate_h:
             data.width, data.height = plate_w, plate_h
-        # Studio flow: TAPNext is mp4-only, so use the user-pointed render — either an
-        # .mp4 file directly, or a JPEG/PNG sequence folder we encode to an mp4.
+        # Prefer a full-res image SEQUENCE (native plate res, no mp4/codec, no downscale).
+        # A user-pointed .mp4 keeps the video route; a user folder or the plate proxies go
+        # in as a sequence so tracking + native-res refine run at true plate resolution.
+        seq_path = ""
         rp = str(getattr(data, "render_path", "") or "").strip()
         if rp and os.path.exists(rp):
             if os.path.isfile(rp) and rp.lower().endswith(".mp4"):
                 video_dir, filename = Path(rp).parent, Path(rp).name
             elif os.path.isdir(rp):
-                mp4 = renders / f"{shot_name}_render.mp4"
-                if render_sequence_to_mp4(rp, str(mp4), logger):
-                    video_dir, filename = mp4.parent, mp4.name
-                else:
-                    logger(f"Skip {shot_name}: could not build mp4 from render '{rp}'.")
+                seq_path = rp
             else:
                 logger(f"{shot_name}: render_path '{rp}' is not an .mp4 or a folder.")
-        if not video_dir:
+        if not video_dir and not seq_path:
             shot_dir = in_root / shot_name
             if shot_dir.exists() and shot_dir.is_dir():
                 mp4s = sorted([p for p in shot_dir.iterdir() if p.suffix.lower() == ".mp4"])
                 if mp4s: video_dir, filename = shot_dir, mp4s[0].name
-        if not video_dir:
+        if not video_dir and not seq_path:
             exact = in_root / f"{shot_name}.mp4"
             if exact.exists(): video_dir, filename = in_root, exact.name
-        if not video_dir:
-            # Auto-render from the plate: reuse the JPG proxies, encode an mp4 keyed by
-            # version into the shot cache, and reuse it on future runs.
+        if not video_dir and not seq_path:
+            # Track the full-res JPG proxy sequence directly — reuses the Mask proxy (no EXR
+            # re-decode), no mp4 encode, native plate resolution.
             pd = str(getattr(data, "plate_dir", "") or "")
             if pd:
-                # Reuse the SAME downscaled JPG proxy Analyse already renders (same cache
-                # key -> no EXR re-decode) and encode the mp4 from it — small + fast + safe.
-                jpgdir = ensure_plate_proxies(pd, cache, logger, max_side=1280)
-                mp4 = renders / f"{shot_name}_{getattr(data, 'version', '') or 'plate'}.mp4"
-                logger(f"{shot_name}: building mp4 from JPG proxy -> {mp4.name}")
-                if render_sequence_to_mp4(jpgdir, str(mp4), logger, max_side=1280):
-                    video_dir, filename = mp4.parent, mp4.name
-        if not video_dir:
-            logger(f"Skip {shot_name}: No video found and could not auto-render the plate. "
-                   f"Point the shot at a render (.mp4 or JPEG folder) in the editor."); continue
+                jpgdir = ensure_plate_proxies(pd, cache, logger)
+                if jpgdir and os.path.isdir(jpgdir):
+                    seq_path = jpgdir
+                    logger(f"{shot_name}: tracking full-res proxy sequence -> {jpgdir}")
+        if not video_dir and not seq_path:
+            logger(f"Skip {shot_name}: no footage. Point the shot at a render (.mp4 or JPEG "
+                   f"folder) in the editor, or set a plate version."); continue
+        if seq_path:
+            filename = shot_name   # scale-key + output naming for the sequence route
 
         tasks = shot_tasks_map.get(shot_name)
         if not tasks:
@@ -1784,7 +1781,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             _set_progress(f"{shot_name} · {task_id}", sel_done, sel_total)
             logger(f"Tracking: {shot_name} | {task_id} | {mode.upper()}")
             cfg = RunnerConfig(
-                input_dir=str(video_dir), output_dir=str(out_root), mask_root_dir=str(out_root),
+                input_dir=(str(video_dir) if video_dir else str(out_root)), output_dir=str(out_root), mask_root_dir=str(out_root),
                 # SAM3 contract: white=keep/track, black=ignore. Derive polarity from that + mode
                 # (inside seeds the white keep-region; outside seeds background, excluding black
                 # movers). Beats "auto" pixel-majority guessing, which flips per-frame and unions to
@@ -1794,7 +1791,9 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 grid_size=int(grid), seeding_mode="features",
                 max_tracks=int(seed_count), min_feature_dist=int(seed_min_dist),
                 flip_y_for_3de=True, selected_files=[filename], selected_scales={filename: float(data.scale.strip('%'))/100.0 if '%' in data.scale else 1.0},
-                out_w=int(plate_w or 0), out_h=int(plate_h or 0),
+                sequence_path=(seq_path or ""), sequence_name=(shot_name if seq_path else ""),
+                # Sequence route is already native plate res; only the mp4-proxy route needs upscaling.
+                out_w=(0 if seq_path else int(plate_w or 0)), out_h=(0 if seq_path else int(plate_h or 0)),
                 frame_start=int(getattr(data, "frame_start", 0) or 0), frame_end=int(getattr(data, "frame_end", 0) or 0),
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),

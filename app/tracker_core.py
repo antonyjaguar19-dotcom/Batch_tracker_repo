@@ -40,6 +40,11 @@ class RunnerConfig:
     # proxy of a larger plate. 0 = coords stay in the tracked (mp4) resolution.
     out_w: int = 0
     out_h: int = 0
+    # Track a full-res image SEQUENCE directly (no mp4). When set, this dir is the input
+    # for one shot; W0/H0 become the plate res so refine runs native and coords are in
+    # plate space (out_w/out_h not needed). sequence_name = the shot name for output.
+    sequence_path: str = ""
+    sequence_name: str = ""
 
     # Frame range (1-based inclusive). 0 = unset => full clip.
     frame_start: int = 0
@@ -927,9 +932,13 @@ class BatchTrackerRunner:
 
     def _run_impl(self):
         os.makedirs(self.cfg.output_dir, exist_ok=True)
-        vids = self._resolve_videos()
-        if not vids:
-            raise RuntimeError("No .mp4 files found (or none selected).")
+        seq_mode = bool(self.cfg.sequence_path)
+        if seq_mode:
+            vids = [self.cfg.sequence_name or os.path.basename(self.cfg.sequence_path.rstrip("/\\"))]
+        else:
+            vids = self._resolve_videos()
+            if not vids:
+                raise RuntimeError("No .mp4 files found (or none selected).")
 
         txt_log, csv_log = self._log_paths()
         ts0 = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -945,8 +954,8 @@ class BatchTrackerRunner:
         for i, fn in enumerate(vids, start=1):
             if self._stop.is_set(): break
             shot_start = time.time()
-            in_path = os.path.join(self.cfg.input_dir, fn)
-            shot = os.path.splitext(fn)[0]
+            in_path = self.cfg.sequence_path if seq_mode else os.path.join(self.cfg.input_dir, fn)
+            shot = fn if seq_mode else os.path.splitext(fn)[0]
             scale = self._scale_for(fn)
 
             try:

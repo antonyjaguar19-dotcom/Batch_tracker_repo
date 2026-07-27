@@ -1,10 +1,41 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Tuple, Dict, Any
+import os
+import re
+from typing import Tuple, Dict, Any, List
 import numpy as np
 import cv2  # type: ignore
 from app.reformat_plate_core import reload_and_rescale_video, _to_rgb_u8, _resize_rgb, _probe_video_hw
+
+# Feeding TAPNext a full-res image SEQUENCE (instead of a downscaled proxy mp4) keeps the
+# tracker + native-res refine at true plate resolution and avoids the mp4 codec entirely.
+_SEQ_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".exr"}
+
+def _seq_frames(path: str) -> List[str]:
+    """Sorted image frames under `path`: the deepest subfolder holding the most images,
+    ordered by trailing frame number (falls back to lexical)."""
+    best, best_n = None, 0
+    for dp, _dn, fns in os.walk(path):
+        imgs = [f for f in fns if os.path.splitext(f)[1].lower() in _SEQ_EXTS]
+        if len(imgs) > best_n:
+            best_n, best = len(imgs), (dp, imgs)
+    if not best:
+        return []
+    dp, imgs = best
+    def _num(f):
+        m = re.search(r"(\d+)$", os.path.splitext(f)[0])
+        return int(m.group(1)) if m else 0
+    return [os.path.join(dp, f) for f in sorted(imgs, key=_num)]
+
+def _read_img_bgr(fp: str, scale: float):
+    """Read one frame -> BGR uint8 at `scale` (UNCHANGED handles 8/16-bit + exr float)."""
+    im = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+    rgb = _to_rgb_u8(im)
+    if rgb is None:
+        return None
+    rgb = _resize_rgb(rgb, float(scale or 1.0))
+    return rgb[..., ::-1]  # RGB -> BGR
 
 def read_video_frames_bgr_scaled(path: str, scale: float = 1.0) -> Tuple[np.ndarray, Dict[str, Any]]:
     scale = float(scale or 1.0)
@@ -99,9 +130,33 @@ class FrameSource:
         self.path = path
         self.scale = scale
         self.stream = bool(stream)
+        self._arr = None
+        self._seq = None
+
+        # --- Image-sequence input (a directory of frames) ---
+        if os.path.isdir(path):
+            self._seq = _seq_frames(path)
+            if not self._seq:
+                raise RuntimeError(f"No image frames in sequence dir: {path}")
+            first = _read_img_bgr(self._seq[0], 1.0)
+            if first is None:
+                raise RuntimeError(f"Could not read first frame in: {path}")
+            self.h0, self.w0, self.fps = int(first.shape[0]), int(first.shape[1]), 24.0
+            self.total = len(self._seq)
+            self.scaled_w = max(1, int(round(self.w0 * scale)))
+            self.scaled_h = max(1, int(round(self.h0 * scale)))
+            if not self.stream:
+                frames = [a for a in (_read_img_bgr(fp, scale) for fp in self._seq) if a is not None]
+                if not frames:
+                    raise RuntimeError(f"No readable frames in: {path}")
+                self._arr = np.stack(frames, axis=0).astype(np.uint8)
+                self.total = int(self._arr.shape[0])
+                self.scaled_h, self.scaled_w = int(self._arr.shape[1]), int(self._arr.shape[2])
+            return
+
+        # --- Video input (mp4/mov via OpenCV) ---
         (h0, w0), fps = _probe_video_hw(path)
         self.w0, self.h0, self.fps = int(w0), int(h0), float(fps)
-        self._arr = None
         if not self.stream:
             arr, meta = read_video_frames_bgr_scaled(path, scale)
             self._arr = arr
@@ -124,15 +179,28 @@ class FrameSource:
     def get(self, start: int, count: int) -> np.ndarray:
         if self._arr is not None:
             return self._arr[int(start):int(start) + int(count)]
+        if self._seq is not None:
+            sel = self._seq[int(start):int(start) + int(count)]
+            out = [a for a in (_read_img_bgr(fp, self.scale) for fp in sel) if a is not None]
+            return np.stack(out, axis=0).astype(np.uint8) if out else np.zeros((0, 0, 0, 3), dtype=np.uint8)
         return read_window_bgr_scaled(self.path, start, count, self.scale)
 
 
 def estimate_clip_bytes(path: str, scale: float = 1.0) -> int:
     """Approx host-RAM bytes to hold the whole clip decoded at `scale` (uint8 BGR)."""
     try:
+        s = float(scale or 1.0)
+        if os.path.isdir(path):
+            seq = _seq_frames(path)
+            if not seq:
+                return 0
+            im = cv2.imread(seq[0], cv2.IMREAD_UNCHANGED)
+            if im is None:
+                return 0
+            h0, w0 = im.shape[:2]
+            return int(len(seq) * round(h0 * s) * round(w0 * s) * 3)
         (h0, w0), _ = _probe_video_hw(path)
         n = _probe_total_frames(path)
-        s = float(scale or 1.0)
         return int(n * round(h0 * s) * round(w0 * s) * 3)
     except Exception:
         return 0
