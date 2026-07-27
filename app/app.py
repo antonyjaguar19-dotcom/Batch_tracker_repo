@@ -1712,6 +1712,23 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
         # Renders persist in the shot's own cache folder (studio tree) and are reused.
         cache = shot_cache_dir(getattr(data, "studio_dir", ""), str(out_root), shot_name)
         renders = Path(cache) / "renders"
+        # True plate resolution: the mp4 fed to TAPNext is a downscaled proxy, so the
+        # tracker must export coords at the full plate size (else they land in a corner).
+        _pd0 = str(getattr(data, "plate_dir", "") or "")
+        plate_w = plate_h = 0
+        try:
+            if _pd0 and os.path.isdir(_pd0):
+                _imgs = sorted(f for f in os.listdir(_pd0)
+                               if os.path.splitext(f)[1].lower() in _SEQ_EXTS)
+                if _imgs:
+                    import cv2 as _cv2
+                    _im = _cv2.imread(os.path.join(_pd0, _imgs[0]), _cv2.IMREAD_UNCHANGED)
+                    if _im is not None:
+                        plate_h, plate_w = int(_im.shape[0]), int(_im.shape[1])
+        except Exception:
+            plate_w = plate_h = 0
+        if plate_w and plate_h:
+            data.width, data.height = plate_w, plate_h
         # Studio flow: TAPNext is mp4-only, so use the user-pointed render — either an
         # .mp4 file directly, or a JPEG/PNG sequence folder we encode to an mp4.
         rp = str(getattr(data, "render_path", "") or "").strip()
@@ -1777,6 +1794,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 grid_size=int(grid), seeding_mode="features",
                 max_tracks=int(seed_count), min_feature_dist=int(seed_min_dist),
                 flip_y_for_3de=True, selected_files=[filename], selected_scales={filename: float(data.scale.strip('%'))/100.0 if '%' in data.scale else 1.0},
+                out_w=int(plate_w or 0), out_h=int(plate_h or 0),
                 frame_start=int(getattr(data, "frame_start", 0) or 0), frame_end=int(getattr(data, "frame_end", 0) or 0),
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
