@@ -1,48 +1,50 @@
-Logs
-[10:11:27] --- Starting Step 2: Analysis & Decision ---
-[10:11:48] Running Qwen2 Visual Description...
-[10:11:48] Analyzing 1 selected shot(s): WLF0070
-[10:11:48] Starting… (offline mode enabled)
-[10:11:48] Run started: 2026-07-27T10:11:48
-[10:11:48] IN : 
-[10:11:48] OUT: D:\Jefrin\batch_tracker_v001_starter\runtime\_work\HOTB\_batches\batch_20260727_101127
-[10:11:48] Model (local): D:\Jefrin\batch_tracker_v001_starter\pipeline\qwen\models\Qwen2.5-VL-7B-Instruct
-[10:11:48] FPS preset: 4
-[10:11:48] Int4: True
-[10:24:59] Model loaded. Precision: bnb-nf4
-[10:24:59] Using 1 explicit per-shot plate dir(s).
-[10:24:59] Restricted to 1 selected shot(s).
-[10:24:59] [1/1] WLF0070
-[10:24:59]   - Image sequence detected -> converting to temp mp4 (OpenCV)…
-[10:26:12] Freed Qwen2.5-VL from VRAM.
-[10:26:12] Done. Wrote JSON: D:\Jefrin\batch_tracker_v001_starter\runtime\_work\HOTB\_batches\batch_20260727_101127\shot_descriptions.json
-[10:26:12] Building mask guidance (Qwen signals + deterministic heuristics)...
-[10:26:12] Merged 1 manual requirement note(s) into analysis.
-[10:26:12] Analysis Complete.
-[10:26:12] published analysis -> \\liv1\shows\HOTB\WLF0070\mid\cmm\bot_tracks\analysis
-System: reloading mask_guidance.json
-[10:30:28] --- Starting Step 3: Mask Generation ---
-[10:30:28] VRAM freed (before SAM3): 0.09 -> 0.09 GB reserved
-[10:30:29] Generating 283 JPG proxy frame(s) from EXR (full-res, 8 threads) → \\liv1\shows\HOTB\WLF0070\mid\cmm\bot_tracks\cache\_proxies\6d86f532517d4d6c
-[10:32:34] Proxy generation done: 283/283 frame(s).
-[10:32:34] Generating masks for 1 selected shot(s).
-[10:32:34] CV motion backstop: ON
-[10:32:34] Loading Ultralytics SAM3… (first time can take a while)
-[10:32:34] Loading Ultralytics SAM3… (first time can take a while)
-[10:32:37] Shot: WLF0070 | task=camera
-[10:32:37] Shot: WLF0070 | task=camera
-[10:32:37]   frames_dir: \\liv1\shows\HOTB\WLF0070\mid\cmm\bot_tracks\cache\_proxies\6d86f532517d4d6c
-[10:32:37]   track_mode: track_outside_mask
-[10:32:37]   mask_mode : include
-[10:32:37]   include   : []
-[10:32:37]   exclude   : ['man', 'tree branches']
-[10:32:37]   motion backstop: ON (mask pixels moving independently of camera)
-[10:37:22] All shots complete.
-[10:37:22] All shots complete.
-[10:37:23] VRAM freed (after SAM3): 6.76 -> 0.09 GB reserved
-[10:37:23] Masking Complete.
-[10:37:43] published 283 mask file(s) -> \\liv1\shows\HOTB\WLF0070\mid\cmm\bot_tracks\masks
-DONE_MASKING
-[10:50:01] --- Starting Step 5: Tracking ---
-[10:50:01] ERROR in Tracking: Input folder does not exist.
+[11:10:45] --- Starting Step 5: Tracking ---
+[11:10:45] Tracking backend: SynthEyes
+[11:10:45] SE: OK  SyPy3 found: C:/Program Files/BorisFX/SynthEyes 2025.5\SyPy3
+[11:10:45] Starting a clean SynthEyes instance for this batch…
+[11:10:46] SE:    No existing SynthEyes instance found.
+[11:10:46] SE: -> Launching SynthEyes...
+[11:10:46] SE:    Launched; giving 3s to spawn, then polling for the listener...
+[11:10:49] SE: -> Connecting port=2222 (up to 60s)...
+[11:10:49] SE: OK  Connected - SynthEyes 2025.2.3399 (after 1 tries)
+[11:10:50] Tracking (SynthEyes): WLF0070 | camera | tracks=800 | matte=yes
+[11:10:50] SE: 
+=======================================================
+[11:10:50] SE:   Processing: WLF0070
+[11:10:50] SE:   Max Tracks: 800
+[11:10:50] SE:   Output:     D:\Jefrin\batch_tracker_v001_starter\runtime\_work\HOTB\WLF0070__syntheyes.txt
+[11:10:50] SE: =======================================================
+[11:10:50] SE:    OK  Writable folders -> D:\Jefrin\batch_tracker_v001_starter\runtime\_work\HOTB
+[11:10:50] SE: -> Creating IFL (283 frames)...
+[11:10:50] SE: -> Loading sequence via IFL...
+[11:10:51] SE:    OK  Validated shot RAM cache
+[11:10:51] SE:    Waiting 5s for image plane to load...
+[11:10:57] SE:    Frames: 977-1259 (283 total)
+[11:10:57] SE: -> Switching to Features room (via TopTabber tab click)...
+[11:10:58] SE:    TopTabber found: 929x20 px - sweeping for Features tab
+[11:11:01] SE:    OK  Features room reached via TopTabber click at x=195
+[11:11:01] SE:    Features: count=800, threshold=0.02, separation=8
+[11:11:01] SE: -> Bringing SynthEyes foreground for panel clicks...
+[11:11:02] SE: -> Blip All frames (Win32 PostMessage)...
+[11:11:02] SE:    OK  Win32 click 'Blips all frames'
+[11:11:03] SE:    blipping 283 frames... (waiting for completion signal)
+[11:11:06] SE:    Blip All: complete at ~3.6s (dialog gone + CPU idle)
+[11:11:06] SE: -> Peel All (Win32 PostMessage)...
+[11:11:06] SE:    OK  Win32 click 'Peel All'
+[11:11:07] SE:    peeling... (waiting for completion signal)
+[11:11:10] SE:    Peel All: complete at ~3.2s (dialog gone + CPU idle)
+[11:11:10] SE: -> Clearing blips...
+[11:11:10] SE:    OK  Win32 click 'Clear all blips'
+[11:11:11] SE: -> Exporting 2D tracks via Sizzle...
+[11:11:11] SE:    OK  SyPy3 socket resynced for export
+[11:11:14] SE:    OK  Sizzle export -> WLF0070__syntheyes.txt (0 trackers)
+[11:11:14] SE:    WARNING: Sizzle export returned no trackers
+[11:11:14]   DONE: WLF0070/camera — 0 trackers
+[11:11:18] SE:    OK  RAM cache flushed
+[11:11:18] SE:    OK  Undo history flushed
+[11:11:18] Closing SynthEyes...
+[11:11:18] SE:    Terminating SynthEyes PID 4924...
+[11:11:19] SE:    SynthEyes terminated. Waiting 3s...
+[11:11:22] Tracking Complete.
+[11:11:22] published tracks -> \\liv1\shows\HOTB\WLF0070\mid\cmm\bot_tracks\WLF0070_2Dtracks__syntheyes.txt
 DONE_TRACKING
