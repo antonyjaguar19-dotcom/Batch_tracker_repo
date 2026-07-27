@@ -81,6 +81,10 @@ class RunnerConfig:
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
     w_stability: float = 0.2       # small max single-frame jump -> no teleports
 
+    # --- Bad-track filter (drop jittery/jumpy mistracks before export; plate px) ---
+    filter_max_jump_px: float = 0.0     # drop track if any single-frame jump > this (0 = off)
+    filter_max_jitter_px: float = 0.0   # drop track if mean |dvelocity| jitter > this (0 = off)
+
     # --- Moving-tile native re-track (post-selection, BEFORE pattern_refine) ---
     # TAPNext runs at 256px, so on a 4K plate the whole frame is squashed ~15x and the
     # coarse position lands several px off the real feature. NCC alone can't fix that
@@ -638,6 +642,9 @@ class BatchTrackerRunner:
                             sx += x_val; sy += y_val
 
                 if len(valid_pts) > 1:
+                    if self._bad_track(valid_pts):
+                        diag_short += 1   # dropped: too jittery/jumpy
+                        continue
                     n = len(valid_pts)
                     candidates.append({
                         "id": out_id,
@@ -655,6 +662,31 @@ class BatchTrackerRunner:
         total_kept = len(final_tracks_out)
 
         return final_tracks_out, total_kept, total_candidates, diag_after_filter, diag_after_gate, diag_short
+
+    def _bad_track(self, pts: List[Tuple[int, float, float]]) -> bool:
+        """True if a track is too jittery or jumpy (plate px), per the user thresholds.
+        Self-consistency signals only (a fast but SMOOTH high-parallax point passes).
+        Returns False when both thresholds are 0 (filter off) or the track is too short."""
+        jmax = float(getattr(self.cfg, "filter_max_jump_px", 0.0) or 0.0)
+        jit_thr = float(getattr(self.cfg, "filter_max_jitter_px", 0.0) or 0.0)
+        if jmax <= 0.0 and jit_thr <= 0.0:
+            return False
+        n = len(pts)
+        if n < 3:
+            return False
+        vels = []
+        for i in range(n - 1):
+            dt = max(1, pts[i + 1][0] - pts[i][0])
+            d = math.hypot(pts[i + 1][1] - pts[i][1], pts[i + 1][2] - pts[i][2])
+            vels.append(d / dt)
+        max_jump = max(vels) if vels else 0.0
+        jitter = (sum(abs(vels[k + 1] - vels[k]) for k in range(len(vels) - 1)) / (len(vels) - 1)
+                  ) if len(vels) > 1 else 0.0
+        if jmax > 0.0 and max_jump > jmax:
+            return True
+        if jit_thr > 0.0 and jitter > jit_thr:
+            return True
+        return False
 
     def _track_quality_score(self, pts: List[Tuple[int, float, float]], T: int, diag: float) -> float:
         """Per-track quality in ~[0,1] from the track's OWN trajectory only.

@@ -1796,6 +1796,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 out_w=(0 if seq_path else int(plate_w or 0)), out_h=(0 if seq_path else int(plate_h or 0)),
                 frame_start=int(getattr(data, "frame_start", 0) or 0), frame_end=int(getattr(data, "frame_end", 0) or 0),
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
+                filter_max_jump_px=float(getattr(state, "filter_max_jump_px", 0.0) or 0.0),
+                filter_max_jitter_px=float(getattr(state, "filter_max_jitter_px", 0.0) or 0.0),
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
                 max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
                 enable_moving_tile=bool(getattr(state, "moving_tile", True)),
