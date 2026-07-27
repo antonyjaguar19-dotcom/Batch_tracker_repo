@@ -1983,9 +1983,14 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
             logger("No shots selected. Tick the 'Use' box on at least one shot, then retry.")
             JOB_QUEUE.put("DONE_TRACKING")
             return False
-        in_root = Path(in_dir) if in_dir else None
+        # Studio flow tracks from each shot's per-shot plate_dir, so the legacy Input
+        # Folder is optional; only require it when NO selected shot has a plate_dir.
+        in_root = Path(in_dir) if in_dir else Path("")
         out_root = Path(out_dir) if out_dir else None
-        if not in_root or not in_root.exists(): raise RuntimeError("Input folder does not exist.")
+        has_plate = any(getattr(d, "use", False) and getattr(d, "plate_dir", "")
+                        for d in state.shots_data.values())
+        if not has_plate and (not in_dir or not in_root.exists()):
+            raise RuntimeError("Input folder does not exist (and no per-shot plate dir set).")
         if not out_root: raise RuntimeError("Output folder is empty.")
         out_root.mkdir(parents=True, exist_ok=True)
 
