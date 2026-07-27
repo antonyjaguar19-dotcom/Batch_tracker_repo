@@ -36,6 +36,10 @@ class RunnerConfig:
     flip_y_for_3de: bool = True
     selected_files: List[str] | None = None
     selected_scales: Dict[str, float] | None = None
+    # True plate resolution to export coords in, when the tracked mp4 is a downscaled
+    # proxy of a larger plate. 0 = coords stay in the tracked (mp4) resolution.
+    out_w: int = 0
+    out_h: int = 0
 
     # Frame range (1-based inclusive). 0 = unset => full clip.
     frame_start: int = 0
@@ -586,7 +590,17 @@ class BatchTrackerRunner:
 
             x_all = (xy_raw[:, :, 0].astype(np.float32) * float(inv))
             y_all = (xy_raw[:, :, 1].astype(np.float32) * float(inv))
-            if self.cfg.flip_y_for_3de and H0 > 0: y_all = (float(H0 - 1) - y_all)
+            # If the tracked mp4 was a downscaled proxy, map coords up to the true plate
+            # resolution so they overlay the full plate (else they'd sit in a corner).
+            ow = int(getattr(self.cfg, "out_w", 0) or 0)
+            oh = int(getattr(self.cfg, "out_h", 0) or 0)
+            if ow > 0 and oh > 0 and W0 > 0 and H0 > 0:
+                x_all = x_all * (ow / float(W0))
+                y_all = y_all * (oh / float(H0))
+                flip_h = float(oh)
+            else:
+                flip_h = float(H0)
+            if self.cfg.flip_y_for_3de and flip_h > 0: y_all = (flip_h - 1.0) - y_all
 
             # Pre-mask any immediate NaNs/Infs that the tracker leaked
             vis_bool = vis_raw.astype(bool) & ~np.isnan(x_all) & ~np.isnan(y_all) & ~np.isinf(x_all) & ~np.isinf(y_all)
