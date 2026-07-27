@@ -1,0 +1,418 @@
+# Decision Log
+
+Chronological record of notable engineering decisions and why they were made.
+Newest first. Dates are absolute.
+
+---
+
+## 2026-07-13
+
+### TAPNext++: periodic re-seeding (track replenishment on fast/low-angle shots)
+- **What**: a single frame-0 seed leaves the frame uncovered once those points sweep out
+  (fast/low-angle shots: close FG exits in a few frames -> FG untracked the rest of the clip).
+  The chunked path already seeds FRESH features per window; re-seeding **bounds the window to
+  `reseed_every` frames** (`tracker_core._run_impl`, right after `_decide_chunks`: force
+  `n_chunks >= ceil(T/reseed_every)`, capped by `reseed_max_windows`). So fresh features are
+  seeded at least that often, reusing the existing seed->carry->merge->filter->gate->spread
+  machinery — re-seeded tracks are mover-gated + motion-filtered + quality-selected like any
+  other (no separate path). New `RunnerConfig.enable_reseed` (default True), `reseed_every` 30,
+  `reseed_max_windows` 40; `AppState.reseed`/`reseed_every`; NiceGUI switch + interval slider.
+- **ORGANIC per-window seed budget** (`_chain_core`): a fixed `max_tracks` fresh seeds PER
+  WINDOW multiplied by the window count (`max_tracks * T/reseed_every`) is what saturated the
+  machine on a fast 4K/1440p shot (NOT a memory bug -- the box has 126G free; host RAM peaked
+  ~16G). Replaced with a resolution-scaled density: `fresh_cap = clamp(reseed_density_per_mp *
+  megapixels, reseed_seed_floor, max_tracks)` (defaults 60/MP, floor 64). TOTAL = cap *
+  n_windows scales linearly with the FRAME RANGE (n_windows = T/reseed_every) and with
+  resolution -- re-seeding REDISTRIBUTES a shot-sized budget over time instead of stacking N per
+  window. `max_tracks` is now only the upper bound; goodFeatures still returns fewer on
+  low-texture frames (content-organic). Verified: full-range SH013 with `max_tracks=1200` (the
+  config that previously froze the box) now completes -- ~221 seeds/window, 244 tracks, RAM flat.
+  Also: moving-tile + pattern-refine now SHARE one native decode (reuse the tracking FrameSource
+  at scale 1.0) instead of three concurrent full decodes.
+- **Why / proof**: validated against a **manual artist track** on SH013 (fast motocross
+  whip-pan, 2562x1440, real motion blur; `Tracks_Shot_13.txt`, 62 tracks). Real bot output
+  (frames 1-150, re-seed on, full pipeline) vs the artist:
+  - **continuity**: 149 tracks (mean 86f, 112 >=50f) vs 54 (mean 60f, 24 >=50f).
+  - **scatter**: 85 live tracks/frame vs 22; grid-coverage 30.6% vs 29.8% (matched); bot
+    vertical spread narrower (113px vs 189px) — artist still catches some lower grass features.
+  - **accuracy** (seeded at 28 manual points): moving-tile+NCC median **2.8px**, p90 20.5px
+    (a few drift outliers to ~260px on the fastest blur). No mover/junk tracks (bike correctly
+    rejected by the motion filter + spread-quality — the raw experiment harness, which bypassed
+    those filters, showed floating mover tracks; the real pipeline does not).
+- **Not wired**: motion-blur "matched-kernel bank" — proved on synthetic (+69%) but regressed
+  on every real plate (velocity/screen-motion != image blur; jitter up, tracks slide). Cepstral
+  kernel estimation too noisy per-patch on real footage. Blur effort shelved; needs image-based
+  kernel estimation to be viable. See `experiments/moving_tile/` (blur_*, reseed_*, eval_*).
+
+---
+
+## 2026-07-10
+
+### TAPNext++: edge tracking + strict disappear/reappear (gap-aware refine)
+- **What**: two accuracy fixes on the moving-tile/NCC refine path.
+  1. **Edge tracking** (`mt_edge_track`, default on). `pattern_refine._ncc_match` now **clamps**
+     its search window to the frame at the border instead of returning `None` (which trimmed edge
+     frames); only bails when the patch itself can't fit. `moving_tile_refine._retrack_one`
+     **accepts** a tile-edge position when the tile is clamped against the frame on the exit side
+     (the point is at the real border, not lost) and breaks only on an unclamped-side escape. Net:
+     points track right up to the frame border — the edge tracks that anchor lens/solve corners.
+  2. **Gap-aware refine** (`refine_gap_aware`, default on). A disappear→reappear point already
+     survives as one 3DE-gapped track (TAPNext is recurrent; `_merge_filter_export` omits hidden
+     frames; the jump filter ignores across-gap displacement). But `_refine_one` anchored ONE patch
+     and refined outward across the whole track, so at the occlusion gap the stale pre-occlusion
+     patch failed NCC and **trimmed the entire reappeared segment**. Now `_refine_one` splits the
+     track into **contiguous visible segments**, refines each on its **own** sharpest-frame anchor
+     (= re-acquire), and reassembles under **one** id; a segment that won't refine keeps its
+     original points. The returning point is kept + re-acquired, never trimmed away.
+- **Why**: artist request — edge features were dropping early, and occluded-then-returning points
+  need to stay one continuous track. Per the artist's call: keep the returning point as one track
+  (no split/drop) and bridge occlusions of any length, so gap-aware has no NCC bridge-gate.
+- **Config**: `RunnerConfig.mt_edge_track`, `refine_gap_aware`; `AppState.edge_track`,
+  `gap_aware_refine`; two NiceGUI switches ("Track to frame edge", "Keep disappear/reappear as one
+  track"). Both default to the new behavior.
+- **Proof**: deterministic unit checks (`experiments/moving_tile/_verify_edge_occlusion.py`) — NCC
+  edge-clamp returns an exact border match where the old code returned `None`; gap-aware keeps both
+  segments of a gapped track. End-to-end on SH011 through the real `BatchTrackerRunner`: exports
+  cleanly, 20 tracks (was 19 — a previously-trimmed track kept).
+
+---
+
+### TAPNext++: moving-tile native re-track before NCC (4K accuracy)
+- **What**: new `app/moving_tile_refine.py`, run in `tracker_core._run_impl` right AFTER
+  spread-selection and BEFORE `pattern_refine`. For each selected track it cuts a **native
+  256×256 crop that follows the coarse path** (window by window, re-centred on the coarse
+  guide via `mt_window` 16 / `mt_edge_margin` 40) and re-runs TAPNext on that crop, so the
+  model sees full-resolution pixels instead of the whole frame squashed to 256. Non-destructive:
+  track count and length are preserved (frames the tile can't reach keep their coarse value);
+  `pattern_refine` still does the trimming/gating afterwards. Native BGR frames via
+  `video_io.FrameSource` (full-decode if it fits `host_ram_frac`, else streamed). New
+  `RunnerConfig.enable_moving_tile` (default True), `mt_window`, `mt_edge_margin`;
+  `AppState.moving_tile`; UI switch "Moving-tile native re-track (4K accuracy)".
+- **Why**: TAPNext is fixed 256px, so on a 4K plate the frame is squashed ~15× and the coarse
+  position lands several px off the real feature. NCC alone can't fix that — its search box
+  centres on the coarse point, so a far-off start makes it lock the WRONG nearby patch.
+  **Measured vs 17 manual artist tracks on a 4K plate (mean px deviation)**: baseline
+  whole-frame 4.88 · baseline+NCC (old bot) 4.03 · moving-tile 2.46 · **moving-tile+NCC 1.30**
+  (3× closer, and worst-frame 5.9px vs 26px — no solve-breaking drifts). NCC alone even
+  *regressed* several strong features (trk04 1.6→5.1, trk08 6.7→9.4). Moving-tile supplies the
+  accurate start NCC needs.
+- **Also**: `refine_motion` default flipped `affine` → **`translation`**. With moving-tile placing
+  the point accurately, affine's extra rot/scale DoF only added wobble on pan/translation-dominant
+  plates (measured jitter regression 0.60→1.02px). Set back to `affine`/`euclidean` for shots with
+  real camera roll or zoom.
+- **Proof**: isolated eval harness under `experiments/moving_tile/` (staged v0→v7 ablation +
+  ground-truth deviation vs `Tracks_Shot_01.txt`). Verified end-to-end through the real
+  `BatchTrackerRunner` on SH011 (moving-tile stage runs, exports valid 3DE `.txt`).
+
+---
+
+## 2026-07-08
+
+### TAPNext++: 3DE-style NCC + affine pattern lock at native resolution
+- **What**: new `app/pattern_refine.py`, run in `tracker_core._run_impl` right before export,
+  on the (few) spread-selected tracks. Re-tracks each point like a 3DE pattern-box/search-box
+  tracker: anchor a reference patch at the track's **highest-contrast frame** (min-eigenvalue of
+  the structure tensor), refine **outward both directions**; per frame NCC template-match
+  (`matchTemplate` TM_CCOEFF_NORMED) at **full resolution** in a search box centred on TAPNext's
+  coarse position, sub-pixel parabola peak, then **affine ECC** (`findTransformECC`, MOTION_AFFINE)
+  for rotation/scale. Correlation gating = **hybrid re-reference** (re-grab the patch when corr sags
+  below `refine_ncc_reref` 0.85) + **trim on lost** (cut the track where corr < `refine_ncc_lost`
+  0.60). New `RunnerConfig`: `enable_pattern_refine`, `refine_patch_px` 31, `refine_search_px` 24,
+  `refine_ncc_lost/reref`, `refine_motion="affine"`, `refine_min_len` 8. UI: "3DE-style pattern
+  lock" switch + "Pattern box (px)" slider (`AppState.pattern_refine/ refine_patch_px`).
+- **Why**: user's reference `3de track.txt` is a 173-frame, ~12-decimal, sub-pixel-smooth 4K track
+  from 3DE's pattern/search-box tracker. TAPNext is fixed **256px** — on a 4K plate 1 model px ≈
+  8–15 real px, so it is coarse AND locks to a learned point, not the actual contrast patch; no
+  filter fixes a precision ceiling. Letting TAPNext only **centre the search box** and letting a
+  full-res contrast patch decide the sub-pixel position gives 3DE-grade lock while keeping TAPNext's
+  robustness for large motion / re-acquisition. Runs post-selection so it's only ~tens of tracks.
+- **Note**: verified on synthetic texture — NCC sub-pixel 0.08px; affine ECC recovers centre through
+  4° rotation to 0.05px; full refine of a 20-frame drift = mean **0.02px** / max 0.03px error; and it
+  correctly **trims** at the frame where a bad coarse guide loses the pattern (found + fixed the ECC
+  centre-mapping sign via this test). Chose hybrid re-reference + trim + affine per the artist. Still
+  to eyeball: real 4K plate + timing (full-decode-to-gray vs streamed per-frame LRU in `_FrameGray`).
+
+### TAPNext++: quality-ranked, evenly-spread track selection (kill the 4× dup dump)
+- **What**: added a post-pass selection stage in `app/tracker_core.py:_merge_filter_export` —
+  the single funnel both the single-block and chunked paths already call. It now pools every
+  filtered+gated survivor from all passes, scores each (`_track_quality_score`), then greedily
+  accepts the strongest tracks that stay ≥ `spread_min_dist_px` apart (`_select_spread`).
+  New `RunnerConfig` fields (`enable_spread_select`, `spread_min_dist_px=40`, `max_output_tracks=0`,
+  `w_coverage/ w_smoothness/ w_stability`); UI slider "Track spacing (px)" + "Max tracks" wired via
+  `AppState.track_spacing_px/ track_max_output` → `_track_shots_tapnext`.
+- **Why**: the tracker had **no** ranking, **no** dedup, **no** output cap. The 4 passes
+  (FWD/BWD/MID_F/MID_B) each seed independently on the same frame → up to ~4× duplicate tracks,
+  concatenated raw → thousands of clumped, redundant, mixed-quality tracks. Goal: 10s–100s of the
+  best, evenly spread across the whole tracking region at all frames, count floating with camera
+  motion. Greedy min-spacing (spacing ≫ any duplicate offset) collapses the pass dups implicitly,
+  so it doubles as dedup; `spread_min_dist_px` is the only density dial (small=dense, large=sparse).
+- **PARALLAX-SAFE**: the score judges each track on its **own** trajectory only (coverage,
+  own-path jitter, own max-jump) — deliberately **no** agreement-with-global-motion term, which
+  would rank down correct foreground parallax and gut the camera solve. The one global-motion
+  test (`_post_filter_tracks.min_motion_inlier_ratio`) stays at its low 0.10 floor, not raised.
+- **Note**: verified in isolation (synthetic tracks) — smooth fast parallax scores 0.97 vs a
+  jittery mistrack 0.67; 4 dups collapse to 1; within-spacing weaker track rejected; spacing dial
+  and cap honored. Still to eyeball on a real plate in 3DE: spread evenness + early/late-frame
+  coverage from the mid-seeded passes.
+
+### TAPNext++ tracks were sliding — wrong video norm + swapped x/y
+- **What**: fixed two `app/tapnext_engine.py` bugs that made every TAPNext track ignore image
+  content (points slid uniformly, seed frame correct then drift). (1) Video fed to the model
+  normalized to **[-1,1]** (`frames/255*2-1`), was [0,1]. (2) `query_points` are **`[t, y, x]`**
+  and predicted tracks return **`[y, x]`** (256px) — the wrapper used `[t,x,y]`/`[x,y]`, so x/y
+  were swapped. `_q_to_256`/`_tracks_from_256` now swap axes at the boundary.
+- **Why**: both conventions are what `tapnet/tapvid/evaluation_datasets` (the model's own eval
+  pipeline) uses; feeding anything else = garbage. Confirmed by a synthetic moving-dot test (pred
+  follows the dot exactly) after the ground-truth 3DE compare pointed at seed-right-then-drift.
+- **Note**: the 256² model on a 4K plate still downscales hard; sub-pixel precision on 4K is the
+  remaining thing to eyeball in 3DE.
+
+### SynthEyes 2026.2.4679: drive it via Win32 + Sizzle (shipped SyPy3 is broken)
+- **What**: `app/syntheyes_engine.py` now tracks end-to-end on build 2026.2.4679 by bypassing the
+  broken SyPy3 return-value protocol. Reach the Features room by **Win32 PostMessage-clicking the
+  `TopTabber` room tab** (`SetRoom` no-ops AND desyncs the socket); fire **Blips-all / Peel-all /
+  Clear** by PostMessage to the `Butt` panel children (found by `GetWindowText`, work backgrounded);
+  **export via a `//SIZZLET` RunScriptFile** script (`openout`+`printf` → 3DE 2D-track ASCII — the
+  `//SIZZLET` header is REQUIRED or RunScriptFile silently no-ops); **resync the socket** (fresh
+  `OpenExisting`) right before export; **gate SAM3 masks as a Python post-filter** (sample each
+  point: white=keep/black=drop, truncate the frozen tail), not the fragile roto matte.
+- **Why**: on 2026.2.4679 every SyPy3 write (SetRoom/blip/peel/menu-export) no-ops and leaves the
+  socket desynced, so the old path produced ~1 tracker + "file not found". Win32/Sizzle touches the
+  real UI + writes tracks server-side, sidestepping the protocol bug.
+- **Note**: verified SH012 = 120 trackers × ~10 frames (~10 = **SynthEyes Pro DEMO** track cap;
+  re-verify length on a full license, same code). Sizzle syntax from the install's own
+  `scripts/tdexport.szl`/`trkpath.szl` + `Documentation/SizzleManual.pdf`.
+
+---
+
+## 2026-07-07
+
+### Replaced CoTracker3 with TAPNext++ as the secondary (GPU) tracking backend
+- **What**: removed all CoTracker3 components (`app/cotracker_engine.py`, vendored
+  `pipeline/co-tracker-main/`, `scaled_offline.pth`, `*__cotracker3_bidir.txt`) and replaced them
+  with **TAPNext++** (google-deepmind/tapnet) in new `app/tapnext_engine.py`. SynthEyes stays the
+  **primary** backend; TAPNext++ is the secondary GPU fallback (`track_backend` value `cotracker`
+  → `tapnext`; legacy value auto-migrates). Output files now `<shot>__tapnext.txt`. `TapNextEngine`
+  keeps the exact `track_grid`/`track_queries` interface, so `tracker_core.py` seeding / 4-pass merge /
+  SAM3 gating / filtering / 3DE export is unchanged.
+- **Why**: **CoTracker3 is CC-BY-NC 4.0 (non-commercial)** — a blocker for paid VFX work. TAPNext++
+  is **Apache-2.0** (commercial OK), ships a native PyTorch checkpoint (`tapnextpp_ckpt.pt`), and is
+  stronger for matchmove (40× longer stable tracks, tracks through occlusion, re-detection).
+- **How / gotchas**: TAPNext++ is a **fixed 256×256** model and **causal/streaming** (next-token).
+  The wrapper absorbs both: resize frames to 256² in and rescale predicted coords back to the caller's
+  frame space; seed queries at block frame 0 then feed one frame at a time carrying the recurrent
+  `state`. `tracker_core` already reverses frames for BWD/MID passes, so a single forward stream covers
+  every pass. TAPNext has no grid mode → `track_grid` synthesizes a uniform grid gated by the SAM3
+  inclusion mask. Checkpoint resolver: `pipeline/tapnext-main/checkpoints/` → `<repo>/checkpoints/` →
+  env `BTR_TAPNEXT_CKPT`. **Open verify item**: 256² on 4K plates — confirm sub-pixel precision is
+  acceptable on the GPU box, and confirm video normalization ([0,1] RGB per the torch demo).
+
+---
+
+## 2026-07-06
+
+### SynthEyes 2026 automation: SyPy3 API is broken → drive it via Win32 UI + Sizzle
+- **What**: proved a fully-automated, background-capable SynthEyes 2026 tracking pipeline that
+  does NOT use the SyPy3 return-value API (it is broken on build 2026.2.4679 — see below):
+  1. **SyPy3** only for the calls that work (launch, `NewSceneAndShot` via IFL, `SetRoom`).
+  2. **Win32 `PostMessage`** clicks on SynthEyes' `Butt` child windows (found by `GetWindowText`)
+     to run **Blips all frames** + **Peel all** — works even with the window at `HWND_BOTTOM`
+     (backgrounded), and is resize-robust (buttons located by name, not pixels).
+  3. **Export** via a Sizzle `//SIZZLET` tool script run with `RunScriptFile` using
+     **`openout(path)` + `printf`** to write the 3D Equalizer 2D-track `.txt` DIRECTLY (the
+     export menu is custom-drawn and unreachable via the API).
+  4. **SAM3 gating in Python** (post-export): sample each mask at each tracker point, drop points
+     on movers. Chosen over SynthEyes roto automation (fragile file-dialog + polarity guessing).
+- **Why**: SyPy3's `Sync()`/`RecvSzl()` return-value protocol desyncs against 2026.2.4679 —
+  attribute reads, `ActionID`, `Actions()` enumeration, `Call()` returns all fail intermittently
+  ("list index out of range"). Only plain `Run()`-based calls work. This blocked every normal
+  automation path (blip/peel dispatch, export, tracker read-back), so we route around it entirely.
+  Full detail + reference scripts in the session memory `syntheyes-2026-headless-status`.
+- **Note**: test build was **SynthEyes Pro DEMO 2026** — the demo caps real track length at
+  ~10 frames (uniform, artificial; the "AUTO" full pipeline incl. coalesce gives the identical
+  cap). This is a **demo limitation, not the pipeline** — re-verify on the full license.
+  Reference impl lives in scratchpad (`se_final.py`, `sam3_filter.py`); not yet wired into
+  `app/worker_track` as a `track_backend="syntheyes_ui"` path (TODO, post-license).
+
+### SAM3 mask filenames renamed `####_alpha.png` → `mask_####.png` (SynthEyes-readable)
+- **What**: `pipeline/sam3/sam3_runner.py` now writes `mask_<stem>.png` / `preview_<stem>.png`
+  (frame number **trailing**) instead of `<stem>_alpha.png` / `<stem>_preview.png`.
+- **Why**: SynthEyes detects a numbered image sequence only when the varying digits are the
+  trailing token (`name_####`, e.g. its own `DCP_####.JPG`); the old digits-first form couldn't
+  be loaded as a sequence via `+Alpha`. Polarity was already correct (white=track, black=exclude,
+  matching SynthEyes) — no invert needed.
+- **Note**: safe because downstream readers use **sorted order**, not the filename
+  (`tracker_core.get_global_mask_idx` indexes a `files.sort()`ed list; the reuse check is an
+  existence glob). Both naming schemes sort identically by zero-padded frame number.
+
+### SAM3 `mask_dilation_px` — Mask ML-style edge dilation
+- **What**: new `RunnerConfig.mask_dilation_px` (default `0` = off). When >0, the final merged
+  mask's EXCLUDE (black/mover) region is grown by N px via `cv2.erode(alpha_keep)` before writing.
+- **Why**: mirrors SynthEyes Mask ML's "Mask Dilation" — keeps auto-trackers off soft edges
+  (hair, motion-blur fringes). SAM edges are tight; ~8–15 px matches SynthEyes tracking behavior.
+  Independent of the existing `motion_dilate_px` (which dilates only the CV-motion-backstop movers).
+
+## 2026-06-23
+
+### VRAM/RAM-safe CoTracker — chained chunking + OOM retry + streamed decode
+- **What**: long and/or high-res shots no longer OOM. New levers in `app/tracker_core.py`:
+  - **Temporal chunking** — a shot is tracked in N overlapping windows whose track IDs are
+    **chained across the seams** (overlap-surviving points become queries for the next chunk),
+    so a feature crossing a seam stays **one continuous track**. FWD-chain + BWD-chain.
+  - **Auto chunk count** — sized from free VRAM (`torch.cuda.mem_get_info`) with a factor that
+    self-calibrates off the measured CUDA peak after the first chunk; UI override wins
+    (`AppState.track_chunks` → `RunnerConfig.chunks`; `0` = auto).
+  - **OOM retry** — on CUDA OOM a chunk downscales (×0.7, floor 0.25), rescales its carried
+    queries, and retries; export rescales coords back to original resolution.
+  - **Streamed decode** — when a full-clip decode would exceed `host_ram_frac` of available RAM,
+    frames are decoded **per window** (`video_io.FrameSource`/`read_window_bgr_scaled`) so host
+    RAM is bounded too; small clips keep the fast full-decode path.
+- **Why**: CoTracker3 offline runs the whole clip in one forward per pass → VRAM ∝ frames×res,
+  and the whole clip was also loaded into host RAM. Both walls hit on long 4K. Chosen over a
+  naive split because naive chunking fragments tracks at seams (weaker 3DE solve).
+- **Note**: single-chunk shots keep the exact prior 4-pass behavior (no regression). Chunked
+  shots use FWD/BWD chains only (mid passes dropped — chaining already preserves long tracks).
+  Calibration + the analytic VRAM estimate are approximate; the OOM-retry net covers misses.
+
+### Repo reorganized: entries in `app/`, stages under `pipeline/`
+- **What**: `app.py` + `app_nicegui.py` moved into `app/`. The three AI stages moved to
+  `pipeline/qwen`, `pipeline/llama/core`, `pipeline/sam3` (flattened — `sam3_mask_tool`
+  gone); vendored CoTracker moved to `pipeline/co-tracker-main` and `thirdparty/`
+  removed. Root now holds only `launch_nicegui.bat`, `requirements.txt`, and the docs.
+- **Why**: a clear, conventional layout — code under `app/`, the swappable AI stages
+  grouped under `pipeline/`.
+- **How it stays working**: the backend loaders rglob by filename, so dir renames are
+  tolerated. Fixed the few path-dependent spots: `app/app.py` `_HERE` = `parents[1]`
+  (repo root, since it now lives in `app/`) and `DEFAULT_SAM3_WEIGHTS` →
+  `pipeline/sam3/weights`; Qwen model base → the run script's own `models/` dir;
+  `cotracker_engine` searches `pipeline/co-tracker-main` first; `app_nicegui.py` loads
+  the backend from `app/app.py`; `launch_nicegui.bat` runs `app\app_nicegui.py`. The
+  `core/` and `app/` package names are load-bearing and were left unchanged. Verified by
+  importing the backend: all loaders + `core.*` imports + CoTracker path resolve.
+
+### Stripped to NiceGUI-only; deleted unused files
+- **What**: removed everything not needed by the NiceGUI tool — the Gradio launcher,
+  the standalone solo-stage UIs (`app/ui*.py`, the PySide reasoner + SAM apps) and their
+  per-stage `.bat`/README/requirements, the dead `core/llama_backend.py`, and the unused
+  vendored `RAFT-master` + `tapnet-main`.
+- **Why**: one front-end, one launcher; less to maintain and ship. The Gradio UI code
+  still lives inside `app/app.py` but no launcher ships for it.
+- **Note**: deletions are permanent; confirmed the keep/remove list before executing.
+  `app/syntheyes_runner.py` (alt SynthEyes engine) is also gone; the tracker loader falls
+  back to `tracker_core.py` (CoTracker), so nothing broke.
+
+### CoTracker checkpoint fetched
+- **What**: downloaded `scaled_offline.pth` to `co-tracker-main/checkpoints/` from the
+  public `facebook/cotracker3` HF repo.
+- **Why**: it was missing — tracking errored with "Missing checkpoint scaled_offline.pth".
+
+### Reuse-existing-masks prompt
+- **What**: at Generate-masks, if selected shots already have masks in OUT, NiceGUI asks
+  Reuse / Regenerate / Cancel. Reuse writes a filtered `*_run.json` guide so SAM3 only
+  generates the missing shots; `state.reuse_existing_masks` drives it.
+- **Why**: avoid silently re-masking (slow) or silently skipping; let the artist decide.
+
+### 0-track shots now explain themselves
+- **What**: a shot exporting 0 tracks logs a `ZERO …` line naming the stage that killed
+  them (seeding / post-filter / mask gating / too-short) with per-stage counts.
+- **Why**: "0 tracks" with no reason was undebuggable.
+
+### Frame range restored on Scan
+- **What**: scanning an Output with a previous guide now restores per-shot
+  `frame_start`/`frame_end` (alongside the include/exclude prompts it already restored),
+  reading the newest of `mask_guidance.json`/`overdrive_guide.json`.
+- **Why**: reused masks were produced for a specific range; tracking must use the same.
+
+---
+
+## 2026-06-22
+
+### Switched the front-end from Gradio to NiceGUI
+- **What**: New `app_nicegui.py` (primary, `launch_nicegui.bat`); Gradio `app.py` kept
+  as a fallback. Entire backend reused unchanged.
+- **Why**: Gradio's `Dataframe` made shot selection unreliable — bool cells did not
+  render as usable checkboxes, and `.select` on an interactive dataframe was flaky
+  (cell-edit vs row-select; the 1 s refresh timer could cancel clicks). NiceGUI's
+  `ui.table` provides native per-row checkboxes, selection highlight, and row-click.
+- **Note**: `app_nicegui.py` loads `app.py` by file path under its own `sys.modules`
+  name. Reasons: the repo has an `app/` package that shadows `import app`, and the
+  embeddable Python `._pth` isolation does not auto-add the script dir to `sys.path`.
+
+### SAM3 masking now honors the per-shot frame range
+- **What**: `frame_start/frame_end` flow `worker_mask` → guide JSON →
+  `sam3_runner.normalize_shots` → frame slice in `run_sam3_batch`. The tracker's mask
+  gating detects a sub-range mask set (fewer masks than the full clip) and maps masks
+  1:1 to the tracked frames; full-clip masks still map proportionally.
+- **Why**: Bug report — SAM3 was masking past the user's frame range. Previously the
+  range only affected tracking; SAM3 processed every frame.
+
+### CV motion backstop made a user toggle
+- **What**: "CV motion backstop" switch in the UI → `AppState.motion_backstop` →
+  `SamConfig.motion_backstop`; also `BTR_MOTION_BACKSTOP=0`.
+- **Why**: The CV layer masks anything moving independently of the camera, ignoring the
+  Exclude list. It correctly leaves the first frame alone (no previous frame for flow),
+  but on later frames it re-masked subjects the user had deliberately removed from
+  Exclude. Users need to turn it off for full manual control.
+
+### Shot-edit prompts are authoritative
+- **What**: `worker_mask` now writes Include/Exclude verbatim (empty list clears the
+  old value) instead of only adding when non-empty.
+- **Why**: Removing a term in the UI did nothing — the old guarded code only ever
+  appended, never cleared.
+
+### VRAM staging between stages
+- **What**: Qwen freed after Analyze; the Ollama LLM kept resident through Analyze and
+  unloaded (`keep_alive=0`) at Mask; CUDA cache cleared before SAM3 and before/after
+  CoTracker. Helpers `_free_vram` / `_free_ollama`.
+- **Why**: Fit each heavy model on a 16 GB RTX A4000 without OOM; keep the LLM available
+  only while it is needed (through Analyze), as requested.
+
+### Four "mover" backstops for camera solves
+- **What**, in order of authority:
+  1. VLM `moving_things`; 2. deterministic `dynamic_subjects` (animals/people/vehicles/
+  fx) scanned from the **raw** detected-things list; 3. scene-text heuristic
+  (`moving_foreground_terms`); 4. CV optical-flow residual after global-motion
+  subtraction (masks pixels moving independently of the camera, no name needed).
+- **Why**: A running dog was tracked into the camera solve. Root cause: it was detected
+  but not in the scene prose, so `filter_things_by_scene` dropped it before the mover
+  heuristic. Layers 2–4 each remove a different dependency (prose mention, motion
+  judgement, detection at all).
+
+### Qwen2.5-VL: added matchmove analysis fields + GUI display
+- **What**: One extra structured-JSON prompt per shot extracts `moving_things`,
+  `bad_track_regions`, `foreground_occluders`, `quality_flags`, `depth_layers`,
+  `parallax`. Carried through the parser/bridge; camera excludes use them; shown in the
+  UI (Quality column + per-shot analysis panel).
+- **Why**: The VLM was already loaded; these signals directly improve mask prompts and
+  give the artist pre-flight QC. Also fixed the bridge so the guide lists every shot
+  even with no client brief.
+
+### Qwen2.5-VL frame sampling fix
+- **What**: Sample 6–8 frames spread across the **whole clip** (not the first N), at
+  768 px. Frame count plateaus by design.
+- **Why**: The old code sampled the first ~6 frames; higher FPS made coverage *worse*,
+  so a subject appearing later (e.g. a dog) was never seen. Too many frames also dilute
+  the VLM, so the count is capped.
+
+### Upgraded Qwen 3B → 7B, loaded int4
+- **What**: Model resolver prefers 7B (AWQ or full); full 7B loaded via bitsandbytes
+  NF4 (~5.5 GB VRAM). `app.py` requests int4.
+- **Why**: 3B was the weakest link — missed/hallucinated objects, which propagate to
+  masks and tracks. 7B int4 fits the GPU with headroom.
+
+### SAM3 weights sourced from `facebook/sam3`
+- **What**: Downloaded `sam3.pt` (gated HF repo) to `SAM3/weights/`; path wired via
+  `BTR_SAM3_WEIGHTS`.
+- **Why**: Weights were missing; not auto-hosted by Ultralytics. Verified the
+  checkpoint has the expected `detector.`/`tracker.` key structure before use.
+
+### Portable, project-local Python runtime
+- **What**: Embeddable Python 3.11.9 at `runtime/python311/` with tkinter restored;
+  all pip installs/caches/temp pinned inside `runtime/`. GPU PyTorch is the cu121 build.
+- **Why**: Hard constraint — keep every install/download inside the project folder and
+  off the C: drive. No system Python existed.
+
+### Default shot selection is OFF
+- **What**: New shots start unticked.
+- **Why**: All-selected-by-default meant a run touched every shot; users wanted to pick
+  one (or a few) deliberately.
