@@ -910,6 +910,19 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
                 track_max.tooltip("Soft ceiling on exported tracks per shot/task after spread selection. 0 = unlimited.")
 
+                ui.label("Bad-track filter (plate px · 0 = off)")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    flt_jump = ui.number("Max jump", value=int(getattr(state, "filter_max_jump_px", 0) or 0),
+                                         min=0, precision=0).props("dense outlined").classes("grow")
+                    flt_jitter = ui.number("Max jitter", value=int(getattr(state, "filter_max_jitter_px", 0) or 0),
+                                           min=0, precision=0).props("dense outlined").classes("grow")
+                flt_jump.on_value_change(lambda e: setattr(state, "filter_max_jump_px", float(e.value or 0)))
+                flt_jitter.on_value_change(lambda e: setattr(state, "filter_max_jitter_px", float(e.value or 0)))
+                flt_jump.tooltip("Drops a track if ANY single-frame jump exceeds this many plate pixels "
+                                 "(teleport = mistrack). 0 = off. Try ~15 on a clean plate, tighten if needed.")
+                flt_jitter.tooltip("Drops a track whose mean frame-to-frame jitter (change in velocity) exceeds "
+                                   "this many plate pixels. Self-consistency only, so a fast SMOOTH point passes. 0 = off. Try ~3.")
+
                 sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
                                        on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
                 sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
