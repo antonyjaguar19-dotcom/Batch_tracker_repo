@@ -177,12 +177,13 @@ def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, 
             item: Dict[str, Any] = {"name": shot_name, "input_path": str(shot_path), "status": "ok"}
 
             try:
-                video_path = str(shot_path)
                 if shot_path.is_dir():
-                    log("  - Image sequence detected -> converting to temp mp4 (OpenCV)…")
-                    video_path = sequence_folder_to_temp_mp4(shot_path, tmp_dir_p)
-
-                d = describer.describe_video_struct(video_path)
+                    # Sample frames straight from the sequence — no mp4 encode (the OpenCV
+                    # VideoWriter can hard-crash on some builds, esp. at high resolution).
+                    log("  - Image sequence detected -> sampling frames directly (no mp4)…")
+                    d = describer.describe_sequence_struct(str(shot_path))
+                else:
+                    d = describer.describe_video_struct(str(shot_path))
                 item.update({
                     "scene_elements": d.get("scene_elements", ""),
                     "camera_movement": d.get("camera_movement", ""),
