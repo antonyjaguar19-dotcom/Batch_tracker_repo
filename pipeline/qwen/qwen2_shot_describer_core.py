@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 import re
 import time
+import threading
 
 import numpy as np
 
@@ -44,7 +45,7 @@ except Exception as e:
 import torch
 
 try:
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, TextIteratorStreamer
 except Exception as e:
     raise RuntimeError(
         "Failed to import Qwen2.5-VL from transformers.\n"
@@ -66,6 +67,9 @@ class ModelConfig:
 
     # VL inputs
     max_new_tokens: int = 220
+    # Hard wall-clock cap per VLM pass. Breaks a repetition/CUDA stall instead of
+    # hanging forever; the partial text is still parsed.
+    gen_timeout_s: int = 180
     # VLM frames are spread across the WHOLE clip (not the first N). Coverage comes
     # from spreading, NOT from sheer count: too many images dilute the VLM's attention
     # and DEGRADE answers. Keep the count in the 6-8 sweet spot; raise resolution
@@ -612,7 +616,6 @@ class QwenShotDescriber:
             except Exception:
                 pass
 
-    @torch.inference_mode()
     def _generate(self, prompt: str, images: List[Image.Image], tag: str = "gen") -> str:
         content = [{"type": "image"} for _ in images]
         content.append({"type": "text", "text": prompt})
@@ -625,12 +628,59 @@ class QwenShotDescriber:
 
         t0 = time.time()
         self._emit(f"    · {tag}: generating ({len(images)} img, {int(self.cfg.max_new_tokens)} tok max)…")
-        out_ids = self.model.generate(**inputs, max_new_tokens=int(self.cfg.max_new_tokens))
-        in_len = int(inputs["input_ids"].shape[-1])
-        gen_ids = out_ids[0][in_len:]
-        text = self.processor.decode(gen_ids, skip_special_tokens=True)
-        self._emit(f"    · {tag}: done in {time.time() - t0:.1f}s")
-        return text.strip()
+
+        # Stream tokens on a worker thread so we can heartbeat + hard-timeout.
+        # A blocking model.generate() gives no signal, so a stall (repetition
+        # loop, CUDA hang) is indistinguishable from slow. Streaming proves flow
+        # and, with repetition_penalty + a wall-clock cap, breaks pathological runs.
+        tok = getattr(self.processor, "tokenizer", None) or self.processor
+        cap_s = float(getattr(self.cfg, "gen_timeout_s", 180))
+        # Per-token wait: if no token arrives within this window the generate call
+        # is truly stalled (not just slow) -> streamer raises Empty and we bail,
+        # instead of the iterator blocking forever before the first token.
+        streamer = TextIteratorStreamer(
+            tok, skip_prompt=True, skip_special_tokens=True, timeout=max(30.0, cap_s / 3.0))
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=int(self.cfg.max_new_tokens),
+            streamer=streamer,
+            do_sample=False,
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
+        )
+        err: Dict[str, BaseException] = {}
+
+        def _run():
+            try:
+                with torch.inference_mode():
+                    self.model.generate(**gen_kwargs)
+            except BaseException as e:  # surface to caller thread
+                err["e"] = e
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+
+        pieces: List[str] = []
+        nchunks = 0
+        last_beat = time.time()
+        try:
+            for chunk in streamer:
+                pieces.append(chunk)
+                nchunks += 1
+                now = time.time()
+                if now - last_beat >= 5.0:
+                    self._emit(f"    · {tag}: {nchunks} chunks, {now - t0:.0f}s…")
+                    last_beat = now
+                if now - t0 > cap_s:
+                    self._emit(f"    · {tag}: TIMEOUT at {cap_s:.0f}s — cutting off ({nchunks} chunks).")
+                    break
+        except Exception as e:  # queue.Empty on a stalled generate, etc.
+            self._emit(f"    · {tag}: STALLED ({type(e).__name__}) after {time.time() - t0:.0f}s, {nchunks} chunks — bailing.")
+        th.join(timeout=2.0)
+        if "e" in err:
+            raise err["e"]
+        self._emit(f"    · {tag}: done in {time.time() - t0:.1f}s ({nchunks} chunks)")
+        return "".join(pieces).strip()
 
     def _frame_budget(self) -> int:
         # Frame count nudges with the FPS slider but stays within the VLM sweet spot
