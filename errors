@@ -1,0 +1,17 @@
+[11:14:20] --- Starting Step 2: Analysis & Decision ---
+[11:14:25] Running Qwen2 Visual Description...
+[11:14:25] Analyzing 1 selected shot(s): SCA_0140_P02
+[11:14:25] Generating 49 JPG proxy frame(s) from EXR (downscaled 1280px, 8 threads) → \\liv1\shows\Telstra_Villains2\SCA_0140_P02\mid\cmm\bot_tracks\cache\_proxies\f501c19b264834fe
+[11:14:46] Proxy generation done: 49/49 frame(s).
+[11:14:46] Starting… (offline mode enabled)
+[11:14:46] Run started: 2026-07-28T11:14:46
+[11:14:46] IN : 
+[11:14:46] OUT: D:\Jefrin\batch_tracker_v001_starter\runtime\_work\Telstra_Villains2\_batches\batch_20260728_111420
+[11:14:46] Model (local): D:\Jefrin\batch_tracker_v001_starter\pipeline\qwen\models\Qwen2.5-VL-7B-Instruct
+[11:14:46] FPS preset: 4
+[11:14:46] Int4: True
+[11:27:48] Model loaded. Precision: bnb-nf4
+[11:27:48] Using 1 explicit per-shot plate dir(s).
+[11:27:48] Restricted to 1 selected shot(s).
+[11:27:48] [1/1] SCA_0140_P02
+[11:27:48]   - Image sequence detected -> sampling frames directly (no mp4)…
