@@ -21,6 +21,7 @@ import importlib
 import importlib.util
 import math
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -521,6 +522,41 @@ def find_frames_subdir(version_dir: str):
         return version_dir, 0, 0, 0
     cnt, s, e = probe_plate_range(best_dir)
     return best_dir, cnt, s, e
+
+# --- Batched (thread-pooled) variants of the two per-shot network probes above -------
+# A 100+ shot show meant 100+ serial UNC round-trips before the table was usable. Both
+# probes are pure IO (dir listing / os.walk), so a small thread pool is a straight win
+# over the network. Each worker swallows its own error and returns a neutral value, so
+# one unreadable shot never aborts the scan (same contract as the serial callers had).
+_SCAN_WORKERS = 8
+
+def _safe_list_shot_versions(args) -> List[str]:
+    try:
+        return list_shot_versions(*args)
+    except Exception:
+        return []
+
+def _safe_find_frames(version_dir: str):
+    try:
+        return find_frames_subdir(version_dir)
+    except Exception:
+        return (version_dir or "", 0, 0, 0)
+
+def list_versions_batch(shows_root: str, show: str, shots: List[str],
+                        workers: int = _SCAN_WORKERS) -> List[List[str]]:
+    """Plate versions for many shots at once. Returns one list per shot, in order."""
+    if not shots:
+        return []
+    args = [(shows_root, show, s) for s in shots]
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(args)))) as ex:
+        return list(ex.map(_safe_list_shot_versions, args))
+
+def resolve_frames_batch(version_dirs: List[str], workers: int = _SCAN_WORKERS):
+    """find_frames_subdir for many version dirs at once. One tuple per dir, in order."""
+    if not version_dirs:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(version_dirs)))) as ex:
+        return list(ex.map(_safe_find_frames, version_dirs))
 
 _RENDER_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
