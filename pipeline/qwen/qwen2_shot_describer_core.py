@@ -66,17 +66,20 @@ class ModelConfig:
     fps: int = 1
 
     # VL inputs
-    max_new_tokens: int = 220
+    max_new_tokens: int = 160
     # Hard wall-clock cap per VLM pass. Breaks a repetition/CUDA stall instead of
     # hanging forever; the partial text is still parsed.
     gen_timeout_s: int = 180
     # VLM frames are spread across the WHOLE clip (not the first N). Coverage comes
     # from spreading, NOT from sheer count: too many images dilute the VLM's attention
-    # and DEGRADE answers. Keep the count in the 6-8 sweet spot; raise resolution
-    # instead so small/brief subjects (e.g. a dog) stay visible.
-    num_frames_min: int = 6
-    num_frames_cap: int = 8
-    max_side: int = 768
+    # and DEGRADE answers.
+    # SPEED: prefill cost ~= frames x (max_side/28)^2. On an int4/bnb box (dequant
+    # every matmul) that prefill dominates, so keep frames lean and side modest.
+    # 6 x 512 is ~3x cheaper than 8 x 768 with little quality loss; bump back up on a
+    # box that fits fp16.
+    num_frames_min: int = 4
+    num_frames_cap: int = 6
+    max_side: int = 512
 
     # CV-only sampling for camera classification
     cv_fps_min: int = 3
