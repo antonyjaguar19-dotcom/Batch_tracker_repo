@@ -142,7 +142,15 @@ def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, 
 
     cfg = ModelConfig(model_id_or_path=str(model_dir), fps=int(fps), use_torchao_int4=bool(use_int4))
     describer = QwenShotDescriber(cfg)
+    describer.log = log  # per-stage progress so a slow box doesn't look frozen
     log(f"Model loaded. Precision: {getattr(describer, 'quant_mode', 'unknown')}")
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            free, total = _t.cuda.mem_get_info()
+            log(f"GPU: {_t.cuda.get_device_name(0)} · {free/1e9:.1f}/{total/1e9:.1f} GB free")
+    except Exception:
+        pass
 
     def _norm(s): return re.sub(r"[\s_\-]+", "", str(s).strip()).lower()
     if shot_dirs:
