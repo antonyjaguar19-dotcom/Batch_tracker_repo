@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 import re
+import time
 
 import numpy as np
 
@@ -566,6 +567,9 @@ def _make_bnb_4bit_config():
 class QwenShotDescriber:
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
+        # Optional progress sink (set by the runner). Without it the long VLM
+        # stages are silent and a slow box looks frozen — so log every step.
+        self.log = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Never hit the network
@@ -601,8 +605,15 @@ class QwenShotDescriber:
         )
         self.model.eval()
 
+    def _emit(self, msg: str) -> None:
+        if self.log:
+            try:
+                self.log(msg)
+            except Exception:
+                pass
+
     @torch.inference_mode()
-    def _generate(self, prompt: str, images: List[Image.Image]) -> str:
+    def _generate(self, prompt: str, images: List[Image.Image], tag: str = "gen") -> str:
         content = [{"type": "image"} for _ in images]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
@@ -612,10 +623,13 @@ class QwenShotDescriber:
         if hasattr(inputs, "to"):
             inputs = inputs.to(self.model.device)
 
+        t0 = time.time()
+        self._emit(f"    · {tag}: generating ({len(images)} img, {int(self.cfg.max_new_tokens)} tok max)…")
         out_ids = self.model.generate(**inputs, max_new_tokens=int(self.cfg.max_new_tokens))
         in_len = int(inputs["input_ids"].shape[-1])
         gen_ids = out_ids[0][in_len:]
         text = self.processor.decode(gen_ids, skip_special_tokens=True)
+        self._emit(f"    · {tag}: done in {time.time() - t0:.1f}s")
         return text.strip()
 
     def _frame_budget(self) -> int:
@@ -640,17 +654,19 @@ class QwenShotDescriber:
         return self._describe_from_frames(frames_bgr, cv_frames, client_requirement)
 
     def _describe_from_frames(self, frames_bgr, cv_frames, client_requirement: Optional[str] = None) -> Dict:
+        self._emit(f"  - {len(frames_bgr)} VLM frame(s) sampled; classifying camera motion…")
         images = [_pil_from_bgr(f, max_side=self.cfg.max_side) for f in frames_bgr]
 
         cam_src = cv_frames if len(cv_frames) >= 2 else frames_bgr
         mags, vecs, scales = _estimate_global_motion(cam_src, scale=self.cfg.cv_scale)
         cam_label = _classify_camera(mags, vecs, scales, self.cfg)
+        self._emit(f"  - camera: {cam_label}. Running VLM (3 passes)…")
 
         scene_prompt = (
             "Describe what is happening in this shot as a short paragraph (2-3 sentences). "
             "Mention key visible subjects and any obvious action."
         )
-        scene = _short_paragraph(self._generate(scene_prompt, images))
+        scene = _short_paragraph(self._generate(scene_prompt, images, tag="scene [1/3]"))
 
         list_prompt = (
             "These frames are sampled across one shot; an object may appear in only some of them. "
@@ -661,7 +677,7 @@ class QwenShotDescriber:
             "Avoid repetition and synonyms/duplicates. "
             "Return ONLY the comma-separated list. No extra text."
         )
-        things = _parse_csvish_list(self._generate(list_prompt, images))
+        things = _parse_csvish_list(self._generate(list_prompt, images, tag="things [2/3]"))
 
         analysis = self._analyze_for_matchmove(images, things)
 
@@ -702,7 +718,7 @@ class QwenShotDescriber:
             "parallax": "",
         }
         try:
-            raw = self._generate(prompt, images)
+            raw = self._generate(prompt, images, tag="matchmove [3/3]")
         except Exception:
             return defaults
         obj = _extract_json_obj(raw)
