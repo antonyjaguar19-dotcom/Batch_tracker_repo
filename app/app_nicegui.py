@@ -55,38 +55,85 @@ TABLE_COLS = [
 
 _suppress_select = False  # guard so programmatic selection doesn't re-trigger handlers
 
+# Status chip above the table. Unlike the search box (which Quasar applies in the
+# browser), a chip changes which rows exist server-side, so it does rebuild the table.
+# Only signals we actually hold in memory — mask state lives on disk and probing it per
+# shot would reintroduce the network stall we just removed.
+STATUS_CHIPS = ["All", "No plate", "Pending", "Analyzed", "Tracked"]
+_status_chip = {"v": "All"}
+
+
+def _passes_status(d) -> bool:
+    s = _status_chip["v"]
+    if s == "No plate":
+        return not d.plate_dir or not d.frames
+    if s == "Pending":
+        return (d.strategy or "Pending") == "Pending"
+    if s == "Analyzed":
+        return (d.strategy or "Pending") != "Pending"
+    if s == "Tracked":
+        return bool(d.track_metrics_summary)
+    return True
+
 
 # -----------------------------------------------------------------------------
 # Row building / table refresh
 # -----------------------------------------------------------------------------
-def _visible_names():
-    return be._visible_names(state)
+def _all_names():
+    """Every shot passing the status chip. The search box is NOT applied here — it is
+    a client-side Quasar filter, so filtered-out rows stay in table.rows and keep their
+    tick. That is what lets a selection survive searching for the next batch."""
+    return [n for n in sorted(state.shots_data) if _passes_status(state.shots_data[n])]
+
+
+def _row_for(name: str) -> dict:
+    d = state.shots_data[name]
+    prompts = f"INC: {d.include_prompts} | EXC: {d.exclude_prompts}"
+    if len(prompts) > 60:
+        prompts = prompts[:57] + "..."
+    return {
+        "name": name,
+        "version": d.version,
+        "versions": d.versions or [],
+        "strategy": d.strategy,
+        "quality": be._quality_cell(d),
+        "prompts": prompts,
+        "scale": d.scale,
+        "range": be._range_cell(d),
+        "metrics": d.track_metrics_summary or "",
+        "clear": "",
+    }
+
+
+# Fields Quasar's default filter scans: every declared column, `versions` excluded
+# because it is row data with no column of its own.
+_FILTER_FIELDS = [c["field"] for c in TABLE_COLS]
+
+
+def _matching_names():
+    """Names a user would see right now: status chip AND the search box. Built from the
+    SAME row dicts the table holds, so it can't drift from Quasar's in-browser filter
+    (substring over every column's cell value). Backs Select all / Invert."""
+    q = (state.filter_query or "").strip().lower()
+    names = _all_names()
+    if not q:
+        return names
+    out = []
+    for n in names:
+        row = _row_for(n)
+        if any(q in str(row[f]).lower() for f in _FILTER_FIELDS):
+            out.append(n)
+    return out
 
 
 def _build_rows():
-    rows = []
-    for name in _visible_names():
-        d = state.shots_data[name]
-        prompts = f"INC: {d.include_prompts} | EXC: {d.exclude_prompts}"
-        if len(prompts) > 60:
-            prompts = prompts[:57] + "..."
-        rows.append({
-            "name": name,
-            "version": d.version,
-            "versions": d.versions or [],
-            "strategy": d.strategy,
-            "quality": be._quality_cell(d),
-            "prompts": prompts,
-            "scale": d.scale,
-            "range": be._range_cell(d),
-            "metrics": d.track_metrics_summary or "",
-            "clear": "",
-        })
-    return rows
+    return [_row_for(name) for name in _all_names()]
 
 
 def refresh_table():
-    """Rebuild rows + restore selection (active shots) without firing the select handler."""
+    """Rebuild rows + restore selection (active shots) without firing the select handler.
+    Replaces the whole row array, so it resets scroll — call it only when the row SET
+    changes (scan boundaries, status chip, version pick), never on a keystroke."""
     global _suppress_select
     rows = _build_rows()
     _suppress_select = True
@@ -97,16 +144,100 @@ def refresh_table():
     lbl_selcount.set_content(be._sel_count_text(state))
 
 
+def refresh_selection_only():
+    """Push tick state without rebuilding rows — used by the bulk-select buttons so a
+    'select all' on a 300-shot show doesn't re-render (and re-scroll) the table."""
+    global _suppress_select
+    _suppress_select = True
+    table.selected = [r for r in table.rows
+                      if state.shots_data.get(r["name"]) and state.shots_data[r["name"]].use]
+    table.update()
+    _suppress_select = False
+    lbl_selcount.set_content(be._sel_count_text(state))
+
+
 # -----------------------------------------------------------------------------
 # Selection (active shots) + editing
 # -----------------------------------------------------------------------------
 def on_selection_change():
+    """Reconcile ONLY the shots currently in the table. Shots excluded by the status
+    chip are not represented in table.selected, so touching their `use` here would
+    silently untick them (that was the old bug)."""
     if _suppress_select:
         return
     sel = {r["name"] for r in (table.selected or [])}
-    for name, d in state.shots_data.items():
-        d.use = name in sel
+    for r in (table.rows or []):
+        d = state.shots_data.get(r["name"])
+        if d:
+            d.use = r["name"] in sel
     lbl_selcount.set_content(be._sel_count_text(state))
+
+
+def select_all_matching():
+    names = _matching_names()
+    for n in names:
+        state.shots_data[n].use = True
+    refresh_selection_only()
+    ui.notify(f"Selected {len(names)} shot(s)", type="positive")
+
+
+def select_none():
+    for d in state.shots_data.values():
+        d.use = False
+    refresh_selection_only()
+
+
+def select_invert():
+    for n in _matching_names():
+        d = state.shots_data[n]
+        d.use = not d.use
+    refresh_selection_only()
+
+
+_PASTE_SPLIT = re.compile(r"[\s,;]+")
+
+
+def apply_pasted_list(text: str):
+    """Tick every shot named in a pasted production list. Names are matched
+    case-insensitively and also by basename, so a pasted path or 'show/shot' still
+    lands. Anything unmatched is reported rather than silently dropped."""
+    wanted = [t.strip() for t in _PASTE_SPLIT.split(text or "") if t.strip()]
+    if not wanted:
+        ui.notify("Nothing to match — paste some shot names first.", type="warning")
+        return
+    by_key = {}
+    for n in state.shots_data:
+        by_key.setdefault(n.lower(), n)
+    hit, missed = [], []
+    for w in wanted:
+        key = w.lower()
+        name = by_key.get(key) or by_key.get(key.replace("\\", "/").rstrip("/").split("/")[-1])
+        if name:
+            hit.append(name)
+        else:
+            missed.append(w)
+    for n in hit:
+        state.shots_data[n].use = True
+    refresh_selection_only()
+    # A pasted shot the status chip is hiding still gets ticked (it will run), but the
+    # user would only see the count move — say so rather than let it look like a bug.
+    hidden = sum(1 for n in hit if not _passes_status(state.shots_data[n]))
+    notes = []
+    if missed:
+        shown = ", ".join(missed[:8]) + (f" … (+{len(missed) - 8} more)" if len(missed) > 8 else "")
+        notes.append(f"{len(missed)} not in this show: {shown}")
+    if hidden:
+        notes.append(f"{hidden} hidden by the '{_status_chip['v']}' filter")
+    if notes:
+        ui.notify(f"Ticked {len(hit)} · " + " · ".join(notes),
+                  type="warning", multi_line=True, timeout=10000)
+    else:
+        ui.notify(f"Ticked {len(hit)} shot(s) — all matched", type="positive")
+
+
+def on_status_chip(e):
+    _status_chip["v"] = e.value or "All"
+    refresh_table()
 
 
 def load_editor(name: str):
@@ -318,7 +449,7 @@ def do_scan():
         _scan_load_prev_guide()
     except Exception as ex:
         print(f"prev guide load: {ex}")
-    ed_pick.set_options(_visible_names())
+    ed_pick.set_options(sorted(state.shots_data))
     refresh_table()
     ui.notify(f"Found {len(rows)} shots", type="info")
 
@@ -363,12 +494,14 @@ async def do_scan_show():
         return
     if token != _scan_token["n"]:
         return  # a newer show was picked while we were listing (it owns the bar now)
-    # Phase 1 (cheap): show names + version dropdowns right away.
-    for s in shots:
-        try:
-            vers = await run.io_bound(be.list_shot_versions, shows_root.value, show, s)
-        except Exception:
-            vers = []
+    # Phase 1 (cheap): show names + version dropdowns right away. One thread-pooled
+    # batch instead of one UNC round-trip per shot — on a 100+ shot show that was the
+    # main reason the list took so long to appear.
+    scan_lbl.set_text(f"Reading plate versions · {len(shots)} shot(s)…")
+    vers_per_shot = await run.io_bound(be.list_versions_batch, shows_root.value, show, shots)
+    if token != _scan_token["n"]:
+        return
+    for s, vers in zip(shots, vers_per_shot):
         latest = vers[-1] if vers else ""
         state.shots_data[s] = be.ShotData(
             name=s, scale="100%", show=show, versions=vers, version=latest,
@@ -379,32 +512,37 @@ async def do_scan_show():
         _scan_load_prev_guide()
     except Exception as ex:
         print(f"prev guide load: {ex}")
-    ed_pick.set_options(_visible_names())
+    ed_pick.set_options(sorted(state.shots_data))
     refresh_table()
     ui.notify(f"{show}: {len(shots)} shot(s)", type="info")
     # Phase 2 (heavier): descend to the real frames dir + parse the range per shot.
-    total = len(shots)
+    # Chunked so progress still moves, but with ~1 websocket push per chunk instead of
+    # two per shot (a 100-shot scan used to fire ~200 UI updates at the browser).
+    todo = [s for s in shots if state.shots_data.get(s) and state.shots_data[s].plate_dir]
+    total = len(todo)
     scan_prog.props(remove="indeterminate"); scan_prog.set_value(0.0)
-    for i, s in enumerate(shots):
+    CHUNK = 16
+    for i in range(0, total, CHUNK):
         if token != _scan_token["n"]:
             return  # superseded by a newer show switch (it owns the bar now)
-        scan_lbl.set_text(f"Resolving frames {i + 1}/{total} · {s}")
-        scan_prog.set_value((i + 1) / total if total else 1.0)
-        d = state.shots_data.get(s)
-        if not d or not d.plate_dir:
-            continue
-        try:
-            pdir, frames, pstart, pend = await run.io_bound(be.find_frames_subdir, d.plate_dir)
-            d.plate_dir, d.frames, d.plate_start, d.plate_end = pdir, frames, pstart, pend
-        except Exception:
-            continue
+        chunk = todo[i:i + CHUNK]
+        scan_lbl.set_text(f"Resolving frames {min(i + CHUNK, total)}/{total}")
+        scan_prog.set_value(min(i + CHUNK, total) / total if total else 1.0)
+        results = await run.io_bound(be.resolve_frames_batch,
+                                     [state.shots_data[s].plate_dir for s in chunk])
+        for s, (pdir, frames, pstart, pend) in zip(chunk, results):
+            d = state.shots_data.get(s)
+            if d:
+                d.plate_dir, d.frames, d.plate_start, d.plate_end = pdir, frames, pstart, pend
     if token == _scan_token["n"]:
         refresh_table()
         scan_prog.set_visibility(False); scan_lbl.set_visibility(False)
 
 
-def on_pick_version(args):
-    """A shot row's version dropdown changed — re-resolve that shot's plate dir."""
+async def on_pick_version(args):
+    """A shot row's version dropdown changed — re-resolve that shot's plate dir.
+    The walk is a UNC os.walk, so it runs off the event loop; doing it inline used to
+    freeze the whole UI for as long as the share took to answer."""
     if isinstance(args, list):
         args = args[0] if args else None
     name = (args or {}).get("name") if isinstance(args, dict) else None
@@ -414,7 +552,7 @@ def on_pick_version(args):
         return
     d.version = ver
     vdir = be.resolve_plate_dir(shows_root.value, d.show, name, ver)
-    d.plate_dir, d.frames, d.plate_start, d.plate_end = be.find_frames_subdir(vdir)
+    d.plate_dir, d.frames, d.plate_start, d.plate_end = await run.io_bound(be.find_frames_subdir, vdir)
     refresh_table()
     ui.notify(f"{name} → {ver} · {d.frames}f", type="info")
 
@@ -669,6 +807,10 @@ def shutdown_bot():
 # -----------------------------------------------------------------------------
 # Poll background job queue (logs, progress, table refresh, button states)
 # -----------------------------------------------------------------------------
+# Last values poll() actually pushed, so an idle tick sends nothing.
+_poll_last = {"status": None, "running": None, "indeterminate": False}
+
+
 def poll():
     new_logs = []
     refresh_now = False
@@ -714,11 +856,12 @@ def poll():
 
     if refresh_now:
         refresh_table()
-        ed_pick.set_options(_visible_names())
+        ed_pick.set_options(sorted(state.shots_data))
 
     # status + progress bar + elapsed + button busy-state
     running = be._job_running()
-    bar.visible = running
+    if bar.visible != running:
+        bar.visible = running
     if running:
         prog = f" · {be.LAST_PROGRESS}" if be.LAST_PROGRESS else ""
         start = getattr(be, "CURRENT_JOB_START", 0.0) or 0.0
@@ -729,23 +872,35 @@ def poll():
         frac = getattr(be, "LAST_PROGRESS_FRAC", None)
         if frac is None:
             # unknown total (e.g. Qwen) -> keep it moving rather than fake a number
-            bar.props("indeterminate")
+            if not _poll_last["indeterminate"]:
+                bar.props("indeterminate"); _poll_last["indeterminate"] = True
         else:
-            bar.props(remove="indeterminate")
+            if _poll_last["indeterminate"]:
+                bar.props(remove="indeterminate"); _poll_last["indeterminate"] = False
             bar.value = float(frac)
             prog += f" · {int(frac * 100)}%"
-        lbl_status.set_content(f"⏳ **{be.CURRENT_JOB_NAME}** running…{prog}{el}")
+        status_md = f"⏳ **{be.CURRENT_JOB_NAME}** running…{prog}{el}"
     else:
-        lbl_status.set_content("🟢 Idle")
-    for b in (btn_pipe, btn_analyze, btn_mask, btn_track):
-        b.set_enabled(not running)
-    btn_stop.set_enabled(running)
+        status_md = "🟢 Idle"
+    # Only push what actually changed — this runs at 1 Hz forever, and blindly
+    # rewriting the status + five button states kept a websocket update going out
+    # every second even while the bot sat idle.
+    if status_md != _poll_last["status"]:
+        lbl_status.set_content(status_md)
+        _poll_last["status"] = status_md
+    if running != _poll_last["running"]:
+        for b in (btn_pipe, btn_analyze, btn_mask, btn_track):
+            b.set_enabled(not running)
+        btn_stop.set_enabled(running)
+        _poll_last["running"] = running
 
 
 def on_search(e):
-    state.filter_query = e.value or ""
-    ed_pick.set_options(_visible_names())
-    refresh_table()
+    """Client-side filter: Quasar hides non-matching rows in the browser, so the row
+    array (and every tick in it) is untouched. No table rebuild, no scroll reset, and a
+    selection built under one search survives the next one."""
+    state.filter_query = e.value or ""   # kept so 'Select all matching' agrees with the view
+    table.filter = state.filter_query
 
 
 # -----------------------------------------------------------------------------
@@ -774,10 +929,15 @@ ui.add_head_html("""
                 padding: 2px 10px; font-size: 12px; }
   .bt-chip p  { margin: 0; }
   .bt-editor  { width: 780px; max-width: 94vw; background: #141924; }
+  .bt-paste   { width: 520px; max-width: 94vw; background: #141924; }
   /* Run bar: pipeline button, then the four stages as one evenly-sized sequence. */
   .bt-run     { min-width: 150px; height: 36px; font-weight: 600; }
   .bt-step    { min-width: 122px; height: 36px; color: #9dc0ff; }
   .bt-vsep    { height: 24px; margin: 0 6px; background: rgba(255,255,255,.12); }
+  /* Shots table: virtual-scrolled so a 300-shot show puts ~20 rows in the DOM, not 300.
+     Quasar needs the scroll container height-bounded, and the header pinned over it. */
+  .bt-shots .q-table__middle { max-height: 58vh; }
+  .bt-shots thead tr th { position: sticky; top: 0; z-index: 2; background: #141924; }
 </style>
 """)
 
@@ -830,8 +990,11 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
     with ui.card().classes("w-full bt-card"):
         ui.label("Find shots").classes("bt-section")
-        ui.input(placeholder="type part of a shot name…"
+        # Filters live in the browser (Quasar), so typing never touches the server or
+        # the ticks. Matches any column: shot name, version, strategy, range, metrics.
+        ui.input(placeholder="shot name, version, strategy…"
                  ).props("dense outlined clearable").classes("w-full").on_value_change(on_search)
+        ui.label("Matches any column · ticks survive searching").classes("bt-hint")
 
     with ui.card().classes("w-full bt-card"):
         with ui.expansion("Settings", icon="tune", value=False).classes("w-full"):
@@ -993,8 +1156,25 @@ with ui.column().classes("w-full gap-3 p-3"):
             ed_pick = ui.select([], label="Edit shot", with_input=True).props("dense outlined").classes("w-64")
             ed_pick.on_value_change(on_pick_edit)
 
-        table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple"
-                         ).props("flat dense").classes("w-full")
+        # ---- Bulk selection + status filter (the 100+ shot workflow) ----
+        with ui.row().classes("w-full items-center no-wrap gap-2 q-mb-xs"):
+            ui.button("Select all matching", icon="done_all", on_click=select_all_matching
+                      ).props("outline dense no-caps"
+                              ).tooltip("Ticks every shot passing the status chip AND the search box.")
+            ui.button("None", icon="remove_done", on_click=select_none
+                      ).props("outline dense no-caps").tooltip("Unticks every shot in the show.")
+            ui.button("Invert", icon="swap_horiz", on_click=select_invert
+                      ).props("outline dense no-caps").tooltip("Flips the tick on every matching shot.")
+            ui.button("Paste list", icon="content_paste", on_click=lambda: paste_dlg.open()
+                      ).props("outline dense no-caps"
+                              ).tooltip("Paste a production shot list to tick them all at once.")
+            ui.separator().props("vertical").classes("bt-vsep")
+            ui.toggle(STATUS_CHIPS, value="All", on_change=on_status_chip
+                      ).props("dense no-caps unelevated toggle-color=primary size=sm")
+
+        table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple",
+                         pagination={"rowsPerPage": 0}
+                         ).props("flat dense virtual-scroll hide-bottom").classes("w-full bt-shots")
         table.on("selection", on_selection_change)
         table.on("rowClick", on_row_click)
         # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
@@ -1023,6 +1203,23 @@ with ui.column().classes("w-full gap-3 p-3"):
           </q-td>
         ''')
         table.on("pickversion", lambda e: on_pick_version(e.args))
+
+    # ---- Paste shot list (dialog; the "Paste list" button opens it) ----
+    with ui.dialog() as paste_dlg, ui.card().classes("bt-paste"):
+        ui.markdown("#### 📋 Paste a shot list").classes("q-mb-none")
+        ui.label("One per line, or comma/space separated. Matched case-insensitively; "
+                 "anything not in this show is reported back.").classes("bt-hint")
+        paste_box = ui.textarea(placeholder="ABC_0010\nABC_0020\nABC_0030"
+                                ).props("outlined autogrow input-style=min-height:180px").classes("w-full")
+        with ui.row().classes("w-full justify-end no-wrap gap-2"):
+            ui.button("Cancel", on_click=paste_dlg.close).props("flat no-caps")
+
+            def _apply_paste():
+                apply_pasted_list(paste_box.value or "")
+                paste_dlg.close()
+
+            ui.button("Tick these shots", icon="done_all", on_click=_apply_paste,
+                      color="primary").props("unelevated no-caps")
 
     # ---- Logs ----
     with ui.card().classes("w-full bt-card"):
