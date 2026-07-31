@@ -1064,8 +1064,9 @@ class AppState:
     chunk_threshold: int = 1000    # frames above which SynthEyes chunks blip/peel
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
-    track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
+    track_spacing_px: int = 60     # TAPNext: min spacing between kept tracks, quoted @1920
     spread_ref_frames: int = 5     # TAPNext: frames sampled to measure that spacing ON SCREEN
+    spread_scale_with_res: bool = True  # TAPNext: scale that spacing by plate width / 1920
     track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
     mask_dilation_px: int = 10     # SAM3: grow the exclude region at MASK time (soft edges)
     mask_margin_px: int = 8        # TAPNext: pull seeding/gating in from the matte edge
@@ -1969,8 +1970,9 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 chunks=int(getattr(state, "track_chunks", 0) or 0),
                 filter_max_jump_px=float(getattr(state, "filter_max_jump_px", 0.0) or 0.0),
                 filter_max_jitter_px=float(getattr(state, "filter_max_jitter_px", 0.0) or 0.0),
-                spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
+                spread_min_dist_px=int(getattr(state, "track_spacing_px", 60) or 60),
                 spread_ref_frames=int(getattr(state, "spread_ref_frames", 5) or 5),
+                spread_scale_with_res=bool(getattr(state, "spread_scale_with_res", True)),
                 max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
                 # Pull seeds/gating in from the matte edge, and reject 1-D (edge) features
                 # that NCC can only slide along. See RunnerConfig for the reasoning.
