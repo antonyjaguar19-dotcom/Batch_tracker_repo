@@ -109,8 +109,63 @@ def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
     return (max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)))
 
 
+def _adaptive_search(pts: Track, cfg) -> int:
+    """Search radius sized from how fast this point is actually moving.
+
+    A fixed radius is wrong at both ends. On a fast shot the true feature can fall OUTSIDE
+    the box -- NCC then returns the best match inside it, which is simply the wrong place,
+    and the point slides. On a slow shot a wide box is worse than useless: it invites the
+    rival-peak problem _peak_is_ambiguous exists to catch. So: keep the tight default when
+    the point is barely moving, and open up only as far as the measured motion demands.
+    Bounded because NCC cost grows with the SQUARE of the radius.
+    """
+    base = int(getattr(cfg, "refine_search_px", 24) or 24)
+    smax = int(getattr(cfg, "refine_search_max", base) or base)
+    k = float(getattr(cfg, "refine_search_speed_k", 0.0) or 0.0)
+    if smax <= base or k <= 0.0 or len(pts) < 3:
+        return base
+    steps = []
+    for a, b in zip(pts, pts[1:]):
+        dt = max(1, int(b[0]) - int(a[0]))
+        steps.append(math.hypot(float(b[1]) - float(a[1]), float(b[2]) - float(a[2])) / dt)
+    if not steps:
+        return base
+    speed = float(np.median(steps))
+    # Below ~1px/frame the point is effectively static and the coarse position is already
+    # good, so keep the tight box EXACTLY. That matters beyond cost: a wider box is what
+    # lets a rival peak in, which is precisely what _peak_is_ambiguous then has to reject.
+    if speed < 1.0:
+        return base
+    return int(max(base, min(smax, round(base + k * speed))))
+
+
+def _peak_is_ambiguous(resp: np.ndarray, maxloc: Tuple[int, int], maxv: float,
+                       ratio: float, half: int) -> bool:
+    """True when a rival peak is nearly as strong as the winner, somewhere else in the box.
+
+    Repetitive detail -- bolts, rivets, a window grid, tiles -- gives NCC several almost
+    equally good answers, and taking minMaxLoc's single best silently snapped the point to
+    the identical feature NEXT DOOR. Nothing downstream could catch it, because the
+    correlation really was high. This is the standard distinctiveness (Lowe-style ratio)
+    test: suppress a neighbourhood around the winner, look at the best of what is left, and
+    refuse to answer when the two are too close to call.
+    """
+    if ratio >= 1.0 or maxv <= 0.0:
+        return False
+    h, w = resp.shape[:2]
+    r = max(2, int(half) // 2)          # suppression radius around the winner
+    x0 = max(0, maxloc[0] - r); x1 = min(w, maxloc[0] + r + 1)
+    y0 = max(0, maxloc[1] - r); y1 = min(h, maxloc[1] + r + 1)
+    masked = resp.copy()
+    masked[y0:y1, x0:x1] = -1.0
+    if masked.size == 0 or float(masked.max()) <= -1.0:
+        return False                     # the box holds only the one peak -> unambiguous
+    return float(masked.max()) >= ratio * float(maxv)
+
+
 def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
-               search: int, half: int, edge_clamp: bool = False
+               search: int, half: int, edge_clamp: bool = False,
+               ambiguity_ratio: float = 1.0
                ) -> Optional[Tuple[float, float, float]]:
     """NCC template match of `patch` in a search box around (cx,cy). -> (x,y,cc).
 
@@ -118,6 +173,11 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
     the frame (reduce search on the clipped side) so an edge point still gets refined. Only
     bail when the patch itself can't fit (target within `half` of the border). Without it the
     original behaviour is kept (bail if the full search box falls off frame).
+
+    `ambiguity_ratio`: reject the match when a rival peak scores >= this fraction of the
+    winner (see _peak_is_ambiguous). Returning None -- "I don't know" -- is far better than a
+    confident wrong answer: the caller's hysteresis simply holds the previous position.
+    1.0 disables the test.
     """
     P = 2 * half + 1
     H, W = gray.shape[:2]
@@ -140,6 +200,8 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
             return None
     resp = cv2.matchTemplate(win, patch, cv2.TM_CCOEFF_NORMED)
     _, maxv, _, maxloc = cv2.minMaxLoc(resp)
+    if _peak_is_ambiguous(resp, maxloc, float(maxv), float(ambiguity_ratio), half):
+        return None
     dx, dy = _subpix_peak(resp, maxloc)
     px = x0 + maxloc[0] + dx + half
     py = y0 + maxloc[1] + dy + half
@@ -236,10 +298,11 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     if len(pts) < 2:
         return None, "no-anchor"
     half = int(cfg.refine_patch_px) // 2
-    search = int(cfg.refine_search_px)
+    search = _adaptive_search(pts, cfg)
     motion = _MOTION.get(str(cfg.refine_motion).lower(), cv2.MOTION_AFFINE)
     lost = float(cfg.refine_ncc_lost)
     reref = float(cfg.refine_ncc_reref)
+    ambig = float(getattr(cfg, "match_ambiguity_ratio", 1.0) or 1.0)
     # Hysteresis: it takes `lost` to be confident, but only `hold` to stay locked, so a
     # correlation hovering around one hard threshold can no longer drop the point for a
     # frame at a time while its pattern is plainly visible.
@@ -290,7 +353,7 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             g = get(f - 1)
             if g is None:
                 break
-            res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp)
+            res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig)
             if res is None or res[2] < hold:
                 # Lock lost. This used to end the track here, which is how points were lost
                 # to occluders SAM3 never masked (a pole, a prop, a hand). Treat it as a
@@ -302,12 +365,19 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                 # Search where the NEIGHBOURS say it should have gone, not where the coarse
                 # tracker left it -- during an occlusion the coarse point has usually been
                 # dragged along by whatever crossed it.
+                # Re-acquisition is where a repetitive feature is most dangerous: the anchor
+                # matches an identical neighbour just as well. Search a TIGHT radius around
+                # the neighbour-predicted position first, and demand the ambiguity test pass
+                # -- better to stay lost than come back on the bolt next door.
                 px, py = cx, cy
+                tight = search
                 if predict is not None and last_good is not None:
                     px, py = predict(last_good[1], last_good[2], int(last_good[0]), int(f))
-                ra = _ncc_match(g, anchor, px, py, search, half, edge_clamp)
+                    tight = max(4, int(round(search * float(
+                        getattr(cfg, "reacquire_search_frac", 1.0) or 1.0))))
+                ra = _ncc_match(g, anchor, px, py, tight, half, edge_clamp, ambig)
                 if ra is None or ra[2] < reacq:
-                    ra = _ncc_match(g, anchor, cx, cy, search, half, edge_clamp)
+                    ra = _ncc_match(g, anchor, cx, cy, search, half, edge_clamp, ambig)
                 if ra is not None and ra[2] >= reacq:
                     refined[i] = (f, float(ra[0]), float(ra[1]))
                     last_good = refined[i]
@@ -415,9 +485,10 @@ def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     if tol <= 0.0 or len(seg) < 3:
         return seg
     half = int(cfg.refine_patch_px) // 2
-    search = int(cfg.refine_search_px)
+    search = _adaptive_search(seg, cfg)
     lost = float(cfg.refine_ncc_lost)
     reref = float(cfg.refine_ncc_reref)
+    ambig = float(getattr(cfg, "match_ambiguity_ratio", 1.0) or 1.0)
 
     g_last = get(int(seg[-1][0]) - 1)
     if g_last is None:
@@ -434,7 +505,7 @@ def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
         g = get(int(f) - 1)
         if g is None:
             break
-        res = _ncc_match(g, patch, fx, fy, search, half, edge_clamp)
+        res = _ncc_match(g, patch, fx, fy, search, half, edge_clamp, ambig)
         if res is None or res[2] < lost:
             break
         bx, by, cc = res
