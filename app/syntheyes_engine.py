@@ -429,9 +429,20 @@ class SynthEyesEngine:
     def _wait_for_operation(self, label, min_wait=3.0, max_timeout=600.0,
                             peak_cpu=250.0, idle_hold=1.5, start_grace=6.0):
         """Wait for a SynthEyes long-op (blip/peel) to finish via live signals instead of a
-        fixed sleep. Returns True when done (or on the timeout ceiling, to never hang the
-        batch); False on stop-request or a crash/error dialog. Falls back to a fixed sleep if
-        psutil is unavailable."""
+        fixed sleep. Falls back to a fixed sleep if psutil is unavailable.
+
+        Returns a STATUS STRING, not a bool, because the caller needs to tell apart the two
+        very different ways this returns "not done":
+
+          "done"          the op ran and finished (CPU peaked / progress dialog seen).
+          "never-started" released or hit the ceiling having seen NEITHER a CPU peak nor a
+                          progress dialog. The op never actually began -- almost always a
+                          PostMessage click SynthEyes ignored (window not foreground, a modal
+                          up). This used to be indistinguishable from "done", so Peel ran on
+                          zero blips and the shot exported 0 trackers with no error anywhere.
+          "error"         a crash/OOM ('Imminent Crash') dialog appeared.
+          "stopped"       the user pressed Stop.
+        """
         pid = self._syntheyes_pid()
         proc = None
         try:
@@ -448,17 +459,17 @@ class SynthEyesEngine:
         low_since = None
         while time.time() - t0 < max_timeout:
             if getattr(self, "_stop_requested", False):
-                return False
+                return "stopped"
             prog, err = self._op_dialog_state()
             if err:
                 self.log(f"   {label}: SynthEyes crash/error dialog -> aborting op")
-                return False
+                return "error"
             if proc is not None:
                 try:
                     cpu = proc.cpu_percent(interval=0.3)
                 except Exception:
                     self.log(f"   {label}: SynthEyes process gone during wait")
-                    return False
+                    return "error"
             else:
                 cpu = 0.0
                 time.sleep(0.3)
@@ -479,32 +490,71 @@ class SynthEyesEngine:
                 # an instant/no-op op like peel on a short shot, or no-psutil fallback).
                 ready = peaked or seen_dialog or (proc is None) or (el >= start_grace)
                 if el >= min_wait and idled >= idle_hold and ready:
+                    # No psutil = no way to tell work from idle, so the old fixed-sleep
+                    # behavior stands (assume it ran). With psutil, seeing neither signal
+                    # means the click never landed -- report that instead of a false "done".
+                    if proc is not None and not (peaked or seen_dialog):
+                        self.log(f"   {label}: released at ~{el:.1f}s but NO work was ever "
+                                 f"observed (no CPU peak, no progress dialog) -> the click "
+                                 f"most likely did not register")
+                        return "never-started"
                     self.log(f"   {label}: complete at ~{el:.1f}s (dialog gone + CPU idle)")
-                    return True
+                    return "done"
+        if proc is not None and not (peaked or seen_dialog):
+            self.log(f"   {label}: hit {max_timeout:.0f}s ceiling having never seen the op run")
+            return "never-started"
         self.log(f"   {label}: hit {max_timeout:.0f}s ceiling -> proceeding")
-        return True
+        return "done"
 
     # ------ blip/peel (single-pass + long-shot chunked) ------
+
+    def _run_panel_op(self, label, variants, fallback_action, timeout, attempts=2):
+        """Click a Features-panel button and WAIT for the op to really run, retrying when it
+        didn't. Raises RuntimeError if it never ran.
+
+        _win32_click_button only proves the button was found and a message was posted -- not
+        that SynthEyes acted on it. A click that silently doesn't register looked exactly like
+        a completed op, so Peel then ran on zero blips and the shot exported 0 trackers with
+        nothing in the log to say why. This re-asserts the room + foreground and re-clicks,
+        which is the same recover-and-retry shape _blip_peel_chunked already uses.
+        """
+        for attempt in range(1, attempts + 1):
+            # The panel's child controls only exist while the window is up and in the
+            # Features room; a lost foreground is exactly why a click gets dropped.
+            self._ensure_features_room()
+            self._bring_foreground()
+            if not self._win32_click_button(label, variants):
+                self.log(f"   Win32 '{label}' unavailable - falling back to SyPy3 dispatch")
+                if self._click_and_wait(fallback_action, label, timeout=timeout):
+                    return
+                raise RuntimeError(f"{label} failed: button not found and SyPy3 dispatch failed")
+            self.log(f"   {label} dispatched... (waiting for completion signal)")
+            st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout)
+            if st == "done":
+                return
+            if st == "stopped":
+                return          # user pressed Stop; the caller's own stop checks take over
+            if st == "error":
+                # crash/OOM dialog -> clear it and the half-built blips before retrying
+                self._dismiss_error_dialog()
+                self._win32_click_button("Clear blips", ["Clear all blips"])
+                if not self.is_alive():
+                    raise RuntimeError(f"SynthEyes crashed during {label}")
+            if attempt < attempts:
+                self.log(f"   {label}: '{st}' -> retrying ({attempt + 1}/{attempts})")
+        raise RuntimeError(
+            f"{label} never ran after {attempts} attempts (last status '{st}'). "
+            f"SynthEyes ignored the panel click - the shot would have exported 0 tracks.")
 
     def _blip_peel_full(self, frame_count, blip_timeout, peel_timeout):
         """Single-pass: blip ALL frames, peel, clear. Fine for shots that fit in memory."""
         self.log("-> Blip All frames (Win32 PostMessage)...")
-        if self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"]):
-            self.log(f"   blipping {frame_count} frames... (waiting for completion signal)")
-            self._wait_for_operation("Blip All", min_wait=3.0, max_timeout=blip_timeout)
-        else:
-            self.log("   Win32 blip unavailable - falling back to SyPy3 dispatch")
-            if not self._click_and_wait("Feature/Blips all frames", "Blip All", timeout=blip_timeout):
-                raise RuntimeError("Blip All failed")
+        self._run_panel_op("Blip All", ["Blips all frames", "Blip all frames"],
+                           "Feature/Blips all frames", blip_timeout)
 
         self.log("-> Peel All (Win32 PostMessage)...")
-        if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-            self.log("   peeling... (waiting for completion signal)")
-            self._wait_for_operation("Peel All", min_wait=3.0, max_timeout=peel_timeout)
-        else:
-            self.log("   Win32 peel unavailable - falling back to SyPy3 dispatch")
-            if not self._click_and_wait("Feature/Peel All", "Peel All", timeout=peel_timeout):
-                raise RuntimeError("Peel All failed")
+        self._run_panel_op("Peel All", ["Peel all", "Peel All"],
+                           "Feature/Peel All", peel_timeout)
 
         self.log("-> Clearing blips...")
         if not self._win32_click_button("Clear blips", ["Clear all blips"]):
@@ -674,12 +724,15 @@ class SynthEyesEngine:
                     wto = max(120, int((b - a + 1) * 0.3))
                     if self._win32_click_button("Blips playback range",
                                                 ["Blips playback range", "Blip playback range"]):
-                        ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
+                        st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
                     else:
                         self.log("   'Blips playback range' not found - falling back to Blip All")
                         self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
-                        ok = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
-                    if ok or getattr(self, "_stop_requested", False):
+                        st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
+                    # 'never-started' joins 'error' on the retry path: both mean this window
+                    # produced nothing, and a re-click is exactly the right recovery.
+                    ok = (st == "done")
+                    if ok or st == "stopped" or getattr(self, "_stop_requested", False):
                         break
                     # crash/OOM signal -> recover + shrink + retry
                     self._dismiss_error_dialog()
@@ -691,7 +744,8 @@ class SynthEyesEngine:
                         self.log(f"   window {a}-{b}: cannot shrink further -> proceeding"); break
                     win = shrunk
                     b = min(a + win - 1, e0)
-                    self.log(f"   memory pressure -> shrink window to plate {a+1}-{b+1} ({win}f) and retry")
+                    why = "click did not register" if st == "never-started" else "memory pressure"
+                    self.log(f"   {why} -> shrink window to plate {a+1}-{b+1} ({win}f) and retry")
 
                 # B) calibrate MB/frame from the first successful window
                 if fixed <= 0 and rss_per_frame is None and proc:
@@ -704,8 +758,14 @@ class SynthEyesEngine:
 
                 self.log(f"   [window {idx}] plate frames {a+1}-{b+1} ({b - a + 1}f) blipped")
                 if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
-                    self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
-                                             max_timeout=max(200, int((b - a + 1) * 1.2)))
+                    pst = self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
+                                                   max_timeout=max(200, int((b - a + 1) * 1.2)))
+                    # Trackers ACCUMULATE across windows, so one dead peel loses only this
+                    # window -- warn (so a pattern is visible in the log) rather than abort
+                    # the shot, which is the caller's call once the export count is known.
+                    if pst == "never-started":
+                        self.log(f"   WARNING: window {idx} peel never ran - that window "
+                                 f"contributed no trackers")
                 self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
             finally:
                 wd.cancel()
@@ -1107,7 +1167,17 @@ class SynthEyesEngine:
         # socket on 2026.2.4679 and is fragile; the Python gating is more robust + exact.
 
         self.log("-> Switching to Features room (via TopTabber tab click)...")
-        self._ensure_features_room()
+        # Hard-fail if the room can't be reached. Without it the blip/peel buttons don't
+        # exist, every click falls through to the SyPy3 dispatch that no-ops on 2026.2.4679,
+        # and the shot silently exports 0 trackers AFTER burning the whole blip/peel budget.
+        # One retry first: the usual cause is a lost foreground, which _bring_foreground fixes.
+        if not self._ensure_features_room():
+            self.log("   Features room not reached - retrying once after a foreground nudge")
+            self._bring_foreground()
+            if not self._ensure_features_room():
+                raise RuntimeError(
+                    "Could not reach the SynthEyes Features room (blip/peel buttons never "
+                    "appeared). Tracking this shot would produce 0 trackers.")
         self._configure_features(track_count, track_threshold, track_separation)
         # NOTE (2026 debug): _set_advanced_max_tracks does ByID(1238).ClickAndContinue()
         # on a control that no longer exists on 2026 ("Advanced dialog not found").
@@ -1153,7 +1223,7 @@ class SynthEyesEngine:
         # the Demo frozen tail. Beats the fragile SynthEyes roto matte.
         if n_trk > 0 and mask_dir:
             res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
-            if res:
+            if res is not None:      # (0, 0) means "gated to nothing" -- still a real result
                 n_trk = res[0]
 
         if n_trk > 0:
@@ -1320,15 +1390,38 @@ class SynthEyesEngine:
         self.log("   WARNING: Could not switch room")
 
     def _configure_features(self, count, threshold, separation):
+        """Write the Features-room spinners and VERIFY the writes landed.
+
+        This used to skip a missing spinner silently, so a failed 'Count' write was
+        invisible: SynthEyes kept whatever count was left over from a previous session and
+        the UI slider looked broken (or the shot tracked far fewer points than asked).
+        Read back where the API allows so the log states what SynthEyes actually holds.
+        """
         self.log(f"   Features: count={count}, threshold={threshold}, separation={separation}")
         try:
             ui = self.hlev.Main()
-            for name, val in [("Count", count), ("Threshold", threshold), ("Separation", separation)]:
-                spinner = ui.ByName(name)
-                if spinner.IsValid():
-                    spinner.SetSpnValue(val)
         except Exception as e:
-            self.log(f"   WARNING: Could not set features: {e}")
+            self.log(f"   WARNING: Could not reach the Features panel to set values: {e}")
+            return
+        for name, val in [("Count", count), ("Threshold", threshold), ("Separation", separation)]:
+            try:
+                spinner = ui.ByName(name)
+                if not spinner.IsValid():
+                    self.log(f"   WARNING: Features spinner '{name}' not found - "
+                             f"{name}={val} was NOT applied (SynthEyes keeps its old value)")
+                    continue
+                spinner.SetSpnValue(val)
+                try:
+                    got = spinner.GetSpnValue()
+                except Exception:
+                    continue      # no read-back on this build; the write itself succeeded
+                if got is not None and int(got) != int(val):
+                    self.log(f"   WARNING: '{name}' read back as {got}, expected {val} - "
+                             f"SynthEyes rejected the write")
+                else:
+                    self.log(f"   OK  '{name}' = {got}")
+            except Exception as e:
+                self.log(f"   WARNING: could not set Features '{name}'={val}: {e}")
 
     # ----- Advanced dialog (known control IDs, Win32 input) -----
     ADV_BUTTON_ID = 1238
@@ -1542,12 +1635,19 @@ class SynthEyesEngine:
             return None
 
         mask_cache = {}
+        # Frame-alignment counters. keep_point maps export frame N -> masks[N-1], so a plate
+        # numbered 1001.. against 120 masks lands every point out of range and the gating
+        # silently does NOTHING. Counting both makes "mask did nothing" and "mask dropped
+        # everything" distinguishable in the log instead of looking alike.
+        span = {"matched": 0, "out_of_range": 0}
 
         def keep_point(frame, x, y):
             # export frame is 1-based; masks are a sorted 1-based sequence
             idx = int(frame) - 1
             if idx < 0 or idx >= len(masks):
+                span["out_of_range"] += 1
                 return True  # no mask for this frame -> don't drop
+            span["matched"] += 1
             m = mask_cache.get(idx)
             if m is None:
                 m = cv2.imread(masks[idx], cv2.IMREAD_GRAYSCALE)
@@ -1578,7 +1678,24 @@ class SynthEyesEngine:
             if len(gated) >= min_len:
                 out_tracks.append((name, color, gated))
 
-        # rewrite in place
+        if span["out_of_range"]:
+            self.log(f"   SAM3 post-filter: {span['matched']} point(s) had a matching mask "
+                     f"frame, {span['out_of_range']} fell outside the {len(masks)} mask(s) "
+                     f"and were kept ungated (export frame N maps to mask N-1 - a plate that "
+                     f"starts at 1001 will not line up)")
+
+        # Gating wiped the shot -> FAIL it and keep nothing, rather than overwrite the good
+        # ungated export with an empty file (which then published over a previous good one).
+        if not out_tracks:
+            self.log(f"   SAM3 post-filter: ALL {ntr} track(s) were gated away - failing the "
+                     f"shot and removing the export (masks may be inverted or misaligned)")
+            try:
+                os.remove(txt_path)
+            except Exception:
+                pass
+            return 0, 0
+
+        # rewrite in place (only now that we know there is something worth writing)
         lines = [str(len(out_tracks))]
         for name, color, gated in out_tracks:
             lines.append(name)
@@ -1619,8 +1736,16 @@ class SynthEyesEngine:
                 os.remove(out_txt_path)
         except Exception:
             pass
-        self._resync_socket()  # clean socket so RunScriptFile actually runs
+        if not self._resync_socket():
+            # A desynced socket makes RunScriptFile a silent no-op, which reads downstream as
+            # "0 tracks". Say so here so the log names the real culprit.
+            self.log("   WARNING: socket resync failed - the Sizzle export may silently no-op")
         p = out_txt_path.replace("\\", "/")
+        # Raw vs exported tracker counts, written to a sidecar the caller reads and deletes.
+        # Without this, 0 tracks is ambiguous: 'blip/peel never produced anything' and
+        # 'trackers exist but none are flagged exportable' look identical. #obj.trk is the
+        # shipped idiom (see SynthEyes' own scripts/Trackers/*.szl).
+        diag = p + ".diag"
         # Sizzle syntax (from SynthEyes' own tdexport.szl / trkpath.szl): newline-terminated
         # statements, for(...)...end / if(...)...end (NO semicolons, NO braces). openout()
         # redirects printf to the file; pixel = 0.5*(u+1)*width, 0.5*(1-v)*height. Classic 3DE
@@ -1660,8 +1785,12 @@ class SynthEyesEngine:
             "    end\n"
             "end\n"
             "closeout()\n"
+            f'openout("{diag}")\n'
+            'printf("%d %d\\n", #obj.trk, nt)\n'
+            "closeout()\n"
         )
         self._run_sizzle(script)
+        self._log_export_diag(diag)
         if not os.path.isfile(out_txt_path):
             self.log("   ERROR: Sizzle export produced no file")
             return -1
@@ -1674,6 +1803,29 @@ class SynthEyesEngine:
         except Exception as e:
             self.log(f"   WARNING: could not parse Sizzle export header: {e}")
             return -1
+
+    def _log_export_diag(self, diag_path):
+        """Read + delete the raw/exported sidecar and say what it means. Best-effort: if the
+        second openout didn't work on this build, stay quiet rather than invent a diagnosis."""
+        try:
+            if not os.path.isfile(diag_path):
+                return
+            with open(diag_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw, exp = (int(x) for x in f.readline().split()[:2])
+            self.log(f"   trackers: raw={raw} exported={exp}")
+            if raw == 0:
+                self.log("   -> SynthEyes holds NO trackers: blip/peel produced nothing "
+                         "(panel automation failed), not a tracking-quality problem.")
+            elif exp == 0:
+                self.log(f"   -> {raw} tracker(s) exist but none are flagged exportable: "
+                         "tracking quality / too few valid frames, not an automation failure.")
+        except Exception as e:
+            self.log(f"   (export diagnostic unavailable: {e})")
+        finally:
+            try:
+                os.remove(diag_path)
+            except Exception:
+                pass
 
     def _export_tracks(self, output_dir, filename):
         out = os.path.normpath(output_dir)
