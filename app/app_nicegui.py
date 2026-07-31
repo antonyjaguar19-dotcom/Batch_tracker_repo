@@ -1024,6 +1024,14 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
                               "Turn OFF if it masks things you removed from Exclude.")
 
+            ui.label("Mask edge dilation (px · applies at Mask time)")
+            mask_dilate = ui.slider(min=0, max=30, value=int(getattr(state, "mask_dilation_px", 10)), step=1).props("label-always")
+            mask_dilate.on_value_change(lambda e: setattr(state, "mask_dilation_px", int(e.value or 0)))
+            mask_dilate.tooltip("Grows the excluded (mover) region when masks are GENERATED, so trackers stay off soft "
+                                "edges — hair, motion-blur fringe. Mirrors SynthEyes Mask ML's Mask Dilation and helps "
+                                "both backends. Only affects masks made from now on: re-run Generate masks to apply it "
+                                "to existing shots (or use the track-time margin in TAPNext++ settings instead).")
+
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
@@ -1079,8 +1087,24 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 ui.label("Track spacing (px · density dial)")
                 track_spacing = ui.slider(min=10, max=120, value=int(getattr(state, "track_spacing_px", 40)), step=5).props("label-always")
                 track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 40)))
-                track_spacing.tooltip("Min pixel gap between kept tracks. Small = denser/more tracks, large = sparser/fewer. "
-                                      "Collapses duplicate passes and spreads the strongest tracks evenly; count floats with footage texture/parallax.")
+                track_spacing.tooltip("Min pixel gap between kept tracks, measured ON SCREEN at several sampled frames "
+                                      "(not on each track's average position), so tracks can't clump at the start or end "
+                                      "of a moving shot. Small = denser/more tracks, large = sparser/fewer.")
+
+                ui.label("Mask safety margin at track time (px)")
+                mask_margin = ui.slider(min=0, max=40, value=int(getattr(state, "mask_margin_px", 8)), step=1).props("label-always")
+                mask_margin.on_value_change(lambda e: setattr(state, "mask_margin_px", int(e.value or 0)))
+                mask_margin.tooltip("Pulls seeding and mask gating IN from the matte edge by this many pixels. "
+                                    "SAM3 mattes often stop just short of hair / motion-blur fringe, and a track left in "
+                                    "that halo sticks to the character and slides. Applies to the masks you ALREADY have "
+                                    "— no re-masking needed. 0 = use the matte exactly as-is.")
+
+                ui.label("Reject edge-like tracks (0 = off)")
+                aniso = ui.slider(min=0.0, max=0.4, value=float(getattr(state, "min_corner_anisotropy", 0.08)), step=0.01).props("label-always")
+                aniso.on_value_change(lambda e: setattr(state, "min_corner_anisotropy", float(e.value or 0.0)))
+                aniso.tooltip("Drops points sitting on a straight edge (rope, plate lines, TV-screen borders). Such a point "
+                              "can only be pinned across the edge, never along it, so it slides left/right. Higher = stricter "
+                              "(fewer, more corner-like tracks). Try 0.15 if sliding persists, 0.04 if too many tracks are lost.")
                 ui.label("Max tracks per task (0 = auto)")
                 track_max = ui.number(value=int(getattr(state, "track_max_output", 0)), min=0, max=500, precision=0
                                       ).props("dense outlined").classes("w-full")
