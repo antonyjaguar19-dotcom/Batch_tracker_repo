@@ -611,9 +611,11 @@ def _norm_shot(s: str) -> str:
     return re.sub(r"[\s_\-]+", "", str(s).strip()).lower()
 
 
-def _prompt_missing_requirements(missing):
+def _prompt_missing_requirements(missing, on_done):
     """Ask the user for a client requirement for each missing shot, one by one,
-    in a text field. Notes saved to <OUT>/manual_requirements.json for reuse."""
+    in a text field. Notes saved to <OUT>/manual_requirements.json for reuse.
+    on_done() runs once every shot has been answered or skipped — it is what
+    actually launches the job, so both Analyze and Run Pipeline can share this."""
     idx = {"i": 0}
     dlg = ui.dialog().props("persistent")
     with dlg, ui.card().classes("w-96"):
@@ -644,7 +646,7 @@ def _prompt_missing_requirements(missing):
         if idx["i"] >= len(missing):
             be.save_manual_notes(out_dir.value, state.manual_notes)
             dlg.close()
-            _launch_analyze()
+            on_done()
         else:
             render()
 
@@ -654,23 +656,34 @@ def _prompt_missing_requirements(missing):
     dlg.open()
 
 
-def start_analyze():
-    shots = [n for n, d in state.shots_data.items() if getattr(d, "use", False)]
-    if not shots:
-        ui.notify("Select at least one shot (tick 'Use'), then Analyze.", type="warning")
-        return
+def _gate_client_scope(shots, on_ready):
+    """Make sure every selected shot has a client requirement, then run on_ready().
+
+    Analysis is only as good as the client scope it is given: with no requirement the
+    guide comes back with nothing usable, masking falls through to 'no_mask_needed' and
+    the run is wasted. Both Analyze and Run Pipeline go through here so the prompt can
+    never be skipped by taking the other route.
+    """
     # Reuse any notes saved in a previous session (saved for later use).
     saved = be.load_manual_notes(out_dir.value)
     state.manual_notes = dict(saved)
     have = be.requirement_shot_names(req_file.value)
     have |= {_norm_shot(k) for k, v in saved.items() if str(v).strip()}
     missing = [s for s in shots if _norm_shot(s) not in have]
-    if missing:
-        ui.notify(f"{len(missing)} shot(s) missing a client requirement — enter them.",
-                  type="warning")
-        _prompt_missing_requirements(missing)
+    if not missing:
+        on_ready()
         return
-    _launch_analyze()
+    ui.notify(f"{len(missing)} shot(s) missing a client requirement — enter them.",
+              type="warning")
+    _prompt_missing_requirements(missing, on_ready)
+
+
+def start_analyze():
+    shots = [n for n, d in state.shots_data.items() if getattr(d, "use", False)]
+    if not shots:
+        ui.notify("Select at least one shot (tick 'Use'), then Analyze.", type="warning")
+        return
+    _gate_client_scope(shots, _launch_analyze)
 
 
 def _launch_mask():
@@ -769,11 +782,17 @@ def start_pipeline():
         ui.label(", ".join(sorted(sel))).classes("text-caption")
         ui.label("Analyze (Qwen) → Generate masks (SAM3) → Track, back-to-back. "
                  "Shots that already have masks reuse them. Stop halts between stages.")
+        ui.label("Shots with no client requirement are asked for one first — the same "
+                 "prompt Analyze shows.").classes("text-caption")
         with ui.row().classes("w-full justify-end"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
 
             def _go():
-                dlg.close(); _launch_pipeline()
+                # Same client-scope gate the Analyze button uses. Without it the pipeline
+                # ran Qwen with zero requirements, so the guide came back empty, masking
+                # fell through to 'no_mask_needed' and the chain died before Track ever
+                # published anything to the shot's bot_tracks folder.
+                dlg.close(); _gate_client_scope(sel, _launch_pipeline)
 
             ui.button("Run pipeline", on_click=_go, color="primary")
     dlg.open()
@@ -836,20 +855,10 @@ def poll():
 
     if refresh_path and os.path.exists(refresh_path):
         try:
-            import json
+            # Same helper worker_analyze calls, so the table and a chained Mask can never
+            # disagree about what the analysis said.
             state.guide_path = refresh_path
-            with open(refresh_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for s in data.get("shots", []):
-                nm = s.get("shot_name") or s.get("shot") or s.get("name")
-                if nm and nm in state.shots_data:
-                    d = state.shots_data[nm]
-                    d.strategy = be._derive_strategy(s)
-                    d.include_prompts = be._extract_prompt_list(s, ["mask_includes", "include_prompts", "sam3_include_prompt"])
-                    d.exclude_prompts = be._extract_prompt_list(s, ["mask_excludes", "exclude_prompts", "sam3_exclude_prompt"])
-                    rt = s.get("qwen2_things", [])
-                    if isinstance(rt, list): d.detected_things = rt
-                    be._apply_analysis_fields(d, s)
+            be.sync_shots_from_guide(state, refresh_path)
             refresh_now = True
         except Exception as ex:
             print(f"guide reload: {ex}")
