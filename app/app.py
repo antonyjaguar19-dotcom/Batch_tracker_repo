@@ -1126,6 +1126,11 @@ class AppState:
     # Accuracy passes
     refine_fb_max_px: float = 1.5      # forward-backward consistency tolerance; 0 = off
     refine_drift_floor: float = 0.55   # min match vs the ORIGINAL patch when re-referencing
+    # Uniform track starts + corner-feature precision
+    seed_stagger: int = 4              # entry times a window's fresh seeds are split across
+    spread_max_starts_per_window: int = 0   # cap tracks STARTING together; 0 = unlimited
+    match_ambiguity_ratio: float = 0.90     # reject a match a rival peak nearly ties; 1 = off
+    refine_search_max: int = 64             # ceiling for the adaptive NCC search radius
     # --- Tracking backend selection + SynthEyes settings ---
     track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
@@ -2111,6 +2116,12 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 refine_ncc_reacquire=float(getattr(state, "refine_ncc_reacquire", 0.75) or 0.75),
                 refine_fb_max_px=float(getattr(state, "refine_fb_max_px", 1.5) or 0.0),
                 refine_drift_floor=float(getattr(state, "refine_drift_floor", 0.55) or 0.0),
+                # Even track starts + the distinctiveness test that stops a point snapping to
+                # an identical neighbour (bolts, window grids). See RunnerConfig for why.
+                seed_stagger=int(getattr(state, "seed_stagger", 4) or 1),
+                spread_max_starts_per_window=int(getattr(state, "spread_max_starts_per_window", 0) or 0),
+                match_ambiguity_ratio=float(getattr(state, "match_ambiguity_ratio", 0.90) or 1.0),
+                refine_search_max=int(getattr(state, "refine_search_max", 64) or 24),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()
