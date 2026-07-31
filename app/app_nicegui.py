@@ -1274,6 +1274,22 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                 "With this on the point just goes missing for those frames and resumes after — "
                                 "3DE reads the gap natively. Turn off to restore the old drop-if-ever-covered rule.")
 
+                ui.label("Ignore brief occlusions (frames · 1 = off)")
+                occ_run = ui.slider(min=1, max=10, value=int(getattr(state, "min_occlusion_run", 3)), step=1).props("label-always")
+                occ_run.on_value_change(lambda e: setattr(state, "min_occlusion_run", int(e.value or 1)))
+                occ_run.tooltip("A point sitting on the mask edge flips in and out from sub-pixel jitter alone, "
+                                "so the track looks like it flickers on and off while its pattern never moved. "
+                                "An occlusion has to last at least this many frames to count. Raise it if you "
+                                "still see flicker around characters.")
+
+                ui.label("Lock hold strength (anti-flicker)")
+                hold = ui.slider(min=0.2, max=0.6, value=float(getattr(state, "refine_ncc_hold", 0.45)), step=0.05).props("label-always")
+                hold.on_value_change(lambda e: setattr(state, "refine_ncc_hold", float(e.value or 0.45)))
+                hold.tooltip("It takes a strong match to trust a point, but only this much to KEEP trusting it. "
+                             "Without the gap between the two, a match hovering near the cutoff drops the point "
+                             "for single frames on grainy footage. Lower = holds on longer. A frame held this "
+                             "way never becomes the new reference pattern.")
+
                 ui.label("Re-acquire window (frames · 0 = off)")
                 reacq_gap = ui.slider(min=0, max=96, value=int(getattr(state, "reacquire_max_gap", 24)), step=2).props("label-always")
                 reacq_gap.on_value_change(lambda e: setattr(state, "reacquire_max_gap", int(e.value or 0)))
