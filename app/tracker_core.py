@@ -79,6 +79,16 @@ class RunnerConfig:
     enable_mask_gating: bool = True
     inside_ratio: float = 0.80
 
+    # --- Occlusion continuity ---------------------------------------------------------
+    # 'outside' gating used to be a per-TRACK kill ("dropped if ever inside"), so one person
+    # walking past for a few frames deleted an otherwise perfect background track for the
+    # WHOLE shot. The mover mask is actually the best occlusion signal available (SAM3 knows
+    # exactly where the character is on every frame), so it now marks those frames occluded
+    # and the track survives with a gap. 3DE takes gaps natively (export writes a frame
+    # number per point) and pattern_refine already refines per visible segment.
+    occlusion_continuity: bool = True
+    min_track_points: int = 8      # drop a track only if fewer than this many frames survive
+
     # --- Quality-ranked, evenly-spread track selection (post-pass) ---
     # Collapses the 4x pass duplication, scores each surviving track on its OWN
     # trajectory (parallax-safe: no agreement-with-global-motion term), then greedily
@@ -136,6 +146,32 @@ class RunnerConfig:
     # Set to "affine"/"euclidean" for shots with real camera roll or zoom.
     refine_motion: str = "translation"   # translation | euclidean | affine
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
+
+    # --- Re-acquisition after an occlusion --------------------------------------------
+    # A lost lock used to END that side of the track, which is how points were lost to
+    # occluders SAM3 never masked (poles, props, a hand). Instead, treat it as a candidate
+    # occlusion: keep stepping and try to re-find the ORIGINAL anchor patch. The search
+    # centre is predicted from nearby surviving tracks -- the one thing CoTracker does well
+    # -- but the sub-pixel position still comes from native-res NCC, which is what actually
+    # carries the accuracy here (measured 4.88 -> 4.03 -> 1.30px, see enable_moving_tile).
+    reacquire_max_gap: int = 24        # frames to keep trying before giving up; 0 = off
+    refine_ncc_reacquire: float = 0.75  # correlation vs the ANCHOR needed to call it the same point
+    reacquire_neighbours: int = 8       # nearest tracks used to predict where it reappears
+    # Post-gap segments that FAIL the anchor check are emitted as a separate track rather
+    # than welded into one id: welding two different features is invisible until the solve
+    # fails, so on doubt it splits.
+    split_unverified_segments: bool = True
+
+    # --- Accuracy passes ---------------------------------------------------------------
+    # Drift guard: re-referencing used to re-grab the patch at the CURRENT position with
+    # nothing tying it to the original, so over a long shot the pattern random-walks off the
+    # feature. A re-reference is now accepted only if it still correlates with the ANCHOR.
+    refine_drift_floor: float = 0.55     # 0 = off (old unbounded re-referencing)
+    refine_drift_check_every: int = 24   # also re-validate against the anchor this often
+    # Forward-backward consistency: refine the segment, then re-run it backwards; a good
+    # point returns to where it started. Self-referential, so parallax-safe (it never judges
+    # a track against global motion). Roughly doubles refine time. 0 = off.
+    refine_fb_max_px: float = 1.5
     # Gap-aware refine: a track that disappears (occlusion) and reappears is refined per
     # contiguous VISIBLE segment (each re-acquires its own reference patch) and reassembled
     # under ONE id -> the reappeared segment is kept, not trimmed by the pre-occlusion patch.
@@ -497,18 +533,28 @@ class BatchTrackerRunner:
         T_seg: int,
         global_T: int,
         start_frame: int,
-        is_reverse: bool
+        is_reverse: bool,
+        want_occlusion: bool = False,
     ) -> tuple[np.ndarray, str]:
+        """Returns (keep, info). With want_occlusion, `keep` is instead a per-FRAME (T,N)
+        boolean of which samples are usable -- False where the mover mask covers the point --
+        so a crossed track survives with a gap instead of being deleted outright."""
+        def _all_ok(msg):
+            shape = (T_seg, tracks_xy.shape[1]) if want_occlusion else (tracks_xy.shape[1],)
+            return np.ones(shape, dtype=bool), msg
+
         if not self.cfg.enable_mask_gating:
-            return np.ones((tracks_xy.shape[1],), dtype=bool), "mask gating disabled"
+            return _all_ok("mask gating disabled")
 
         mask_paths, where = self._list_mask_files(shot_name)
         if not mask_paths:
-            return np.ones((tracks_xy.shape[1],), dtype=bool), "no masks for gating"
+            return _all_ok("no masks for gating")
 
         N = int(tracks_xy.shape[1])
         inside_count = np.zeros((N,), dtype=np.int32)
         total_count = np.zeros((N,), dtype=np.int32)
+        # Per-frame occlusion: True where the mover mask covers this point on this frame.
+        occluded = np.zeros((T_seg, N), dtype=bool) if want_occlusion else None
         M = len(mask_paths)
 
         # Masks cover the FULL clip; tracked frames may be a sub-range. Map the local
@@ -574,12 +620,24 @@ class BatchTrackerRunner:
             in_region = region[ys, xs]
             total_count[vt] += 1
             inside_count[vt & in_region] += 1
+            if occluded is not None:
+                # Mark the sample occluded whether or not the tracker thought it was visible:
+                # the mask is the authority on where the character is, and TAPNext frequently
+                # keeps reporting a covered point as visible (it locks onto the character).
+                occluded[t] = in_region
 
         if int(np.max(total_count)) <= 0:
-            return np.ones((N,), dtype=bool), f"{where} | gating: no usable mask frames"
+            return _all_ok(f"{where} | gating: no usable mask frames")
 
         marg = f" margin={margin}px" if margin > 0 else ""
         if mode == "outside":
+            if occluded is not None:
+                usable = ~occluded
+                n_gapped = int(np.sum(np.any(occluded, axis=0)))
+                n_dead = int(np.sum(np.sum(usable, axis=0) == 0))
+                return usable, (f"{where} | gating(outside): {n_gapped}/{N} track(s) occluded "
+                                f"for part of the shot -> kept with a gap, {n_dead} fully "
+                                f"covered{marg}")
             keep = inside_count == 0
             kept = int(np.sum(keep))
             return keep, f"{where} | gating(outside): kept={kept}/{N} (dropped if ever inside){marg}"
@@ -590,7 +648,12 @@ class BatchTrackerRunner:
         thr = float(self.cfg.inside_ratio)
         keep = ratio >= thr
         kept = int(np.sum(keep))
-        return keep, f"{where} | gating(inside): kept={kept}/{N} (inside_ratio>={thr:.2f}){marg}"
+        info = f"{where} | gating(inside): kept={kept}/{N} (inside_ratio>={thr:.2f}){marg}"
+        if want_occlusion:
+            # 'inside' semantics are unchanged -- an object track SHOULD stay on its object,
+            # so this stays a whole-track decision. Broadcast it so the caller has one shape.
+            return np.broadcast_to(keep, (T_seg, N)).copy(), info
+        return keep, info
 
     def run(self):
         try:
@@ -648,12 +711,14 @@ class BatchTrackerRunner:
         N = int(tracks_xy.shape[1])
         
         # 2. MASK GATING
-        gate_keep = np.ones((N,), dtype=bool)
+        occl = bool(getattr(self.cfg, "occlusion_continuity", True))
+        gate_keep = np.ones((T_seg, N) if occl else (N,), dtype=bool)
         gate_msg = "no gating"
         if n_masks > 0 and self.cfg.enable_mask_gating and N > 0:
             gate_keep, gate_msg = self._apply_per_frame_mask_gating(
-                shot_name, tracks_xy, vis.astype(bool), Ws, Hs, 
-                T_seg=T_seg, global_T=global_T, start_frame=start_frame, is_reverse=is_reverse
+                shot_name, tracks_xy, vis.astype(bool), Ws, Hs,
+                T_seg=T_seg, global_T=global_T, start_frame=start_frame, is_reverse=is_reverse,
+                want_occlusion=occl,
             )
 
         return tracks_xy, vis, gate_keep, f"[{pass_name}] N={N} {gate_msg}"
@@ -697,6 +762,14 @@ class BatchTrackerRunner:
             # Pre-mask any immediate NaNs/Infs that the tracker leaked
             vis_bool = vis_raw.astype(bool) & ~np.isnan(x_all) & ~np.isnan(y_all) & ~np.isinf(x_all) & ~np.isinf(y_all)
 
+            # Occlusion continuity: a (T,N) gate marks the frames the mover mask covers, so
+            # the point simply goes INVISIBLE there and the track survives with a gap. The
+            # old (N,) gate deleted the whole track for one crossing. Applied BEFORE the
+            # motion filter so the occluded samples can't be read as a jump either.
+            if gate_mask is not None and getattr(gate_mask, "ndim", 1) == 2:
+                vis_bool = vis_bool & gate_mask.astype(bool)
+                gate_mask = None
+
             keep = np.ones((N,), dtype=bool)
             if self.cfg.enable_filtering and N > 0:
                 keep = self._post_filter_tracks(x_all, y_all, vis_bool, diag=diag)
@@ -704,6 +777,9 @@ class BatchTrackerRunner:
 
             if gate_mask is not None:
                 keep = keep & gate_mask
+            # A fully-covered track has nothing left; drop anything too short to be useful.
+            min_pts = max(2, int(getattr(self.cfg, "min_track_points", 8) or 2))
+            keep = keep & (np.sum(vis_bool, axis=0) >= min_pts)
             diag_after_gate += int(np.sum(keep))
             kept_idx = np.where(keep)[0]
             win = max(1, int(self.cfg.smooth_window or 1))
@@ -957,13 +1033,16 @@ class BatchTrackerRunner:
         return max(1, min(n, int(self.cfg.max_chunks)))
 
     def _gate_assembled(self, shot: str, xy: np.ndarray, vis: np.ndarray, W0: int, H0: int, T: int) -> np.ndarray:
-        """Mask-gate an assembled full-length sweep (coords in ORIGINAL, top-left orientation)."""
+        """Mask-gate an assembled full-length sweep (coords in ORIGINAL, top-left orientation).
+        Returns a per-frame (T,N) usable mask when occlusion continuity is on, else per-track."""
         N = int(xy.shape[1])
+        occl = bool(getattr(self.cfg, "occlusion_continuity", True))
         if N == 0 or not self.cfg.enable_mask_gating:
-            return np.ones((N,), dtype=bool)
+            return np.ones((T, N) if occl else (N,), dtype=bool)
         keep, _msg = self._apply_per_frame_mask_gating(
             shot, xy, vis.astype(bool), W0, H0,
             T_seg=T, global_T=T, start_frame=0, is_reverse=False,
+            want_occlusion=occl,
         )
         return keep
 

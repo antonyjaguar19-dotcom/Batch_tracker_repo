@@ -1265,6 +1265,46 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                     "that halo sticks to the character and slides. Applies to the masks you ALREADY have "
                                     "— no re-masking needed. 0 = use the matte exactly as-is.")
 
+                ui.separator().classes("q-my-sm")
+                ui.label("Occlusion & accuracy").classes("bt-section")
+                sw_occl = ui.switch("Survive occlusion (break, then resume)",
+                                    value=bool(getattr(state, "occlusion_continuity", True)),
+                                    on_change=lambda e: setattr(state, "occlusion_continuity", bool(e.value)))
+                sw_occl.tooltip("A character crossing a point used to DELETE that track for the whole shot. "
+                                "With this on the point just goes missing for those frames and resumes after — "
+                                "3DE reads the gap natively. Turn off to restore the old drop-if-ever-covered rule.")
+
+                ui.label("Re-acquire window (frames · 0 = off)")
+                reacq_gap = ui.slider(min=0, max=96, value=int(getattr(state, "reacquire_max_gap", 24)), step=2).props("label-always")
+                reacq_gap.on_value_change(lambda e: setattr(state, "reacquire_max_gap", int(e.value or 0)))
+                reacq_gap.tooltip("How long to keep hunting for a point after it is lost, before giving up. "
+                                  "Covers occluders SAM3 never masked — poles, props, a hand. Where it should "
+                                  "reappear is predicted from nearby tracks, then confirmed by matching the "
+                                  "original pattern at full resolution.")
+
+                ui.label("Re-acquire match strength")
+                reacq_thr = ui.slider(min=0.5, max=0.95, value=float(getattr(state, "refine_ncc_reacquire", 0.75)), step=0.05).props("label-always")
+                reacq_thr.on_value_change(lambda e: setattr(state, "refine_ncc_reacquire", float(e.value or 0.75)))
+                reacq_thr.tooltip("How closely the point must match its pre-occlusion pattern to count as the SAME "
+                                  "point. Pass = one continuous track with a gap. Fail = emitted as a separate track, "
+                                  "never welded — two different features under one ID stays invisible until the solve fails.")
+
+                ui.label("Forward-backward tolerance (px · 0 = off)")
+                fb_tol = ui.slider(min=0.0, max=6.0, value=float(getattr(state, "refine_fb_max_px", 1.5)), step=0.5).props("label-always")
+                fb_tol.on_value_change(lambda e: setattr(state, "refine_fb_max_px", float(e.value or 0.0)))
+                fb_tol.tooltip("Re-tracks each track backwards and drops frames the return pass disagrees with — a "
+                               "correct point comes back where it started. Strongest accuracy signal available, and "
+                               "parallax-safe (never judged against overall camera motion). Roughly doubles refine time. "
+                               "Lower = stricter.")
+
+                ui.label("Pattern drift guard (0 = off)")
+                drift = ui.slider(min=0.0, max=0.9, value=float(getattr(state, "refine_drift_floor", 0.55)), step=0.05).props("label-always")
+                drift.on_value_change(lambda e: setattr(state, "refine_drift_floor", float(e.value or 0.0)))
+                drift.tooltip("When the tracker re-grabs its pattern mid-shot, require it to still resemble the "
+                              "ORIGINAL. Without this the pattern slowly walks off the feature over a long shot. "
+                              "Costs almost nothing. Higher = stricter.")
+
+                ui.separator().classes("q-my-sm")
                 ui.label("Reject edge-like tracks (0 = off)")
                 aniso = ui.slider(min=0.0, max=0.4, value=float(getattr(state, "min_corner_anisotropy", 0.08)), step=0.01).props("label-always")
                 aniso.on_value_change(lambda e: setattr(state, "min_corner_anisotropy", float(e.value or 0.0)))
