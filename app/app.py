@@ -1119,6 +1119,8 @@ class AppState:
     refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
+    min_occlusion_run: int = 3         # ignore 1-2 frame mask-edge chatter (anti-flicker)
+    refine_ncc_hold: float = 0.45      # hysteresis: lower bar to HOLD a lock than to lose it
     reacquire_max_gap: int = 24        # frames to keep trying to re-find the point; 0 = off
     refine_ncc_reacquire: float = 0.75  # match vs the pre-occlusion patch to call it the same
     # Accuracy passes
@@ -2103,6 +2105,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.
                 occlusion_continuity=bool(getattr(state, "occlusion_continuity", True)),
+                min_occlusion_run=int(getattr(state, "min_occlusion_run", 3) or 1),
+                refine_ncc_hold=float(getattr(state, "refine_ncc_hold", 0.45) or 0.45),
                 reacquire_max_gap=int(getattr(state, "reacquire_max_gap", 24) or 0),
                 refine_ncc_reacquire=float(getattr(state, "refine_ncc_reacquire", 0.75) or 0.75),
                 refine_fb_max_px=float(getattr(state, "refine_fb_max_px", 1.5) or 0.0),

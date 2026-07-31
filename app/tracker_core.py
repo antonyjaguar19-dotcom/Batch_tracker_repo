@@ -88,6 +88,11 @@ class RunnerConfig:
     # number per point) and pattern_refine already refines per visible segment.
     occlusion_continuity: bool = True
     min_track_points: int = 8      # drop a track only if fewer than this many frames survive
+    # A point sitting right on the (dilated) mask edge flips in and out from sub-pixel
+    # jitter alone, which reads as the track flickering on and off while its pattern is
+    # plainly visible. An occlusion has to LAST to be real: runs shorter than this are
+    # treated as boundary chatter and the frames are kept. 1 = no hysteresis.
+    min_occlusion_run: int = 3
 
     # --- Quality-ranked, evenly-spread track selection (post-pass) ---
     # Collapses the 4x pass duplication, scores each surviving track on its OWN
@@ -140,6 +145,12 @@ class RunnerConfig:
     refine_patch_px: int = 31       # pattern box (odd); larger = more stable, less local
     refine_search_px: int = 24      # search radius around TAPNext coarse position
     refine_ncc_lost: float = 0.60   # corr below this = lock lost -> trim the track here
+    # Hysteresis (Schmitt trigger). refine_ncc_lost alone is a single hard edge, so on grainy
+    # footage the correlation hovers around it and the point drops out for a frame here and
+    # there while its pattern is plainly visible -- the track appears to flicker. Once locked,
+    # hold on down to this lower bar; only below it is the lock genuinely lost. A frame held
+    # this way is never used to re-grab the pattern. Set == refine_ncc_lost to disable.
+    refine_ncc_hold: float = 0.45
     refine_ncc_reref: float = 0.85  # corr below this (but >= lost) = re-grab the pattern
     # translation default: with moving-tile placing the point accurately, affine's extra
     # rot/scale DoF only adds wobble on pan/translation-dominant plates (measured regression).
@@ -449,6 +460,34 @@ class BatchTrackerRunner:
         info = f"{where} | masks={len(mask_paths)} sampled={used} union_mask={pct:.1f}% polarity={self.cfg.mask_polarity}->{eff_pol}"
         return union_region, info, len(mask_paths)
 
+    @staticmethod
+    def _drop_short_runs(occ: np.ndarray, min_run: int) -> np.ndarray:
+        """Clear occluded runs shorter than min_run, per track (column) of a (T,N) array.
+
+        Sub-pixel jitter around a mask boundary marks a point occluded for one frame here
+        and there, which shows up as a track flickering on and off even though its pattern
+        never went anywhere. A genuine crossing lasts several frames.
+        """
+        if min_run <= 1 or occ.size == 0:
+            return occ
+        out = occ.copy()
+        T = out.shape[0]
+        for j in range(out.shape[1]):
+            col = out[:, j]
+            if not col.any():
+                continue
+            t = 0
+            while t < T:
+                if not col[t]:
+                    t += 1
+                    continue
+                s = t
+                while t < T and col[t]:
+                    t += 1
+                if (t - s) < min_run:
+                    col[s:t] = False      # too brief to be a real occlusion
+        return out
+
     def _shrink_region(self, incl: np.ndarray, margin: int) -> np.ndarray:
         """Pull the keep-region IN by `margin` px (erode). SAM3 mattes routinely stop a few px
         short of the real silhouette, and a point seeded in that halo is stuck to the character
@@ -632,12 +671,18 @@ class BatchTrackerRunner:
         marg = f" margin={margin}px" if margin > 0 else ""
         if mode == "outside":
             if occluded is not None:
+                min_run = max(1, int(getattr(self.cfg, "min_occlusion_run", 1) or 1))
+                raw_frames = int(np.sum(occluded))
+                occluded = self._drop_short_runs(occluded, min_run)
+                de_flickered = raw_frames - int(np.sum(occluded))
                 usable = ~occluded
                 n_gapped = int(np.sum(np.any(occluded, axis=0)))
                 n_dead = int(np.sum(np.sum(usable, axis=0) == 0))
+                extra = (f", ignored {de_flickered} 1-2 frame boundary flicker(s)"
+                         if de_flickered else "")
                 return usable, (f"{where} | gating(outside): {n_gapped}/{N} track(s) occluded "
                                 f"for part of the shot -> kept with a gap, {n_dead} fully "
-                                f"covered{marg}")
+                                f"covered{extra}{marg}")
             keep = inside_count == 0
             kept = int(np.sum(keep))
             return keep, f"{where} | gating(outside): kept={kept}/{N} (dropped if ever inside){marg}"
