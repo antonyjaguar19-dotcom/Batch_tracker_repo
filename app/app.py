@@ -944,6 +944,42 @@ def _apply_analysis_fields(shot: "ShotData", s_item: dict) -> None:
         shot.depth_layers = {"fg": str(dl.get("fg") or ""), "mg": str(dl.get("mg") or ""), "bg": str(dl.get("bg") or "")}
     shot.parallax = str(s_item.get("qwen2_parallax") or "").strip()
 
+def sync_shots_from_guide(state: "AppState", guide_path: str) -> int:
+    """Copy a guide's per-shot analysis onto state.shots_data. Returns shots updated.
+
+    The UI normally does this in poll() when it sees GUIDE_PATH_UPDATE, but poll() only
+    runs on the event loop. worker_pipeline chains Analyze -> Mask inside ONE worker
+    thread, so masking could reach _shots_data_ before poll() had copied anything across
+    and read the PRE-analysis (empty) include/exclude prompts. worker_mask treats those
+    as authoritative and writes them back verbatim, which silently erased the prompts
+    Qwen had just produced and left every task on 'no_mask_needed'. Calling this at the
+    end of worker_analyze makes the handoff deterministic instead of a race with poll().
+    """
+    if not (state and guide_path and os.path.isfile(guide_path)):
+        return 0
+    try:
+        with open(guide_path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return 0
+    n = 0
+    for s_item in (data.get("shots") or []):
+        if not isinstance(s_item, dict):
+            continue
+        nm = s_item.get("shot_name") or s_item.get("shot") or s_item.get("name")
+        shot = state.shots_data.get(nm) if nm else None
+        if not shot:
+            continue
+        shot.strategy = _derive_strategy(s_item)
+        shot.include_prompts = _extract_prompt_list(s_item, ["mask_includes", "include_prompts", "sam3_include_prompt"])
+        shot.exclude_prompts = _extract_prompt_list(s_item, ["mask_excludes", "exclude_prompts", "sam3_exclude_prompt"])
+        rt = s_item.get("qwen2_things", [])
+        if isinstance(rt, list):
+            shot.detected_things = rt
+        _apply_analysis_fields(shot, s_item)
+        n += 1
+    return n
+
 def _quality_cell(shot: "ShotData") -> str:
     """Short table cell: warn icon + flags, else OK."""
     if shot.quality_flags:
@@ -1506,6 +1542,15 @@ def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
         # would otherwise reach worker_mask with guide_path still unset and silently mask
         # against a fresh overdrive_guide instead of this analysis.
         state.guide_path = str(guide_path)
+        # Same reason: push the new prompts/strategy onto shots_data HERE rather than
+        # waiting for poll() to do it, so a chained Mask reads this analysis and not the
+        # empty pre-run values (which it would then write back over the guide).
+        try:
+            n_sync = sync_shots_from_guide(state, str(guide_path))
+            if n_sync:
+                logger(f"Applied analysis to {n_sync} shot(s).")
+        except Exception as e:
+            logger(f"Warning: could not apply guide to the shot table: {e}")
         # Publish each analyzed shot's guide slice + note to its studio tree.
         for nm, d in state.shots_data.items():
             if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
