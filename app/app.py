@@ -1117,6 +1117,13 @@ class AppState:
     gap_aware_refine: bool = True  # TAPNext: keep disappear/reappear points as one track (per-segment refine)
     pattern_refine: bool = True    # TAPNext: 3DE-style NCC/affine pattern lock at native res
     refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
+    # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
+    occlusion_continuity: bool = True
+    reacquire_max_gap: int = 24        # frames to keep trying to re-find the point; 0 = off
+    refine_ncc_reacquire: float = 0.75  # match vs the pre-occlusion patch to call it the same
+    # Accuracy passes
+    refine_fb_max_px: float = 1.5      # forward-backward consistency tolerance; 0 = off
+    refine_drift_floor: float = 0.55   # min match vs the ORIGINAL patch when re-referencing
     # --- Tracking backend selection + SynthEyes settings ---
     track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
@@ -2093,6 +2100,13 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 refine_gap_aware=bool(getattr(state, "gap_aware_refine", True)),
                 enable_pattern_refine=bool(getattr(state, "pattern_refine", True)),
                 refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
+                # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
+                # each exists; all are no-ops at 0/False.
+                occlusion_continuity=bool(getattr(state, "occlusion_continuity", True)),
+                reacquire_max_gap=int(getattr(state, "reacquire_max_gap", 24) or 0),
+                refine_ncc_reacquire=float(getattr(state, "refine_ncc_reacquire", 0.75) or 0.75),
+                refine_fb_max_px=float(getattr(state, "refine_fb_max_px", 1.5) or 0.0),
+                refine_drift_floor=float(getattr(state, "refine_drift_floor", 0.55) or 0.0),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()
