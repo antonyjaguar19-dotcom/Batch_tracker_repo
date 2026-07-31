@@ -723,6 +723,13 @@ def publish_shot(work_out: str, studio_dir: str, shot: str, backend: str,
         except OSError:
             pass
 
+        # --- the shot's tracking log -> <studio>/logs/ (so a failure is diagnosable from
+        # the shot folder, not only from whatever was on screen at the time).
+        slog = os.path.join(work_out, f"{shot}__track.log")
+        if os.path.isfile(slog):
+            if _copy_file(slog, os.path.join(studio_dir, "logs", f"{shot}__track.log")):
+                _log(f"published log -> {os.path.join(studio_dir, 'logs')}")
+
     # --- masks: <work>/<shot>/masks* -> <studio>/masks/
     if do_mask:
         for md in _shot_mask_dirs(work_out, shot):
@@ -1107,10 +1114,53 @@ def _set_progress(msg: str, done=None, total=None):
 def _job_running() -> bool:
     return CURRENT_JOB_THREAD is not None and CURRENT_JOB_THREAD.is_alive()
 
+# Per-shot tracking log. The UI log view is the only record today, so an overnight failure
+# can't be diagnosed afterward. While a shot is tracking, logger() also tees to this file;
+# publish_shot copies it into the shot's studio logs/ folder.
+_SHOT_LOG = {"path": "", "fh": None}
+
+def open_shot_log(out_dir: str, shot: str) -> str:
+    """Start teeing logger() to <out_dir>/<shot>__track.log. Safe to call repeatedly."""
+    close_shot_log()
+    if not (out_dir and shot):
+        return ""
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{shot}__track.log")
+        _SHOT_LOG["fh"] = open(path, "a", encoding="utf-8")
+        _SHOT_LOG["path"] = path
+        _SHOT_LOG["fh"].write(f"\n===== {shot} @ {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+        _SHOT_LOG["fh"].flush()
+        return path
+    except Exception as e:
+        print(f"shot log open failed for {shot}: {e}")
+        _SHOT_LOG["fh"] = None
+        _SHOT_LOG["path"] = ""
+        return ""
+
+def close_shot_log() -> None:
+    fh = _SHOT_LOG.get("fh")
+    if fh:
+        try:
+            fh.close()
+        except Exception:
+            pass
+    _SHOT_LOG["fh"] = None
+    _SHOT_LOG["path"] = ""
+
 def logger(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     full_msg = f"[{ts}] {msg}"
     JOB_QUEUE.put(full_msg)   # UI log keeps full unicode - the browser renders it fine
+    fh = _SHOT_LOG.get("fh")
+    if fh:
+        # Never let a logging problem kill the worker mid-stage (same rule as the console
+        # copy below): a full disk or a closed handle must not abort tracking.
+        try:
+            fh.write(full_msg + "\n")
+            fh.flush()
+        except Exception:
+            pass
     try:
         print(full_msg)
     except UnicodeEncodeError:
@@ -1753,6 +1803,21 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
         JOB_QUEUE.put("DONE_MASKING")   # signal end on failure too (also refreshes the table)
         return False
 
+def _shot_track_files(work_out, shot: str, backend: str) -> List[str]:
+    """Track .txt files a backend produced for a shot, using the SAME match rule as
+    publish_shot ("<shot>__*__<backend>.txt"). Lets the caller confirm a backend really
+    produced output before publishing under its name."""
+    out = []
+    try:
+        for f in os.listdir(str(work_out)):
+            low = f.lower()
+            if (low.endswith(f"__{backend}.txt") and low.startswith(f"{shot.lower()}__")):
+                out.append(f)
+    except OSError:
+        pass
+    return out
+
+
 def _find_mask_dir(out_root, shot_name, mask_subdir):
     """Locate a SAM3 mask folder for a shot (case-insensitive child), trying the
     task's mask_subdir first, then a plain 'masks' fallback. Returns path or None."""
@@ -1778,16 +1843,25 @@ def _find_mask_dir(out_root, shot_name, mask_subdir):
     return None
 
 
-def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist):
-    """TAPNext++ tracking path (Apache-2.0 GPU tracker, fallback backend)."""
+def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_count,
+                         seed_min_dist, only_shots=None):
+    """TAPNext++ tracking path (Apache-2.0 GPU tracker, fallback backend).
+
+    only_shots: restrict the run to this set of shot names (same convention as
+    run_qwen2_batch). Used for the retry pass over shots SynthEyes could not track.
+    """
     any_ran = False
     stopped = False
-    sel_total = sum(1 for d in state.shots_data.values() if getattr(d, "use", False))
+    sel_names = [n for n, d in state.shots_data.items() if getattr(d, "use", False)
+                 and (only_shots is None or n in only_shots)]
+    sel_total = len(sel_names)
     sel_done = 0
     for shot_name, data in state.shots_data.items():
         if STOP_EVENT.is_set():
             logger("Tracking stopped by user."); stopped = True; break
         if not getattr(data, "use", False): continue
+        if only_shots is not None and shot_name not in only_shots: continue
+        open_shot_log(str(out_root), shot_name)
 
         video_dir, filename = None, None
         # Renders persist in the shot's own cache folder (studio tree) and are reused.
@@ -1918,13 +1992,20 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
         sel_done += 1
         _set_progress(f"{shot_name} · done", sel_done, sel_total)
         if stopped: break
+    close_shot_log()
     return any_ran, stopped
 
 
 def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count):
-    """SynthEyes tracking path: drive one SynthEyes instance over SyPy3 across shots."""
+    """SynthEyes tracking path: drive one SynthEyes instance over SyPy3 across shots.
+
+    Returns (any_ran, stopped, failed) where `failed` maps shot -> reason for every shot that
+    produced no usable tracks. worker_track retries those on TAPNext once SynthEyes has closed
+    and given the GPU back.
+    """
     any_ran = False
     stopped = False
+    failed = {}
     sel_total = sum(1 for d in state.shots_data.values() if getattr(d, "use", False))
     sel_done = 0
 
@@ -1945,11 +2026,11 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
 
     if not settings["syntheyes_exe"]:
         logger("ERROR: SynthEyes .exe not set. Open Settings and point to SynthEyes64.exe.")
-        return any_ran, stopped
+        return any_ran, stopped, failed
     engine = SynthEyesEngine(settings, on_log=lambda m: logger(f"SE: {m}"))
     if not engine.setup_sypy():
         logger("ERROR: SyPy3 not found — install SynthEyes / check its bundled Python.")
-        return any_ran, stopped
+        return any_ran, stopped, failed
     # Force a CLEAN instance for the batch: reusing a stale/hung SynthEyes left over from a
     # prior run desyncs the socket and makes process_shot fail (shots then get swallowed ->
     # a bland "Nothing to track"). launch() kills any existing instance first, so this
@@ -1957,7 +2038,7 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
     logger("Starting a clean SynthEyes instance for this batch…")
     if not engine.launch() or not engine.connect():
         logger("ERROR: Could not start/connect to SynthEyes.")
-        return any_ran, stopped
+        return any_ran, stopped, failed
 
     prev_was_heavy = False
     try:
@@ -1965,6 +2046,7 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
             if STOP_EVENT.is_set():
                 logger("Tracking stopped by user."); stopped = True; break
             if not getattr(data, "use", False): continue
+            open_shot_log(str(out_root), shot_name)
 
             # Chosen plate version (network fetch) wins; SynthEyes reads EXR natively so
             # it uses the raw plate dir, no proxy. Falls back to the flat <in_root>/<shot>.
@@ -1993,6 +2075,7 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                         mv = vids[0]
                 if mv is None:
                     logger(f"Skip {shot_name}: no image sequence or movie found.")
+                    failed[shot_name] = "no image sequence or movie found"
                     continue
                 movie_path = str(mv)
                 first_frame = movie_path
@@ -2023,7 +2106,16 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
             if not tasks:
                 tasks = [{"task_id": "camera", "mask_subdir": "masks"}]
 
+            # The PRESET decides the count unless it is "Custom", in which case the Seed Count
+            # slider is used. Say which one won: the slider sits above the backend selector and
+            # reads as global, so a preset quietly overriding it looks like a broken slider.
             track_count = se_preset_track_count(preset, seed_count) if se_preset_track_count else int(seed_count)
+            if int(track_count) != int(seed_count):
+                logger(f"  max tracks: {track_count} (from preset '{preset}'; the Seed Count "
+                       f"slider value {int(seed_count)} is ignored — choose the 'Custom' "
+                       f"preset to use the slider)")
+            else:
+                logger(f"  max tracks: {track_count} (preset '{preset}')")
 
             qc_parts = []
             for t in tasks:
@@ -2049,11 +2141,21 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                         track_count=track_count, mask_dir=mask_dir,
                         image_width=img_w, image_height=img_h, movie_path=movie_path,
                     )
-                    any_ran = True
-                    logger(f"  DONE: {shot_name}/{task_id} — {n_trk} trackers")
+                    # Only a shot that actually produced tracks counts as "ran". A 0-track
+                    # shot used to report success AND publish an empty .txt over a previously
+                    # good one; now it is a failure and goes to the TAPNext retry pass.
+                    if n_trk > 0:
+                        any_ran = True
+                        logger(f"  DONE: {shot_name}/{task_id} — {n_trk} trackers")
+                    else:
+                        failed[shot_name] = f"{task_id}: exported 0 tracks"
+                        logger(f"  FAILED: {shot_name}/{task_id} — 0 tracks "
+                               f"(queued for the TAPNext retry pass)")
+                        continue
                 except Exception as e:
                     logger(f"ERROR tracking '{shot_name}/{task_id}': {e}")
                     traceback.print_exc()
+                    failed[shot_name] = f"{task_id}: {e}"
                     continue
 
                 try:
@@ -2079,12 +2181,13 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
             prev_was_heavy = (frame_count >= 1000)
             if stopped: break
     finally:
+        close_shot_log()
         logger("Closing SynthEyes...")
         try:
             engine.kill_syntheyes()
         except Exception as e:
             logger(f"  Could not close SynthEyes: {e}")
-    return any_ran, stopped
+    return any_ran, stopped, failed
 
 
 def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppState):
@@ -2124,10 +2227,47 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
             logger(f"SynthEyes backend unavailable ({SYNTHEYES_IMPORT_ERROR}); falling back to TAPNext++.")
             backend = "tapnext"
 
+        # Which backend actually produced each shot's tracks. publish_shot matches
+        # "<shot>__*__<backend>.txt", so a batch where some shots fell back to TAPNext must
+        # publish per shot -- one global backend would silently publish nothing for them.
+        backend_by_shot = {}
         if backend == "syntheyes":
             logger("Tracking backend: SynthEyes")
             _free_vram("before SynthEyes")  # release torch cache so SynthEyes can use the GPU
-            any_ran, stopped = _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
+            any_ran, stopped, failed = _track_shots_syntheyes(in_root, out_root, shot_tasks_map,
+                                                              state, seed_count)
+            for nm, d in state.shots_data.items():
+                if getattr(d, "use", False) and nm not in failed:
+                    backend_by_shot[nm] = "syntheyes"
+            # Deferred TAPNext retry. It has to run AFTER the SynthEyes pass, not inline:
+            # SynthEyes holds the GPU until _track_shots_syntheyes kills it in its finally.
+            if failed and not stopped:
+                logger(f"=== {len(failed)} shot(s) produced no tracks in SynthEyes — "
+                       f"retrying on TAPNext++ ===")
+                for nm, why in sorted(failed.items()):
+                    logger(f"   {nm}: {why}")
+                if BatchTrackerRunner is None:
+                    _ensure_tracker_loaded()
+                if BatchTrackerRunner is None:
+                    logger(f"TAPNext++ unavailable, cannot retry: {TRACKER_IMPORT_ERROR}")
+                else:
+                    _free_vram("before TAPNext retry")
+                    t_ran, t_stopped = _track_shots_tapnext(
+                        in_root, out_root, shot_tasks_map, state, grid, seed_count,
+                        seed_min_dist, only_shots=set(failed))
+                    _free_vram("after TAPNext retry")
+                    stopped = stopped or t_stopped
+                    if t_ran:
+                        any_ran = True
+                        # Only shots with a real TAPNext .txt publish as tapnext.
+                        for nm in failed:
+                            if _shot_track_files(out_root, nm, "tapnext"):
+                                backend_by_shot[nm] = "tapnext"
+                        recovered = [n for n in failed if backend_by_shot.get(n) == "tapnext"]
+                        logger(f"TAPNext++ retry recovered {len(recovered)}/{len(failed)} shot(s)"
+                               + (f": {', '.join(sorted(recovered))}" if recovered else ""))
+                    else:
+                        logger("TAPNext++ retry produced no tracks either.")
         else:
             logger("Tracking backend: TAPNext++")
             _ensure_tracker_loaded()
@@ -2135,6 +2275,9 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
             if BatchTrackerRunner is None: raise ImportError(f"Tracker module missing. {TRACKER_IMPORT_ERROR}")
             any_ran, stopped = _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist)
             _free_vram("after TAPNext")
+            for nm, d in state.shots_data.items():
+                if getattr(d, "use", False):
+                    backend_by_shot[nm] = "tapnext"
 
         if stopped: logger("Tracking halted.")
         elif not any_ran:
@@ -2143,10 +2286,12 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                    "SynthEyes errored on it. Confirm the Input Folder is set and the shot is ticked.")
         else: logger("Tracking Complete.")
         if any_ran:
-            # Publish the 2D tracks to each selected shot's studio bot_tracks folder.
+            # Publish the 2D tracks to each selected shot's studio bot_tracks folder, each
+            # under the backend that actually tracked it.
             for nm, d in state.shots_data.items():
-                if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
-                    publish_shot(str(out_root), d.studio_dir, nm, backend, scope="track", log_cb=logger)
+                if getattr(d, "use", False) and getattr(d, "studio_dir", "") and nm in backend_by_shot:
+                    publish_shot(str(out_root), d.studio_dir, nm, backend_by_shot[nm],
+                                 scope="track", log_cb=logger)
         JOB_QUEUE.put("DONE_TRACKING")
         return not stopped
     except Exception as e:
