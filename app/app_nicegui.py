@@ -1269,6 +1269,37 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                     "that halo sticks to the character and slides. Applies to the masks you ALREADY have "
                                     "— no re-masking needed. 0 = use the matte exactly as-is.")
 
+                ui.label("Stagger new track starts (1 = off)")
+                stagger = ui.slider(min=1, max=8, value=int(getattr(state, "seed_stagger", 4)), step=1).props("label-always")
+                stagger.on_value_change(lambda e: setattr(state, "seed_stagger", int(e.value or 1)))
+                stagger.tooltip("New tracks used to all begin on the first frame of each re-seed window, so they "
+                                "arrived in a visible clump every N frames. This splits each window's new points "
+                                "across this many entry times so they appear steadily. Also picks up detail that "
+                                "only becomes visible mid-window. Same number of tracks, spread out.")
+
+                ui.label("Max tracks starting together (0 = unlimited)")
+                start_cap = ui.slider(min=0, max=60, value=int(getattr(state, "spread_max_starts_per_window", 0)), step=5).props("label-always")
+                start_cap.on_value_change(lambda e: setattr(state, "spread_max_starts_per_window", int(e.value or 0)))
+                start_cap.tooltip("Hard cap on how many tracks may begin within the same few frames — the "
+                                  "best-scoring ones win. Use it if starts still look bunched after staggering; "
+                                  "0 leaves it to the staggering alone.")
+
+                ui.label("Reject look-alike matches (1.0 = off)")
+                ambig = ui.slider(min=0.7, max=1.0, value=float(getattr(state, "match_ambiguity_ratio", 0.90)), step=0.02).props("label-always")
+                ambig.on_value_change(lambda e: setattr(state, "match_ambiguity_ratio", float(e.value or 1.0)))
+                ambig.tooltip("Repeating detail — bolts, rivets, window grids, tiles — gives the matcher several "
+                              "near-identical answers, and it would silently pick the one NEXT DOOR at high "
+                              "confidence. This refuses to answer when a rival is nearly as good, and the point "
+                              "holds its previous position instead. Lower = stricter.")
+
+                ui.label("Max search radius (px · fast motion)")
+                smax = ui.slider(min=24, max=128, value=int(getattr(state, "refine_search_max", 64)), step=8).props("label-always")
+                smax.on_value_change(lambda e: setattr(state, "refine_search_max", int(e.value or 24)))
+                smax.tooltip("How far the matcher may look when a point is moving fast. A fixed small radius makes "
+                             "a fast feature land outside the search box, so the match snaps to whatever is inside "
+                             "and slides. Grows only as fast as the point actually moves; slow shots keep the tight "
+                             "box. Cost rises with the SQUARE of this, so don't raise it without need.")
+
                 ui.separator().classes("q-my-sm")
                 ui.label("Occlusion & accuracy").classes("bt-section")
                 sw_occl = ui.switch("Survive occlusion (break, then resume)",
