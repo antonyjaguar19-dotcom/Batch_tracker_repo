@@ -558,6 +558,39 @@ def resolve_frames_batch(version_dirs: List[str], workers: int = _SCAN_WORKERS):
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(version_dirs)))) as ex:
         return list(ex.map(_safe_find_frames, version_dirs))
 
+# --- Per-shot progress, read from the shot's OWN folder ------------------------------
+# Derived from the real published artifacts rather than a separate status file, so it can
+# never drift out of sync with what is actually on disk -- and because the artifacts live
+# in <show>/<shot>/mid/cmm/bot_tracks, the bot shows the same progress from any workstation
+# on the share. ONE listdir per shot answers all three (publish_shot only creates
+# analysis/ and masks/ when it actually copied something into them).
+_BLANK_STATUS = {"analyzed": False, "masked": False, "tracked": False}
+
+def _safe_shot_status(studio_dir: str) -> dict:
+    try:
+        if not studio_dir or not os.path.isdir(studio_dir):
+            return dict(_BLANK_STATUS)
+        analyzed = masked = tracked = False
+        for e in os.listdir(studio_dir):
+            low = e.lower()
+            if low == "analysis":
+                analyzed = True
+            elif low == "masks":
+                masked = True
+            elif low.endswith(".txt") and "_2dtracks" in low:
+                tracked = True
+        return {"analyzed": analyzed, "masked": masked, "tracked": tracked}
+    except Exception:
+        return dict(_BLANK_STATUS)
+
+def shot_status_batch(studio_dirs: List[str], workers: int = _SCAN_WORKERS) -> List[dict]:
+    """{'analyzed','masked','tracked'} per shot, in order. Thread-pooled: these are UNC
+    listings, and one per shot serially is what made a 100+ shot scan crawl."""
+    if not studio_dirs:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(studio_dirs)))) as ex:
+        return list(ex.map(_safe_shot_status, studio_dirs))
+
 _RENDER_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 def render_sequence_to_mp4(seq_dir: str, out_mp4: str, log_cb=None, fps: int = 24,
@@ -1051,6 +1084,12 @@ class ShotData:
     plate_end: int = 0     # absolute last frame number
     render_path: str = ""  # TAPNext: user-pointed .mp4 file OR jpeg/png render folder
     studio_dir: str = ""   # publish target: <show>/<shot>/mid/cmm/bot_tracks
+    # What this shot already has, read from studio_dir at scan time (shot_status_batch).
+    # Kept separate from the in-memory signals (strategy / track_metrics_summary) so the
+    # badges survive a restart and read the same from any workstation on the share.
+    has_analysis: bool = False
+    has_masks: bool = False
+    has_tracks: bool = False
 
 @dataclass
 class AppState:
@@ -1506,6 +1545,75 @@ def clear_shot_memory(out_root, shot_name):
     logger(f"Cleared analysis memory for '{shot_name}'." if removed
            else f"No stored analysis found for '{shot_name}'.")
     return removed
+
+
+def clear_shot_artifacts(work_out: str, studio_dir: str, shot: str, *,
+                         analysis: bool = False, masks: bool = False,
+                         tracks: bool = False) -> Dict[str, int]:
+    """Delete a shot's finished work, per scope, from BOTH the local work dir and the shot's
+    own studio folder. Returns {'analysis': n, 'masks': n, 'tracks': n} file counts.
+
+    DESTRUCTIVE and reaches the network share: the studio copies are the ones that make the
+    UI badges (and another workstation's view) read 'done', so clearing a badge has to remove
+    them too. Each scope is independent so masks -- by far the most expensive stage -- can be
+    kept while tracking is redone. Missing paths are a no-op, never an error.
+    """
+    import shutil
+    counts = {"analysis": 0, "masks": 0, "tracks": 0}
+
+    def _rm_file(p) -> int:
+        try:
+            if p and os.path.isfile(p):
+                os.remove(p)
+                return 1
+        except Exception as e:
+            logger(f"clear '{shot}': could not delete {p}: {e}")
+        return 0
+
+    def _rm_tree(d) -> int:
+        try:
+            if not d or not os.path.isdir(d):
+                return 0
+            n = sum(1 for p in Path(d).rglob("*") if p.is_file())
+            shutil.rmtree(d, ignore_errors=True)
+            return n
+        except Exception as e:
+            logger(f"clear '{shot}': could not delete {d}: {e}")
+            return 0
+
+    if analysis:
+        # Guide entry + manual note in the work dir, then the published slice.
+        try:
+            clear_shot_memory(work_out, shot)
+        except Exception as e:
+            logger(f"clear '{shot}': analysis memory: {e}")
+        if studio_dir:
+            counts["analysis"] += _rm_tree(os.path.join(studio_dir, "analysis"))
+
+    if masks:
+        for md in _shot_mask_dirs(work_out, shot):
+            counts["masks"] += _rm_tree(md)
+        if studio_dir:
+            counts["masks"] += _rm_tree(os.path.join(studio_dir, "masks"))
+
+    if tracks:
+        # Work dir: "<shot>__*.txt" for either backend (same rule publish_shot matches on).
+        for backend in ("syntheyes", "tapnext"):
+            for f in _shot_track_files(work_out, shot, backend):
+                counts["tracks"] += _rm_file(os.path.join(work_out, f))
+        # Studio: the published "<shot>_2Dtracks*.txt".
+        try:
+            if studio_dir and os.path.isdir(studio_dir):
+                pre = f"{shot.lower()}_2dtracks"
+                for f in os.listdir(studio_dir):
+                    if f.lower().startswith(pre) and f.lower().endswith(".txt"):
+                        counts["tracks"] += _rm_file(os.path.join(studio_dir, f))
+        except OSError as e:
+            logger(f"clear '{shot}': listing studio dir: {e}")
+
+    done = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
+    logger(f"Cleared {shot}: {done}" if done else f"Cleared {shot}: nothing to remove")
+    return counts
 
 
 def worker_analyze(in_dir, out_dir, req_path, fps, ollama_url, state: AppState):
