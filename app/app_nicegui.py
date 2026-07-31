@@ -1013,6 +1013,11 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             qwen_fps = ui.slider(min=1, max=8, value=4).props("label-always")
             ui.label("Seed Count (Max Tracks)")
             seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
+            seed_count.tooltip(
+                "Always used by TAPNext++. On SynthEyes it only applies when the SynthEyes "
+                "preset below is set to 'Custom' — every other preset has its own fixed count "
+                "(Locked 100 / Slow 500 / Normal 800 / Fast 2000) and ignores this slider. "
+                "The tracking log prints the count actually used and where it came from.")
 
             sw_motion = ui.switch("CV motion backstop", value=True,
                                   on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
