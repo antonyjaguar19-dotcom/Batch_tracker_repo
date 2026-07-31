@@ -48,15 +48,28 @@ def _extract(gray: np.ndarray, x: float, y: float, half: int) -> Optional[np.nda
     return gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
 
 
-def _contrast_score(patch: np.ndarray) -> float:
-    """Min eigenvalue of the structure tensor (goodFeaturesToTrack-style cornerness)."""
+def _structure_eigs(patch: np.ndarray) -> Tuple[float, float]:
+    """Both structure-tensor eigenvalues (lambda_min, lambda_max) for a patch."""
     p = patch.astype(np.float32)
     gx = cv2.Sobel(p, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(p, cv2.CV_32F, 0, 1, ksize=3)
     a = float(np.mean(gx * gx)); b = float(np.mean(gx * gy)); c = float(np.mean(gy * gy))
     t = a + c
-    disc = max(0.0, t * t / 4.0 - (a * c - b * b))
-    return t / 2.0 - math.sqrt(disc)
+    disc = math.sqrt(max(0.0, t * t / 4.0 - (a * c - b * b)))
+    return (t / 2.0 - disc, t / 2.0 + disc)
+
+
+def _contrast_score(patch: np.ndarray) -> float:
+    """Min eigenvalue of the structure tensor (goodFeaturesToTrack-style cornerness)."""
+    return _structure_eigs(patch)[0]
+
+
+def _anisotropy(patch: np.ndarray) -> float:
+    """lambda_min / lambda_max: ~1 for a corner, ~0 for a pure edge. Contrast-invariant, so
+    it separates 'this is a 1-D feature' from 'this is faint', which _contrast_score alone
+    cannot. A 1-D patch gives NCC a response RIDGE, and the point slides along it."""
+    lo, hi = _structure_eigs(patch)
+    return (lo / hi) if hi > 1e-12 else 0.0
 
 
 def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
@@ -211,6 +224,13 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     if best_i < 0 or best_patch is None:
         return None
 
+    # Aperture guard: even the sharpest patch in this segment may be a 1-D feature (the track
+    # seeded on a corner and drifted onto an edge, or re-referenced onto one). NCC can only
+    # pin it across the edge, so refining it just slides it along -- drop the segment instead.
+    thr = float(getattr(cfg, "min_corner_anisotropy", 0.0) or 0.0)
+    if thr > 0.0 and _anisotropy(best_patch) < thr:
+        return None
+
     refined: Dict[int, Tuple[int, float, float]] = {
         best_i: (pts[best_i][0], float(pts[best_i][1]), float(pts[best_i][2]))
     }
@@ -353,5 +373,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             trimmed += 1
         out[name] = to_out(ref)
 
-    info = f"refined={len(out)}/{len(final_tracks)} trimmed={trimmed} dropped={dropped}"
+    aniso = float(getattr(cfg, "min_corner_anisotropy", 0.0) or 0.0)
+    extra = f" (edge-reject anisotropy<{aniso:.2f})" if aniso > 0.0 else ""
+    info = f"refined={len(out)}/{len(final_tracks)} trimmed={trimmed} dropped={dropped}{extra}"
     return out, info
