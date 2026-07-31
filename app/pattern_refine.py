@@ -72,6 +72,27 @@ def _anisotropy(patch: np.ndarray) -> float:
     return (lo / hi) if hi > 1e-12 else 0.0
 
 
+def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalised correlation between two equally-sized patches. Used to ask 'is this still
+    the same feature?' -- against the anchor for drift, and across a gap for re-acquisition.
+
+    Zero-variance patches are rejected outright: TM_CCOEFF_NORMED divides by the standard
+    deviation, so a FLAT patch scores ~1.0 against anything. Without this guard a pattern
+    that drifted onto a blank wall would sail through the drift guard -- the exact case it
+    exists to catch.
+    """
+    if a is None or b is None or a.shape != b.shape or a.size == 0:
+        return -1.0
+    try:
+        fa = a.astype(np.float32)
+        fb = b.astype(np.float32)
+        if float(fa.std()) < 1e-3 or float(fb.std()) < 1e-3:
+            return -1.0
+        return float(cv2.matchTemplate(fa, fb, cv2.TM_CCOEFF_NORMED)[0, 0])
+    except Exception:
+        return -1.0
+
+
 def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
     """Quadratic sub-pixel offset of the NCC response peak at integer `loc`."""
     mx, my = loc
@@ -198,7 +219,7 @@ class _FrameGray:
 
 
 def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
-                    edge_clamp: bool) -> Tuple[Optional[Track], str]:
+                    edge_clamp: bool, predict=None) -> Tuple[Optional[Track], str]:
     """NCC/ECC refine one CONTIGUOUS visible segment (anchor at its sharpest frame,
     refine outward both ways, trim on loss of lock).
 
@@ -246,10 +267,20 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
         best_i: (pts[best_i][0], float(pts[best_i][1]), float(pts[best_i][2]))
     }
 
+    # Re-acquisition + drift-guard settings.
+    max_gap = int(getattr(cfg, "reacquire_max_gap", 0) or 0)
+    reacq = float(getattr(cfg, "refine_ncc_reacquire", 0.75) or 0.75)
+    drift_floor = float(getattr(cfg, "refine_drift_floor", 0.0) or 0.0)
+    drift_every = int(getattr(cfg, "refine_drift_check_every", 0) or 0)
+    anchor = best_patch.copy()          # NEVER replaced: the drift guard's ground truth
+
     # 2. refine outward both directions from the anchor
     for direction in (1, -1):
         patch = best_patch.copy()
         i = best_i + direction
+        since_anchor_check = 0
+        gap = 0                          # consecutive frames with no lock (candidate occlusion)
+        last_good = refined[best_i]      # last verified position, for neighbour prediction
         while 0 <= i < len(pts):
             f, cx, cy = pts[i]  # cx,cy = coarse position (search centre)
             g = get(f - 1)
@@ -257,36 +288,185 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                 break
             res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp)
             if res is None or res[2] < lost:
-                break  # trim this side at loss of lock
+                # Lock lost. This used to end the track here, which is how points were lost
+                # to occluders SAM3 never masked (a pole, a prop, a hand). Treat it as a
+                # candidate occlusion: leave the frame out and keep trying to re-find the
+                # ORIGINAL anchor further along.
+                if max_gap <= 0 or gap >= max_gap:
+                    break
+                gap += 1
+                # Search where the NEIGHBOURS say it should have gone, not where the coarse
+                # tracker left it -- during an occlusion the coarse point has usually been
+                # dragged along by whatever crossed it.
+                px, py = cx, cy
+                if predict is not None and last_good is not None:
+                    px, py = predict(last_good[1], last_good[2], int(last_good[0]), int(f))
+                ra = _ncc_match(g, anchor, px, py, search, half, edge_clamp)
+                if ra is None or ra[2] < reacq:
+                    ra = _ncc_match(g, anchor, cx, cy, search, half, edge_clamp)
+                if ra is not None and ra[2] >= reacq:
+                    refined[i] = (f, float(ra[0]), float(ra[1]))
+                    last_good = refined[i]
+                    patch = anchor.copy()      # resume from the verified original pattern
+                    gap = 0
+                    since_anchor_check = 0
+                i += direction
+                continue
+            gap = 0
             x, y, cc = res
             if motion != cv2.MOTION_TRANSLATION:
                 er = _ecc_refine(g, patch, x, y, half, motion)
                 if er is not None and er[2] >= lost:
                     x, y, cc = er
             refined[i] = (f, float(x), float(y))
+            last_good = refined[i]
+
+            # Drift guard: re-referencing used to re-grab the patch wherever the point
+            # currently sat, with nothing tying it to the original -- over a long shot the
+            # pattern random-walks off the feature. Accept a new patch only while it still
+            # resembles the anchor, and re-check against the anchor periodically.
+            since_anchor_check += 1
             if cc < reref:  # hybrid: re-grab the pattern before it degrades further
                 np2 = _extract(g, x, y, half)
                 if np2 is not None:
-                    patch = np2
+                    if drift_floor <= 0.0 or _corr(np2, anchor) >= drift_floor:
+                        patch = np2
+                    else:
+                        patch = anchor.copy()   # snapped too far: fall back to the original
+                        since_anchor_check = 0
+            elif drift_floor > 0.0 and drift_every > 0 and since_anchor_check >= drift_every:
+                cur = _extract(g, x, y, half)
+                since_anchor_check = 0
+                if cur is not None and _corr(cur, anchor) < drift_floor:
+                    break                       # drifted off the feature -> stop this side
             i += direction
 
     return [refined[k] for k in sorted(refined.keys())], "ok"
 
 
+def build_neighbour_predictor(tracks: Dict[str, Track], cfg):
+    """Predict where an occluded point reappears, from the motion of its NEAREST neighbours.
+
+    This is the one thing CoTracker genuinely does better than a per-point tracker -- using
+    other points to infer a hidden one -- taken without adding a second network. Deliberately
+    LOCAL: the median motion of the k nearest tracks, never a global model, because a global
+    fit would drag foreground (parallax) points toward the background solution. The prediction
+    only supplies a search CENTRE; the sub-pixel position still comes from native-res NCC.
+
+    Returns predict(x, y, from_frame, to_frame) -> (x, y).
+    """
+    k = int(getattr(cfg, "reacquire_neighbours", 8) or 0)
+    # frame -> list of (x, y, dx, dy) for every track visible on consecutive frames
+    by_frame: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    if k > 0:
+        for tr in tracks.values():
+            pts = sorted(tr, key=lambda t: t[0])
+            for a, b in zip(pts, pts[1:]):
+                if int(b[0]) - int(a[0]) != 1:
+                    continue
+                by_frame.setdefault(int(a[0]), []).append(
+                    (float(a[1]), float(a[2]), float(b[1]) - float(a[1]), float(b[2]) - float(a[2])))
+
+    def predict(x: float, y: float, f_from: int, f_to: int) -> Tuple[float, float]:
+        if k <= 0 or f_to == f_from:
+            return x, y
+        step = 1 if f_to > f_from else -1
+        cx, cy = float(x), float(y)
+        for f in range(int(f_from), int(f_to), step):
+            # motion of frame f -> f+1; walking backwards means subtracting it
+            cand = by_frame.get(f if step > 0 else f - 1)
+            if not cand:
+                continue
+            near = sorted(cand, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)[:k]
+            if not near:
+                continue
+            dx = float(np.median([c[2] for c in near]))
+            dy = float(np.median([c[3] for c in near]))
+            cx += dx * step
+            cy += dy * step
+        return cx, cy
+
+    return predict
+
+
+def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
+               edge_clamp: bool) -> Track:
+    """Forward-backward consistency: re-track the refined segment BACKWARDS from its last
+    frame and keep only the frames the return pass agrees with.
+
+    A correctly tracked point comes back to where it started; a mistrack does not. This is
+    purely self-referential, so it is parallax-safe -- it never compares a track against
+    global motion, which would punish exactly the fast foreground points we want to keep.
+    Costs a second NCC sweep per segment. 0 = off.
+    """
+    tol = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
+    if tol <= 0.0 or len(seg) < 3:
+        return seg
+    half = int(cfg.refine_patch_px) // 2
+    search = int(cfg.refine_search_px)
+    lost = float(cfg.refine_ncc_lost)
+
+    g_last = get(int(seg[-1][0]) - 1)
+    if g_last is None:
+        return seg
+    patch = _extract(g_last, float(seg[-1][1]), float(seg[-1][2]), half)
+    if patch is None:
+        return seg
+
+    out: Track = [seg[-1]]
+    for f, fx, fy in reversed(seg[:-1]):
+        g = get(int(f) - 1)
+        if g is None:
+            break
+        res = _ncc_match(g, patch, fx, fy, search, half, edge_clamp)
+        if res is None or res[2] < lost:
+            break
+        bx, by, _cc = res
+        if math.hypot(bx - float(fx), by - float(fy)) > tol:
+            continue          # the return pass disagrees here -> drop just this frame
+        out.append((f, fx, fy))
+    return sorted(out, key=lambda t: t[0])
+
+
 def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
-                cfg) -> Optional[Track]:
+                cfg, predict=None) -> Optional[Track]:
+    """Refine one track. Returns the refined points, or None to drop it.
+
+    With split_unverified_segments on, this can return a LIST of segments instead (see
+    _refine_one_multi) — kept as a thin wrapper so existing callers are unchanged.
+    """
+    res = _refine_one_multi(track, get, cfg, predict)
+    if not res:
+        return None
+    # Callers that want one track get the segments welded back; verification already ran.
+    out: Track = []
+    for seg in res:
+        out.extend(seg)
+    return sorted(out, key=lambda t: t[0]) or None
+
+
+def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
+                      cfg, predict=None) -> List[Track]:
+    """Refine one track into one or MORE verified pieces.
+
+    A gap is only welded back into a single id when the post-gap patch still matches the
+    pre-gap anchor. If it does not, the pieces come back separately: welding two different
+    features under one id is the failure mode that stays invisible until the solve blows up,
+    so on doubt it splits.
+    """
     pts = sorted(track, key=lambda t: t[0])
     if len(pts) < 2:
-        return None
+        return []
     edge_clamp = bool(getattr(cfg, "mt_edge_track", True))
     gap_aware = bool(getattr(cfg, "refine_gap_aware", True))
     min_len = int(cfg.refine_min_len)
 
     if not gap_aware:
-        out, _reason = _refine_segment(pts, get, cfg, edge_clamp)
-        if out is None or len(out) < min_len:
-            return None
-        return out
+        out, _reason = _refine_segment(pts, get, cfg, edge_clamp, predict)
+        if out is None:
+            return []
+        out = _fb_filter(out, get, cfg, edge_clamp)
+        return [out] if len(out) >= min_len else []
 
     # Gap-aware: split into contiguous VISIBLE segments (occlusion = frame number jump > 1),
     # refine each on its OWN reference patch, and reassemble under one id. A segment that
@@ -302,19 +482,49 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
             cur = [p]
     segments.append(cur)
 
+    split_on_doubt = bool(getattr(cfg, "split_unverified_segments", True))
+    reacq = float(getattr(cfg, "refine_ncc_reacquire", 0.75) or 0.75)
+    half = int(cfg.refine_patch_px) // 2
+
+    def _patch_at(pt):
+        g = get(int(pt[0]) - 1)
+        return _extract(g, float(pt[1]), float(pt[2]), half) if g is not None else None
+
+    pieces: List[Track] = []
     combined: Track = []
+    prev_tail_patch = None       # patch at the end of the last accepted segment
     for seg in segments:
         if len(seg) >= 2:
-            ref, reason = _refine_segment(seg, get, cfg, edge_clamp)
+            ref, reason = _refine_segment(seg, get, cfg, edge_clamp, predict)
         else:
             ref, reason = None, "no-anchor"
         if reason == "edge":
             continue          # 1-D feature: drop these points; keeping them RAW would be
                               # both jittery (coarse 256px position) and still sliding.
-        combined.extend(ref if (ref is not None and len(ref) >= min_len) else seg)
-    if len(combined) < min_len:
-        return None
-    return sorted(combined, key=lambda t: t[0])
+        use = ref if (ref is not None and len(ref) >= min_len) else seg
+        if ref is not None:
+            use = _fb_filter(use, get, cfg, edge_clamp)
+            if len(use) < min_len:
+                use = seg
+        if not use:
+            continue
+
+        # Is this really the same feature we had before the gap? Compare the patch either
+        # side of it; a mismatch means the tracker came back on something else.
+        if combined and prev_tail_patch is not None:
+            head_patch = _patch_at(use[0])
+            same = head_patch is not None and _corr(head_patch, prev_tail_patch) >= reacq
+            if not same and split_on_doubt:
+                pieces.append(combined)
+                combined = []
+        combined.extend(use)
+        tail = _patch_at(use[-1])          # explicit: `ndarray or x` is ambiguous in numpy
+        if tail is not None:
+            prev_tail_patch = tail
+
+    if combined:
+        pieces.append(combined)
+    return [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
 
 
 class _GrayFromBGR:
@@ -379,18 +589,40 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
                f"search=±{cfg.refine_search_px}px motion={cfg.refine_motion} "
                f"(full-decode={'yes' if prov._all is not None else 'streamed'})")
 
+    # Neighbour motion model, built once from the pre-refine tracks (image space, same frame
+    # of reference the refine loop works in).
+    predict = build_neighbour_predictor({k: to_img(v) for k, v in final_tracks.items()}, cfg)
+
     out: Dict[str, Track] = {}
-    trimmed = dropped = 0
+    trimmed = dropped = split = gapped = 0
     for name, tr in final_tracks.items():
-        ref = _refine_one(to_img(tr), prov.get, cfg)
-        if ref is None:
+        pieces = _refine_one_multi(to_img(tr), prov.get, cfg, predict)
+        if not pieces:
             dropped += 1
             continue
-        if len(ref) < len(tr):
+        total_pts = sum(len(p) for p in pieces)
+        if total_pts < len(tr):
             trimmed += 1
-        out[name] = to_out(ref)
+        if len(pieces) > 1:
+            split += 1
+        for k, piece in enumerate(pieces):
+            # A piece spanning more frames than it has points survived an occlusion and
+            # carries a genuine gap -- 3DE reads that natively (a frame number per point).
+            if piece and (int(piece[-1][0]) - int(piece[0][0]) + 1) > len(piece):
+                gapped += 1
+            # Only a piece that failed verification gets a new id; the first keeps the
+            # original name so downstream naming is unchanged for the common case.
+            out[name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"] = to_out(piece)
 
     aniso = float(getattr(cfg, "min_corner_anisotropy", 0.0) or 0.0)
-    extra = f" (edge-reject anisotropy<{aniso:.2f})" if aniso > 0.0 else ""
-    info = f"refined={len(out)}/{len(final_tracks)} trimmed={trimmed} dropped={dropped}{extra}"
-    return out, info
+    bits = [f"refined={len(out)}/{len(final_tracks)}", f"trimmed={trimmed}", f"dropped={dropped}"]
+    if gapped:
+        bits.append(f"survived-occlusion={gapped}")
+    if split:
+        bits.append(f"split-unverified={split}")
+    if aniso > 0.0:
+        bits.append(f"(edge-reject anisotropy<{aniso:.2f})")
+    fb = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
+    if fb > 0.0:
+        bits.append(f"(fwd-bwd<={fb:.1f}px)")
+    return out, " ".join(bits)
