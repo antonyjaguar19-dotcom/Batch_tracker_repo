@@ -198,11 +198,22 @@ class _FrameGray:
 
 
 def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
-                    edge_clamp: bool) -> Optional[Track]:
+                    edge_clamp: bool) -> Tuple[Optional[Track], str]:
     """NCC/ECC refine one CONTIGUOUS visible segment (anchor at its sharpest frame,
-    refine outward both ways, trim on loss of lock). Returns refined points or None."""
+    refine outward both ways, trim on loss of lock).
+
+    Returns (points, reason). The reason matters because the caller treats the two failure
+    modes oppositely:
+      "ok"        refined normally.
+      "no-anchor" mechanically un-refinable (patch fell off frame, no readable frame).
+                  The caller keeps the ORIGINAL points -- better raw than deleted.
+      "edge"      the anchor is a 1-D feature. The caller must DROP these points: keeping
+                  them raw is the worst outcome, since an unrefined point sits at TAPNext's
+                  coarse 256px position (~4.9px error at 4K vs ~1.3px refined) AND still
+                  slides along the edge.
+    """
     if len(pts) < 2:
-        return None
+        return None, "no-anchor"
     half = int(cfg.refine_patch_px) // 2
     search = int(cfg.refine_search_px)
     motion = _MOTION.get(str(cfg.refine_motion).lower(), cv2.MOTION_AFFINE)
@@ -222,14 +233,14 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
         if c > best_c:
             best_c, best_i, best_patch = c, i, patch
     if best_i < 0 or best_patch is None:
-        return None
+        return None, "no-anchor"
 
     # Aperture guard: even the sharpest patch in this segment may be a 1-D feature (the track
     # seeded on a corner and drifted onto an edge, or re-referenced onto one). NCC can only
-    # pin it across the edge, so refining it just slides it along -- drop the segment instead.
+    # pin it across the edge, so refining it just slides it along.
     thr = float(getattr(cfg, "min_corner_anisotropy", 0.0) or 0.0)
     if thr > 0.0 and _anisotropy(best_patch) < thr:
-        return None
+        return None, "edge"
 
     refined: Dict[int, Tuple[int, float, float]] = {
         best_i: (pts[best_i][0], float(pts[best_i][1]), float(pts[best_i][2]))
@@ -259,7 +270,7 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                     patch = np2
             i += direction
 
-    return [refined[k] for k in sorted(refined.keys())]
+    return [refined[k] for k in sorted(refined.keys())], "ok"
 
 
 def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
@@ -272,7 +283,7 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
     min_len = int(cfg.refine_min_len)
 
     if not gap_aware:
-        out = _refine_segment(pts, get, cfg, edge_clamp)
+        out, _reason = _refine_segment(pts, get, cfg, edge_clamp)
         if out is None or len(out) < min_len:
             return None
         return out
@@ -293,7 +304,13 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
 
     combined: Track = []
     for seg in segments:
-        ref = _refine_segment(seg, get, cfg, edge_clamp) if len(seg) >= 2 else None
+        if len(seg) >= 2:
+            ref, reason = _refine_segment(seg, get, cfg, edge_clamp)
+        else:
+            ref, reason = None, "no-anchor"
+        if reason == "edge":
+            continue          # 1-D feature: drop these points; keeping them RAW would be
+                              # both jittery (coarse 256px position) and still sliding.
         combined.extend(ref if (ref is not None and len(ref) >= min_len) else seg)
     if len(combined) < min_len:
         return None

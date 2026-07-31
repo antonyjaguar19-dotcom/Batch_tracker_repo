@@ -93,6 +93,12 @@ class RunnerConfig:
     # for most of the shot while their means are 40px+ apart -- the mean test passed both and
     # they clumped. 1 = effectively the old mean-only behaviour.
     spread_ref_frames: int = 5
+    # Track coords are scaled to the FULL PLATE before spacing is measured, so a raw pixel
+    # dial means something different per resolution: 40px is 2% of an HD width but ~1% of 4K
+    # (~96 columns of tracks -> looks clumped) and ~0.7% of 6K. Scale the spacing by
+    # plate_width / spread_ref_width so one slider value looks the same at any resolution.
+    spread_scale_with_res: bool = True
+    spread_ref_width: int = 1920   # the width spread_min_dist_px is quoted against
     # score weights (self-referential terms only; must not judge vs global motion)
     w_coverage: float = 0.5        # visible span / low internal gaps -> long, gapless
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
@@ -733,7 +739,10 @@ class BatchTrackerRunner:
                     diag_short += 1
 
         if self.cfg.enable_spread_select and candidates:
-            final_tracks_out = self._select_spread(candidates)
+            # Spacing is measured in the same space the candidate coords are in: the full
+            # plate (out_w when the tracked file was a downscaled proxy, else W0).
+            ow = int(getattr(self.cfg, "out_w", 0) or 0)
+            final_tracks_out = self._select_spread(candidates, out_width=(ow if ow > 0 else int(W0)))
         else:
             final_tracks_out = {c["id"]: c["pts"] for c in candidates}
         total_kept = len(final_tracks_out)
@@ -800,7 +809,25 @@ class BatchTrackerRunner:
         wsum = (w_c + w_s + w_j) or 1.0
         return (w_c * cov_score + w_s * smooth_score + w_j * stab_score) / wsum
 
-    def _select_spread(self, candidates: List[dict]) -> Dict[str, List[Tuple[int, float, float]]]:
+    def _spacing_px(self, out_width: int = 0) -> int:
+        """Effective min spacing in PLATE pixels.
+
+        The slider is quoted against spread_ref_width (1920). Candidate coords are in full
+        plate space, so on a 4K plate a raw 40px gap is only ~1% of the width -- dense enough
+        to still read as clumped -- and worse on 6K/8K. Scaling by plate width keeps one
+        slider value looking the same at any resolution.
+        """
+        d = max(1, int(self.cfg.spread_min_dist_px))
+        if not bool(getattr(self.cfg, "spread_scale_with_res", True)):
+            return d
+        ref = max(1, int(getattr(self.cfg, "spread_ref_width", 1920) or 1920))
+        w = int(out_width or 0)
+        if w <= 0:
+            return d
+        return max(1, int(round(d * (w / float(ref)))))
+
+    def _select_spread(self, candidates: List[dict],
+                       out_width: int = 0) -> Dict[str, List[Tuple[int, float, float]]]:
         """Greedy min-spacing selection over score-sorted candidates.
 
         Walk best-first; accept a track only if it stays >= spread_min_dist_px from every
@@ -815,10 +842,13 @@ class BatchTrackerRunner:
         are still rejected implicitly -- this doubles as the pass dedup. One coarse cell grid
         PER reference frame keeps each spacing test O(neighbours).
         """
-        d = max(1, int(self.cfg.spread_min_dist_px))
+        d = self._spacing_px(out_width)
         d2 = float(d * d)
         cap = int(self.cfg.max_output_tracks or 0)
         out: Dict[str, List[Tuple[int, float, float]]] = {}
+        if d != int(self.cfg.spread_min_dist_px):
+            self._status(f"  spread: {self.cfg.spread_min_dist_px}px @{self.cfg.spread_ref_width} "
+                         f"-> {d}px at this plate width ({out_width})")
 
         # Reference frames: evenly spaced over the frame range the candidates actually span.
         k = max(1, int(getattr(self.cfg, "spread_ref_frames", 5) or 1))
