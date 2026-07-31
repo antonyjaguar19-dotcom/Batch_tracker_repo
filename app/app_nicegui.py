@@ -44,6 +44,7 @@ state = be.AppState()
 TABLE_COLS = [
     {"name": "name", "label": "Shot", "field": "name", "align": "left", "sortable": True},
     {"name": "version", "label": "Version", "field": "version", "align": "left"},
+    {"name": "status", "label": "Done", "field": "status", "align": "left"},
     {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left"},
     {"name": "quality", "label": "Quality", "field": "quality", "align": "left"},
     {"name": "prompts", "label": "Prompts", "field": "prompts", "align": "left"},
@@ -57,10 +58,23 @@ _suppress_select = False  # guard so programmatic selection doesn't re-trigger h
 
 # Status chip above the table. Unlike the search box (which Quasar applies in the
 # browser), a chip changes which rows exist server-side, so it does rebuild the table.
-# Only signals we actually hold in memory — mask state lives on disk and probing it per
-# shot would reintroduce the network stall we just removed.
-STATUS_CHIPS = ["All", "No plate", "Pending", "Analyzed", "Tracked"]
+# 'Masked' is back now that mask state comes from one batched listdir of each shot's own
+# folder at scan time, instead of a per-shot probe during the scan.
+STATUS_CHIPS = ["All", "No plate", "Pending", "Analyzed", "Masked", "Tracked"]
 _status_chip = {"v": "All"}
+
+
+def _is_analyzed(d) -> bool:
+    """Analysed per the shot's own folder OR this session's memory (published later)."""
+    return bool(getattr(d, "has_analysis", False)) or (d.strategy or "Pending") != "Pending"
+
+
+def _is_masked(d) -> bool:
+    return bool(getattr(d, "has_masks", False))
+
+
+def _is_tracked(d) -> bool:
+    return bool(getattr(d, "has_tracks", False)) or bool(d.track_metrics_summary)
 
 
 def _passes_status(d) -> bool:
@@ -68,22 +82,68 @@ def _passes_status(d) -> bool:
     if s == "No plate":
         return not d.plate_dir or not d.frames
     if s == "Pending":
-        return (d.strategy or "Pending") == "Pending"
+        return not _is_analyzed(d)
     if s == "Analyzed":
-        return (d.strategy or "Pending") != "Pending"
+        return _is_analyzed(d)
+    if s == "Masked":
+        return _is_masked(d)
     if s == "Tracked":
-        return bool(d.track_metrics_summary)
+        return _is_tracked(d)
     return True
+
+
+# Shot-number filter. Server-side (it must show ONLY the matches), which is safe because
+# on_selection_change reconciles only shots present in table.rows -- a shot filtered out
+# keeps its tick. Same mechanism as the status chips.
+_num_query = {"v": ""}
+
+
+def _parse_number_query(q: str):
+    """'10', '10-20', '10,14,22' -> a set of ints and a list of (lo,hi) ranges.
+    Returns None when the query holds no usable number, meaning 'do not filter'."""
+    nums, ranges = set(), []
+    for tok in _PASTE_SPLIT.split(str(q or "").strip()):
+        if not tok:
+            continue
+        m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", tok)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            ranges.append((min(lo, hi), max(lo, hi)))
+            continue
+        if tok.isdigit():
+            nums.add(int(tok))
+    return (nums, ranges) if (nums or ranges) else None
+
+
+def _shot_matches_number(name: str, parsed) -> bool:
+    """True if any digit-run in the shot name matches NUMERICALLY, so zero-padding never
+    matters: 10 finds SH010, ABC_0010 and shot_10 alike."""
+    nums, ranges = parsed
+    for run in re.findall(r"\d+", str(name)):
+        v = int(run)
+        if v in nums or any(lo <= v <= hi for lo, hi in ranges):
+            return True
+    return False
 
 
 # -----------------------------------------------------------------------------
 # Row building / table refresh
 # -----------------------------------------------------------------------------
 def _all_names():
-    """Every shot passing the status chip. The search box is NOT applied here — it is
-    a client-side Quasar filter, so filtered-out rows stay in table.rows and keep their
-    tick. That is what lets a selection survive searching for the next batch."""
-    return [n for n in sorted(state.shots_data) if _passes_status(state.shots_data[n])]
+    """Every shot passing the status chip AND the shot-number box. The text search box is
+    NOT applied here — it is a client-side Quasar filter, so filtered-out rows stay in
+    table.rows and keep their tick. That is what lets a selection survive searching for the
+    next batch. The number box IS applied here because it must show only the matches."""
+    parsed = _parse_number_query(_num_query["v"])
+    out = []
+    for n in sorted(state.shots_data):
+        d = state.shots_data[n]
+        if not _passes_status(d):
+            continue
+        if parsed is not None and not _shot_matches_number(n, parsed):
+            continue
+        out.append(n)
+    return out
 
 
 def _row_for(name: str) -> dict:
@@ -95,6 +155,14 @@ def _row_for(name: str) -> dict:
         "name": name,
         "version": d.version,
         "versions": d.versions or [],
+        # Badge booleans ride along as row data with no column of their own (like
+        # `versions`), so Quasar's all-column text filter never sees them. `status` is the
+        # column field and stays a plain string: a dict would stringify to "[object Object]"
+        # in the browser and match every search.
+        "st_a": _is_analyzed(d), "st_m": _is_masked(d), "st_t": _is_tracked(d),
+        "status": " ".join(s for s, on in
+                           (("Analyzed", _is_analyzed(d)), ("Masked", _is_masked(d)),
+                            ("Tracked", _is_tracked(d))) if on),
         "strategy": d.strategy,
         "quality": be._quality_cell(d),
         "prompts": prompts,
@@ -308,34 +376,69 @@ def _reset_shot_analysis(d):
 
 
 def on_clear_mem(row):
-    """Per-shot 'clear memory': confirm, then drop the shot's stored analysis (guide entry +
-    manual note) and reset it in the table."""
+    """Per-shot clear: pick which of Analysis / Masks / Tracks to remove, then delete them
+    from BOTH the local work dir and the shot's own studio folder.
+
+    The studio copies are what make the badges read 'done' (here and on any other
+    workstation), so clearing a badge has to remove them too. Scopes are independent
+    because masks are the expensive stage — redoing a track shouldn't cost a SAM3 re-run.
+    """
     if isinstance(row, list):
         row = row[0] if row else None
     name = (row or {}).get("name") if isinstance(row, dict) else None
     if not name or name not in state.shots_data:
         return
+    d = state.shots_data[name]
+    has_a, has_m, has_t = _is_analyzed(d), _is_masked(d), _is_tracked(d)
+    if not (has_a or has_m or has_t):
+        ui.notify(f"{name} has nothing to clear yet.", type="info")
+        return
+    studio = getattr(d, "studio_dir", "") or ""
+
     dlg = ui.dialog()
-    with dlg, ui.card():
-        ui.markdown(f"**Clear analysis memory for `{name}`?**")
-        ui.label("Removes its scope, prompts and Qwen analysis (guide entry + manual brief). "
-                 "Tracking metrics and the shot itself stay. This cannot be undone.")
+    with dlg, ui.card().classes("bt-paste"):
+        ui.markdown(f"**Clear work for `{name}`?**")
+        # Pre-tick only what exists; disable the rest so the dialog states the shot's state.
+        cb_a = ui.checkbox("Analysis — scope, prompts, Qwen result", value=has_a)
+        cb_m = ui.checkbox("Masks — SAM3 mask frames", value=has_m)
+        cb_t = ui.checkbox("Tracks — exported 2D track files", value=has_t)
+        for cb, present in ((cb_a, has_a), (cb_m, has_m), (cb_t, has_t)):
+            if not present:
+                cb.disable()
+        cb_m.tooltip("Masks are the slowest stage to regenerate — untick to keep them "
+                     "and only redo tracking.")
+        if studio:
+            ui.label(f"Deletes from the shot's own folder: {studio}").classes("bt-hint")
+        ui.label("This also removes the local working copies. It cannot be undone.").classes(
+            "text-caption text-orange")
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
 
-            def _do():
-                try:
-                    be.clear_shot_memory(out_dir.value, name)
-                except Exception as ex:
-                    print(f"clear_shot_memory: {ex}")
-                _reset_shot_analysis(state.shots_data[name])
-                if isinstance(getattr(state, "manual_notes", None), dict):
-                    state.manual_notes.pop(name, None)
-                refresh_table()
+            async def _do():
+                a, m, t = bool(cb_a.value), bool(cb_m.value), bool(cb_t.value)
+                if not (a or m or t):
+                    ui.notify("Nothing ticked.", type="info")
+                    return
                 dlg.close()
-                ui.notify(f"Cleared memory for {name}", type="warning")
+                # Deletions touch the network share -> keep them off the event loop.
+                counts = await run.io_bound(be.clear_shot_artifacts, out_dir.value, studio,
+                                            name, analysis=a, masks=m, tracks=t)
+                if a:
+                    _reset_shot_analysis(d)
+                    d.has_analysis = False
+                    if isinstance(getattr(state, "manual_notes", None), dict):
+                        state.manual_notes.pop(name, None)
+                if m:
+                    d.has_masks = False
+                if t:
+                    d.has_tracks = False
+                    d.track_metrics_summary = ""
+                refresh_table()
+                done = ", ".join(f"{k} {v}" for k, v in (counts or {}).items() if v)
+                ui.notify(f"Cleared {name}" + (f" · removed {done} file(s)" if done else ""),
+                          type="warning")
 
-            ui.button("Clear memory", on_click=_do, color="negative")
+            ui.button("Clear", on_click=_do, color="negative")
     dlg.open()
 
 
@@ -515,25 +618,43 @@ async def do_scan_show():
     ed_pick.set_options(sorted(state.shots_data))
     refresh_table()
     ui.notify(f"{show}: {len(shots)} shot(s)", type="info")
-    # Phase 2 (heavier): descend to the real frames dir + parse the range per shot.
-    # Chunked so progress still moves, but with ~1 websocket push per chunk instead of
-    # two per shot (a 100-shot scan used to fire ~200 UI updates at the browser).
-    todo = [s for s in shots if state.shots_data.get(s) and state.shots_data[s].plate_dir]
-    total = len(todo)
+    # Phase 2 (heavier): descend to the real frames dir + parse the range per shot, and read
+    # each shot's progress badges from its own folder. Chunked so progress still moves, but
+    # with ~1 websocket push per chunk instead of two per shot (a 100-shot scan used to fire
+    # ~200 UI updates at the browser). Both probes are thread-pooled inside the backend.
+    total = len(shots)
     scan_prog.props(remove="indeterminate"); scan_prog.set_value(0.0)
     CHUNK = 16
     for i in range(0, total, CHUNK):
         if token != _scan_token["n"]:
             return  # superseded by a newer show switch (it owns the bar now)
-        chunk = todo[i:i + CHUNK]
-        scan_lbl.set_text(f"Resolving frames {min(i + CHUNK, total)}/{total}")
+        chunk = shots[i:i + CHUNK]
+        scan_lbl.set_text(f"Reading shots {min(i + CHUNK, total)}/{total}")
         scan_prog.set_value(min(i + CHUNK, total) / total if total else 1.0)
-        results = await run.io_bound(be.resolve_frames_batch,
-                                     [state.shots_data[s].plate_dir for s in chunk])
-        for s, (pdir, frames, pstart, pend) in zip(chunk, results):
+
+        # Frame range: only shots that actually resolved a plate version.
+        with_plate = [s for s in chunk if state.shots_data.get(s) and state.shots_data[s].plate_dir]
+        if with_plate:
+            results = await run.io_bound(be.resolve_frames_batch,
+                                         [state.shots_data[s].plate_dir for s in with_plate])
+            for s, (pdir, frames, pstart, pend) in zip(with_plate, results):
+                d = state.shots_data.get(s)
+                if d:
+                    d.plate_dir, d.frames, d.plate_start, d.plate_end = pdir, frames, pstart, pend
+
+        # Badges: every shot, plate or not — work already published stays visible even if
+        # the plate has since moved.
+        if token != _scan_token["n"]:
+            return
+        stats = await run.io_bound(be.shot_status_batch,
+                                   [getattr(state.shots_data.get(s), "studio_dir", "") or ""
+                                    for s in chunk])
+        for s, st in zip(chunk, stats):
             d = state.shots_data.get(s)
             if d:
-                d.plate_dir, d.frames, d.plate_start, d.plate_end = pdir, frames, pstart, pend
+                d.has_analysis = bool(st.get("analyzed"))
+                d.has_masks = bool(st.get("masked"))
+                d.has_tracks = bool(st.get("tracked"))
     if token == _scan_token["n"]:
         refresh_table()
         scan_prog.set_visibility(False); scan_lbl.set_visibility(False)
@@ -846,6 +967,7 @@ def poll():
             pass
         elif m in ("DONE_MASKING", "DONE_TRACKING"):
             refresh_now = True
+            _refresh_badges_local(masks=(m == "DONE_MASKING"), tracks=(m == "DONE_TRACKING"))
             new_logs.append(m)
         else:
             new_logs.append(m)
@@ -904,12 +1026,46 @@ def poll():
         _poll_last["running"] = running
 
 
+def _refresh_badges_local(masks: bool = False, tracks: bool = False):
+    """Light up badges for the shots a job just finished, reading the LOCAL work dir only.
+
+    poll() runs on the event loop at 1 Hz, so it must never touch the share; the work dir is
+    local disk and only the ticked shots are checked, so this stays sub-millisecond. The
+    worker publishes to the shot's studio folder in the same step, so a local artifact means
+    the studio one is there too — and the next show scan re-reads the folder authoritatively.
+    """
+    try:
+        work = out_dir.value or ""
+        if not work:
+            return
+        for name, d in state.shots_data.items():
+            if not getattr(d, "use", False):
+                continue
+            if masks and be._shot_mask_dirs(work, name):
+                d.has_masks = True
+            if tracks and any(be._shot_track_files(work, name, b)
+                              for b in ("syntheyes", "tapnext")):
+                d.has_tracks = True
+    except Exception as ex:
+        print(f"badge refresh: {ex}")
+
+
 def on_search(e):
     """Client-side filter: Quasar hides non-matching rows in the browser, so the row
     array (and every tick in it) is untouched. No table rebuild, no scroll reset, and a
     selection built under one search survives the next one."""
     state.filter_query = e.value or ""   # kept so 'Select all matching' agrees with the view
     table.filter = state.filter_query
+
+
+def on_number_filter(value):
+    """Shot-number filter. Server-side (the list must show ONLY the matches), which is safe:
+    on_selection_change reconciles just the shots in table.rows, so ticks on shots this
+    filter hides are preserved. Debounced in the UI so it isn't a rebuild per keystroke."""
+    _num_query["v"] = value or ""
+    refresh_table()
+    if (value or "").strip() and _parse_number_query(value) is None:
+        ui.notify("Type a shot number: 10, a range 10-20, or a list 10,14,22", type="warning")
 
 
 # -----------------------------------------------------------------------------
@@ -939,6 +1095,7 @@ ui.add_head_html("""
   .bt-chip p  { margin: 0; }
   .bt-editor  { width: 780px; max-width: 94vw; background: #141924; }
   .bt-paste   { width: 520px; max-width: 94vw; background: #141924; }
+  .bt-badge-off { opacity: .28; }
   /* Run bar: pipeline button, then the four stages as one evenly-sized sequence. */
   .bt-run     { min-width: 150px; height: 36px; font-weight: 600; }
   .bt-step    { min-width: 122px; height: 36px; color: #9dc0ff; }
@@ -999,11 +1156,18 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
     with ui.card().classes("w-full bt-card"):
         ui.label("Find shots").classes("bt-section")
-        # Filters live in the browser (Quasar), so typing never touches the server or
+        # Text search lives in the browser (Quasar), so typing never touches the server or
         # the ticks. Matches any column: shot name, version, strategy, range, metrics.
         ui.input(placeholder="shot name, version, strategy…"
                  ).props("dense outlined clearable").classes("w-full").on_value_change(on_search)
         ui.label("Matches any column · ticks survive searching").classes("bt-hint")
+        # Shot NUMBER is its own box: an all-column text match on "10" also hits v010,
+        # 100%, frame ranges and metrics, which made "Select all matching" tick the wrong
+        # shots. This one narrows the list to just those shot numbers.
+        num_in = ui.input(placeholder="shot number — 10   10-20   10,14,22"
+                          ).props("dense outlined clearable debounce=300").classes("w-full q-mt-sm")
+        num_in.on_value_change(lambda e: on_number_filter(e.value))
+        ui.label("Zero-padding ignored · 10 finds SH010 and ABC_0010").classes("bt-hint")
 
     with ui.card().classes("w-full bt-card"):
         with ui.expansion("Settings", icon="tune", value=False).classes("w-full"):
@@ -1189,7 +1353,7 @@ with ui.column().classes("w-full gap-3 p-3"):
         with ui.row().classes("w-full items-center justify-between no-wrap gap-3"):
             with ui.column().classes("gap-0"):
                 ui.label("Shots").classes("bt-section")
-                ui.label("tick to include · click a row to edit · trash clears that shot's memory"
+                ui.label("tick to include · click a row to edit · A/M/T = analysed, masked, tracked · trash clears them"
                          ).classes("bt-hint")
             lbl_selcount = ui.markdown("No shots yet — set **Shows Root**, load shows, then pick a **Show**."
                                        ).classes("bt-chip")
@@ -1200,7 +1364,7 @@ with ui.column().classes("w-full gap-3 p-3"):
         with ui.row().classes("w-full items-center no-wrap gap-2 q-mb-xs"):
             ui.button("Select all matching", icon="done_all", on_click=select_all_matching
                       ).props("outline dense no-caps"
-                              ).tooltip("Ticks every shot passing the status chip AND the search box.")
+                              ).tooltip("Ticks every shot currently listed — status chip, shot-number box and search box combined.")
             ui.button("None", icon="remove_done", on_click=select_none
                       ).props("outline dense no-caps").tooltip("Unticks every shot in the show.")
             ui.button("Invert", icon="swap_horiz", on_click=select_invert
@@ -1223,11 +1387,31 @@ with ui.column().classes("w-full gap-3 p-3"):
           <q-td :props="props" auto-width>
             <q-btn dense flat round color="grey-6" icon="delete_outline"
                    @click.stop="() => $parent.$emit('clearmem', props.row)">
-              <q-tooltip>Clear this shot's analysis memory</q-tooltip>
+              <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
             </q-btn>
           </q-td>
         ''')
         table.on("clearmem", lambda e: on_clear_mem(e.args))
+        # Progress badges. Read from each shot's OWN folder at scan time, so they are the
+        # same on any workstation pointed at the share. Dim = not done yet.
+        table.add_slot("body-cell-status", r'''
+          <q-td :props="props" auto-width>
+            <div class="row no-wrap items-center q-gutter-xs">
+              <q-badge :color="props.row.st_a ? 'info' : 'grey-9'"
+                       :class="props.row.st_a ? '' : 'bt-badge-off'">A
+                <q-tooltip>{{ props.row.st_a ? 'Analyzed' : 'Not analyzed yet' }}</q-tooltip>
+              </q-badge>
+              <q-badge :color="props.row.st_m ? 'secondary' : 'grey-9'"
+                       :class="props.row.st_m ? '' : 'bt-badge-off'">M
+                <q-tooltip>{{ props.row.st_m ? 'Masks generated' : 'No masks yet' }}</q-tooltip>
+              </q-badge>
+              <q-badge :color="props.row.st_t ? 'positive' : 'grey-9'"
+                       :class="props.row.st_t ? '' : 'bt-badge-off'">T
+                <q-tooltip>{{ props.row.st_t ? 'Tracked' : 'Not tracked yet' }}</q-tooltip>
+              </q-badge>
+            </div>
+          </q-td>
+        ''')
         # Per-shot plate-version dropdown. Emits {name, version} up to Python, which
         # re-resolves that shot's plate_dir. @click.stop so it doesn't open the editor.
         table.add_slot("body-cell-version", r'''
