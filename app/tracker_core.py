@@ -53,6 +53,18 @@ class RunnerConfig:
     mask_root_dir: str = ""
     mask_mode: str = "outside"
     mask_polarity: str = "auto"
+    # Safety margin pulled IN from the mask edge, in px. SAM3 mattes often stop a few px
+    # short of the real silhouette (hair, motion-blur fringe), and a track seeded in that
+    # halo is stuck to the character and slides. Shrinks the seed/keep region on both the
+    # seeding mask and the per-frame gate. 0 = the old, exact-mask behaviour.
+    mask_margin_px: int = 8
+
+    # Aperture-problem guard. A point on a 1-D feature (rope, plate line, TV-screen edge) can
+    # only be localized ACROSS the edge, never ALONG it, so NCC finds a response ridge and the
+    # point slides down it. Reject seeds whose structure-tensor anisotropy (lambda_min /
+    # lambda_max) is below this: a corner tends to 1, a pure edge to 0. Contrast-invariant, so
+    # unlike feature_quality it does not also throw away faint-but-real corners. 0 = off.
+    min_corner_anisotropy: float = 0.08
 
     mask_subdir: str = "masks"
     output_tag: str = ""
@@ -76,6 +88,11 @@ class RunnerConfig:
     enable_spread_select: bool = True
     spread_min_dist_px: int = 40   # min px spacing between kept tracks (density dial)
     max_output_tracks: int = 0     # soft cap; 0 = unlimited
+    # Spacing is measured ON SCREEN at this many evenly-spaced reference frames, not on each
+    # track's lifetime MEAN position. With a moving camera two tracks can sit a few px apart
+    # for most of the shot while their means are 40px+ apart -- the mean test passed both and
+    # they clumped. 1 = effectively the old mean-only behaviour.
+    spread_ref_frames: int = 5
     # score weights (self-referential terms only; must not judge vs global motion)
     w_coverage: float = 0.5        # visible span / low internal gaps -> long, gapless
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
@@ -390,6 +407,16 @@ class BatchTrackerRunner:
         info = f"{where} | masks={len(mask_paths)} sampled={used} union_mask={pct:.1f}% polarity={self.cfg.mask_polarity}->{eff_pol}"
         return union_region, info, len(mask_paths)
 
+    def _shrink_region(self, incl: np.ndarray, margin: int) -> np.ndarray:
+        """Pull the keep-region IN by `margin` px (erode). SAM3 mattes routinely stop a few px
+        short of the real silhouette, and a point seeded in that halo is stuck to the character
+        and slides with it. Mirrors sam3_runner's mask_dilation_px, but applied at track time
+        so it works on masks that already exist."""
+        if margin <= 0 or incl is None or not incl.any():
+            return incl
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
+        return cv2.erode(incl.astype(np.uint8), k).astype(bool)
+
     def _make_seed_inclusion_mask(self, shot_name: str, Ws: int, Hs: int) -> tuple[np.ndarray | None, str, int]:
         region, info, n_masks = self._load_mask_union(shot_name, Ws, Hs)
         mode = (self.cfg.mask_mode or "outside").strip().lower()
@@ -397,22 +424,51 @@ class BatchTrackerRunner:
         if region is None:
             return None, info, n_masks
 
-        if mode == "inside":
-            incl = region
-            incl_pct = float(np.mean(incl)) * 100.0
-            return incl, f"{info} | mode=inside | seed_region={incl_pct:.1f}%", n_masks
-        else:
-            incl = ~region
-            incl_pct = float(np.mean(incl)) * 100.0
-            return incl, f"{info} | mode=outside | seed_region={incl_pct:.1f}%", n_masks
+        margin = max(0, int(getattr(self.cfg, "mask_margin_px", 0) or 0))
+        incl = region if mode == "inside" else ~region
+        before = float(np.mean(incl)) * 100.0
+        incl = self._shrink_region(incl, margin)
+        incl_pct = float(np.mean(incl)) * 100.0
+        extra = f" | margin={margin}px ({before:.1f}%->{incl_pct:.1f}%)" if margin > 0 else ""
+        return incl, f"{info} | mode={mode} | seed_region={incl_pct:.1f}%{extra}", n_masks
 
-    def _detect_features(self, first_frame_bgr: np.ndarray, mask: np.ndarray | None, 
+    def _drop_edge_points(self, gray: np.ndarray, pts: np.ndarray) -> np.ndarray:
+        """Drop seeds sitting on 1-D features (aperture problem).
+
+        A point on an edge -- a rope, a plate line, the border of a TV screen -- can only be
+        localized ACROSS the edge, never ALONG it, so the NCC refine finds a response ridge
+        instead of a peak and the point slides up and down the edge. The structure tensor's
+        eigenvalue RATIO (lambda_min / lambda_max) measures exactly that: ~1 for a corner, ~0
+        for a pure edge. It is contrast-invariant, so unlike goodFeaturesToTrack's relative
+        qualityLevel it does not also discard faint-but-real corners.
+        """
+        thr = float(getattr(self.cfg, "min_corner_anisotropy", 0.0) or 0.0)
+        if thr <= 0.0 or pts.shape[0] == 0:
+            return pts
+        # 6 channels: l1, l2, and the two eigenvectors. blockSize matches goodFeaturesToTrack.
+        eig = cv2.cornerEigenValsAndVecs(gray, blockSize=5, ksize=3)
+        h, w = gray.shape[:2]
+        xi = np.clip(np.rint(pts[:, 0]).astype(np.int32), 0, w - 1)
+        yi = np.clip(np.rint(pts[:, 1]).astype(np.int32), 0, h - 1)
+        l1 = eig[yi, xi, 0]
+        l2 = eig[yi, xi, 1]
+        lmax = np.maximum(np.abs(l1), np.abs(l2))
+        lmin = np.minimum(np.abs(l1), np.abs(l2))
+        ratio = np.divide(lmin, lmax, out=np.zeros_like(lmax), where=lmax > 1e-12)
+        keep = ratio >= thr
+        n_drop = int(pts.shape[0] - np.sum(keep))
+        if n_drop:
+            self._status(f"  seeds: dropped {n_drop}/{pts.shape[0]} edge-like point(s) "
+                         f"(anisotropy < {thr:.2f}) - these slide along edges")
+        return pts[keep]
+
+    def _detect_features(self, first_frame_bgr: np.ndarray, mask: np.ndarray | None,
                          count: int, quality: float, min_dist: int) -> np.ndarray:
         gray = cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2GRAY)
         m_uint8 = None
         if mask is not None:
             m_uint8 = (mask.astype(np.uint8) * 255)
-            
+
         pts = cv2.goodFeaturesToTrack(
             gray,
             maxCorners=count,
@@ -423,7 +479,7 @@ class BatchTrackerRunner:
         )
         if pts is None or len(pts) == 0:
             return np.zeros((0, 2), dtype=np.float32)
-        return pts.reshape(-1, 2).astype(np.float32)
+        return self._drop_edge_points(gray, pts.reshape(-1, 2).astype(np.float32))
 
     def _apply_per_frame_mask_gating(
         self,
@@ -469,18 +525,38 @@ class BatchTrackerRunner:
 
         mode = (self.cfg.mask_mode or "outside").strip().lower()
 
+        # Resolve 'auto' polarity ONCE for the clip. Deciding per frame flips near 50% white
+        # and makes the gate mean different things on different frames -- the exact failure
+        # _resolve_auto_polarity exists to prevent (the seeding path already does this).
+        pol = (self.cfg.mask_polarity or "auto").strip().lower()
+        if pol == "auto":
+            step_s = max(1, int(np.ceil(M / 300.0)))
+            pol = self._resolve_auto_polarity(mask_paths[::step_s], Ws, Hs)
+
+        # Same edge margin as the seeding mask. 'outside' gates on the mover region, so the
+        # margin GROWS it; 'inside' gates on the keep region, so the margin SHRINKS it. Either
+        # way the boundary band stops counting as safe, and a track that DRIFTS into the halo
+        # is dropped -- which seeding-only filtering would miss.
+        margin = max(0, int(getattr(self.cfg, "mask_margin_px", 0) or 0))
+        mk = (cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
+              if margin > 0 else None)
+
         for t in range(T_seg):
             if self._stop.is_set(): break
             p = mask_paths[get_global_mask_idx(t)]
             gray = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
             if gray is None: continue
-            
+
             if gray.ndim == 3: gray = gray.squeeze()
             if gray.shape[1] != Ws or gray.shape[0] != Hs:
                 gray = cv2.resize(gray, (Ws, Hs), interpolation=cv2.INTER_NEAREST)
             if gray.ndim == 3: gray = gray.squeeze()
 
-            region = self._mask_region_from_gray(gray)
+            region = self._mask_region_from_gray(gray, pol=pol)
+            if mk is not None:
+                r8 = region.astype(np.uint8)
+                region = (cv2.dilate(r8, mk) if mode == "outside"
+                          else cv2.erode(r8, mk)).astype(bool)
             vt = vis[t]
             if not np.any(vt): continue
 
@@ -496,10 +572,11 @@ class BatchTrackerRunner:
         if int(np.max(total_count)) <= 0:
             return np.ones((N,), dtype=bool), f"{where} | gating: no usable mask frames"
 
+        marg = f" margin={margin}px" if margin > 0 else ""
         if mode == "outside":
             keep = inside_count == 0
             kept = int(np.sum(keep))
-            return keep, f"{where} | gating(outside): kept={kept}/{N} (dropped if ever inside)"
+            return keep, f"{where} | gating(outside): kept={kept}/{N} (dropped if ever inside){marg}"
 
         ratio = np.zeros((N,), dtype=np.float32)
         nz = total_count > 0
@@ -507,7 +584,7 @@ class BatchTrackerRunner:
         thr = float(self.cfg.inside_ratio)
         keep = ratio >= thr
         kept = int(np.sum(keep))
-        return keep, f"{where} | gating(inside): kept={kept}/{N} (inside_ratio>={thr:.2f})"
+        return keep, f"{where} | gating(inside): kept={kept}/{N} (inside_ratio>={thr:.2f}){marg}"
 
     def run(self):
         try:
@@ -726,33 +803,77 @@ class BatchTrackerRunner:
     def _select_spread(self, candidates: List[dict]) -> Dict[str, List[Tuple[int, float, float]]]:
         """Greedy min-spacing selection over score-sorted candidates.
 
-        Walk best-first; accept a track only if its mean position is >= spread_min_dist_px
-        from every already-accepted track. Because spacing (default 40px) >> any pass
-        duplicate offset, near-identical duplicates are rejected implicitly -- this doubles
-        as the pass dedup. A coarse cell grid keeps each spacing test O(neighbours).
+        Walk best-first; accept a track only if it stays >= spread_min_dist_px from every
+        already-accepted track AT EVERY SAMPLED REFERENCE FRAME where both are visible.
+
+        Spacing used to be measured between the two tracks' LIFETIME MEAN positions, which is
+        not what the artist sees: with a moving camera two tracks can sit a few px apart for
+        most of the shot while their means are 40px+ apart, so both were accepted and they
+        clumped on screen. Sampling real positions fixes that; the dial keeps its meaning.
+
+        Because spacing (default 40px) >> any pass duplicate offset, near-identical duplicates
+        are still rejected implicitly -- this doubles as the pass dedup. One coarse cell grid
+        PER reference frame keeps each spacing test O(neighbours).
         """
         d = max(1, int(self.cfg.spread_min_dist_px))
         d2 = float(d * d)
         cap = int(self.cfg.max_output_tracks or 0)
-        grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
         out: Dict[str, List[Tuple[int, float, float]]] = {}
 
-        for c in sorted(candidates, key=lambda c: c["score"], reverse=True):
-            mx, my = c["mean"]
-            cx, cy = int(mx // d), int(my // d)
-            ok = True
+        # Reference frames: evenly spaced over the frame range the candidates actually span.
+        k = max(1, int(getattr(self.cfg, "spread_ref_frames", 5) or 1))
+        f_lo = min(c["pts"][0][0] for c in candidates)
+        f_hi = max(c["pts"][-1][0] for c in candidates)
+        if k == 1 or f_hi <= f_lo:
+            ref_frames = [f_lo]
+        else:
+            step = (f_hi - f_lo) / float(k - 1)
+            ref_frames = sorted({int(round(f_lo + i * step)) for i in range(k)})
+
+        # Per-candidate position at each reference frame. A track need not be visible at one:
+        # it simply doesn't compete there. Nearest-sample within half a step keeps a track
+        # that is alive around the reference frame but has a gap exactly on it.
+        tol = max(1, int((f_hi - f_lo) / (2.0 * max(1, len(ref_frames) - 1)))) if f_hi > f_lo else 1
+
+        def positions_at_refs(pts):
+            by_frame = {f: (x, y) for f, x, y in pts}
+            got = {}
+            for rf in ref_frames:
+                if rf in by_frame:
+                    got[rf] = by_frame[rf]
+                    continue
+                near = min(by_frame, key=lambda f: abs(f - rf))
+                if abs(near - rf) <= tol:
+                    got[rf] = by_frame[near]
+            return got
+
+        grids: Dict[int, Dict[Tuple[int, int], List[Tuple[float, float]]]] = {rf: {} for rf in ref_frames}
+        mean_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+
+        def clashes(grid, px, py):
+            cx, cy = int(px // d), int(py // d)
             for gx in (cx - 1, cx, cx + 1):
                 for gy in (cy - 1, cy, cy + 1):
-                    for (ax, ay) in grid.get((gx, gy), ()):  # type: ignore[arg-type]
-                        if (ax - mx) ** 2 + (ay - my) ** 2 < d2:
-                            ok = False
-                            break
-                    if not ok: break
-                if not ok: break
-            if not ok:
+                    for (ax, ay) in grid.get((gx, gy), ()):
+                        if (ax - px) ** 2 + (ay - py) ** 2 < d2:
+                            return True
+            return False
+
+        for c in sorted(candidates, key=lambda c: c["score"], reverse=True):
+            at = positions_at_refs(c["pts"])
+            mx, my = c["mean"]
+            if not at:
+                # Short track falling between every sample: fall back to the mean test rather
+                # than waving it through unchecked.
+                if clashes(mean_grid, mx, my):
+                    continue
+            elif any(clashes(grids[rf], px, py) for rf, (px, py) in at.items()):
                 continue
+
             out[c["id"]] = c["pts"]
-            grid.setdefault((cx, cy), []).append((mx, my))
+            for rf, (px, py) in at.items():
+                grids[rf].setdefault((int(px // d), int(py // d)), []).append((px, py))
+            mean_grid.setdefault((int(mx // d), int(my // d)), []).append((mx, my))
             if cap > 0 and len(out) >= cap:
                 break
         return out
