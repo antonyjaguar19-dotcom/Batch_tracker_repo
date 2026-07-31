@@ -114,6 +114,11 @@ class RunnerConfig:
     # plate_width / spread_ref_width so one slider value looks the same at any resolution.
     spread_scale_with_res: bool = True
     spread_ref_width: int = 1920   # the width spread_min_dist_px is quoted against
+    # Spacing in TIME as well as space. Seeding is staggered now, but the 4 passes still all
+    # begin at their own first frame, so start frames can still pile up. Cap how many tracks
+    # may START within the same short window; the best-scoring ones win. 0 = off.
+    spread_max_starts_per_window: int = 0   # 0 = unlimited (set with spread_start_window)
+    spread_start_window: int = 8            # frames that counts as "the same start"
     # score weights (self-referential terms only; must not judge vs global motion)
     w_coverage: float = 0.5        # visible span / low internal gaps -> long, gapless
     w_smoothness: float = 0.3      # low own-path jitter -> steady, sub-pixel
@@ -144,6 +149,21 @@ class RunnerConfig:
     enable_pattern_refine: bool = True
     refine_patch_px: int = 31       # pattern box (odd); larger = more stable, less local
     refine_search_px: int = 24      # search radius around TAPNext coarse position
+    # Adaptive search: a fixed radius is wrong at both ends. Too small and a fast-moving
+    # feature falls OUTSIDE the box, so NCC returns the best match inside it -- the wrong
+    # place -- and the point slides. Too large and rival peaks creep in. Grow the radius only
+    # as fast as the point actually moves; cost is quadratic in radius, so it is capped.
+    refine_search_max: int = 64      # ceiling; == refine_search_px disables adaptation
+    refine_search_speed_k: float = 1.5   # px of extra radius per px/frame of local speed
+    # Distinctiveness test. Repetitive detail -- bolts, rivets, window grids, tiles -- gives
+    # NCC several near-equal answers, and taking the single best silently snapped the point
+    # to the identical feature next door at high correlation, so nothing downstream noticed.
+    # Reject the match when a rival peak scores >= this fraction of the winner. 1.0 = off.
+    match_ambiguity_ratio: float = 0.90
+    # Re-acquisition after an occlusion is where that matters most: search this fraction of
+    # the normal radius around the neighbour-predicted position, so a rival further away
+    # cannot win. 1.0 = search the full box (old behaviour).
+    reacquire_search_frac: float = 0.5
     refine_ncc_lost: float = 0.60   # corr below this = lock lost -> trim the track here
     # Hysteresis (Schmitt trigger). refine_ncc_lost alone is a single hard edge, so on grainy
     # footage the correlation hovers around it and the point drops out for a frame here and
@@ -206,6 +226,10 @@ class RunnerConfig:
     # only the upper bound. Applies to the chunked/re-seed path (single-block seeds once).
     reseed_density_per_mp: float = 60.0  # fresh seeds per window per megapixel
     reseed_seed_floor: int = 64          # min fresh seeds per window (small frames)
+    # How many entry times a window's fresh seeds are split across. TAPNext queries carry a
+    # time index that was always 0, so every new track began on its window's first frame and
+    # they arrived in visible bulk every reseed_every frames. 1 = that old behaviour.
+    seed_stagger: int = 4
 
     # --- VRAM/RAM safety: temporal chunking + OOM downscale-retry + streamed decode ---
     chunks: int = 0            # 0 = auto (VRAM-estimated); >=1 forces that many chunks
@@ -543,6 +567,78 @@ class BatchTrackerRunner:
                          f"(anisotropy < {thr:.2f}) - these slide along edges")
         return pts[keep]
 
+    def _stagger_offsets(self, n_frames: int) -> List[int]:
+        """Frame offsets within a block at which fresh seeds should enter.
+
+        Every seed used to enter at offset 0 -- the TAPNext query format is (t, x, y) and the
+        t was hardcoded to zero -- so with a re-seed window of N frames, a whole batch of new
+        tracks began at frames 0, N, 2N... and none in between. In 3DE that reads as tracks
+        arriving in bulk every N frames. Spreading the entry times uses a capability the model
+        already has; 1 = the old behaviour.
+        """
+        k = max(1, int(getattr(self.cfg, "seed_stagger", 1) or 1))
+        if k <= 1 or n_frames < 4:
+            return [0]
+        k = min(k, max(1, n_frames // 2))          # never denser than every other frame
+        step = n_frames / float(k)
+        # Offsets stay inside the block and always include 0 so frame-0 content is seeded.
+        return sorted({min(n_frames - 2, int(round(i * step))) for i in range(k)})
+
+    def _staggered_queries(self, frames: np.ndarray, seed_mask, total: int,
+                           n_frames: int) -> np.ndarray | None:
+        """Build a (1,N,3) TAPNext query array whose seeds ENTER at staggered times.
+
+        The per-offset budget is `total` split across the offsets, so staggering redistributes
+        the same seed budget over time instead of multiplying it. Each batch detects features
+        on the frame it actually enters on, so it seeds what is visible THERE -- content that
+        only appears mid-window now gets tracked, which seeding frame 0 alone could never do.
+        """
+        offsets = self._stagger_offsets(int(n_frames))
+        # The SHOT's seed budget is authoritative, not the per-round one. Each round runs its
+        # own goodFeaturesToTrack with a fresh min-distance allowance, so a naive
+        # total/len(offsets) split would return more points in four rounds than in one --
+        # staggering must redistribute the budget over time, never inflate it.
+        remaining = int(total)
+        rows: List[np.ndarray] = []
+        # Ground already claimed by an earlier offset. Without this every offset re-detects
+        # the SAME features -- the frames barely differ -- and we would emit one duplicate
+        # track per offset for every point. Masking claimed ground means a later batch seeds
+        # only what is genuinely new (content that has just entered or been revealed), which
+        # is the whole reason to seed mid-window.
+        taken = None
+        rad = max(2, int(self.cfg.min_feature_dist) or 2)
+        for oi, off in enumerate(offsets):
+            if off >= frames.shape[0] or remaining <= 0:
+                continue
+            left = len(offsets) - oi
+            per = max(1, int(round(remaining / float(left))))
+            m = seed_mask
+            if taken is not None:
+                m = (~taken) if seed_mask is None else (seed_mask & ~taken)
+            pts = self._detect_features(
+                frames[off], mask=m, count=per,
+                quality=self.cfg.feature_quality, min_dist=self.cfg.min_feature_dist,
+            )
+            if pts.shape[0] > remaining:
+                pts = pts[:remaining]
+            if pts.shape[0] == 0:
+                continue
+            remaining -= int(pts.shape[0])
+            if taken is None:
+                taken = np.zeros(frames.shape[1:3], dtype=bool)
+            claim = taken.astype(np.uint8)
+            for (px, py) in pts:
+                cv2.circle(claim, (int(round(px)), int(round(py))), rad, 1, -1)
+            taken = claim.astype(bool)
+            q = np.zeros((pts.shape[0], 3), dtype=np.float32)
+            q[:, 0] = float(off)
+            q[:, 1] = pts[:, 0]
+            q[:, 2] = pts[:, 1]
+            rows.append(q)
+        if not rows:
+            return None
+        return np.concatenate(rows, axis=0)[None]
+
     def _detect_features(self, first_frame_bgr: np.ndarray, mask: np.ndarray | None,
                          count: int, quality: float, min_dist: int) -> np.ndarray:
         gray = cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -734,22 +830,11 @@ class BatchTrackerRunner:
         
         # 1. SEEDING
         if self.cfg.seeding_mode == "features":
-            pts = self._detect_features(
-                frames[0], 
-                mask=seed_mask,
-                count=self.cfg.max_tracks,
-                quality=self.cfg.feature_quality,
-                min_dist=self.cfg.min_feature_dist
-            )
-            if pts.shape[0] < 5:
+            q = self._staggered_queries(frames, seed_mask, self.cfg.max_tracks, T_seg)
+            if q is None or q.shape[1] < 5:
                 tracks_xy, vis = engine.track_grid(frames, grid_size=int(self.cfg.grid_size), segm_mask=seed_mask)
             else:
-                N_pts = pts.shape[0]
-                queries = np.zeros((1, N_pts, 3), dtype=np.float32)
-                queries[0, :, 0] = 0.0
-                queries[0, :, 1] = pts[:, 0]
-                queries[0, :, 2] = pts[:, 1]
-                tracks_xy, vis = engine.track_queries(frames, queries)
+                tracks_xy, vis = engine.track_queries(frames, q)
         else:
             tracks_xy, vis = engine.track_grid(frames, grid_size=int(self.cfg.grid_size), segm_mask=seed_mask)
             
@@ -1000,6 +1085,11 @@ class BatchTrackerRunner:
 
         grids: Dict[int, Dict[Tuple[int, int], List[Tuple[float, float]]]] = {rf: {} for rf in ref_frames}
         mean_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        # Temporal spacing: how many accepted tracks already START in each short window.
+        start_cap = int(getattr(self.cfg, "spread_max_starts_per_window", 0) or 0)
+        start_win = max(1, int(getattr(self.cfg, "spread_start_window", 8) or 8))
+        starts: Dict[int, int] = {}
+        n_start_pruned = 0
 
         def clashes(grid, px, py):
             cx, cy = int(px // d), int(py // d)
@@ -1011,6 +1101,12 @@ class BatchTrackerRunner:
             return False
 
         for c in sorted(candidates, key=lambda c: c["score"], reverse=True):
+            # Best-first, so a full start-window keeps the strongest tracks that began there
+            # and turns the rest away -- thinning a burst rather than banning one outright.
+            sbin = int(c["pts"][0][0]) // start_win if start_cap > 0 else None
+            if sbin is not None and starts.get(sbin, 0) >= start_cap:
+                n_start_pruned += 1
+                continue
             at = positions_at_refs(c["pts"])
             mx, my = c["mean"]
             if not at:
@@ -1025,8 +1121,13 @@ class BatchTrackerRunner:
             for rf, (px, py) in at.items():
                 grids[rf].setdefault((int(px // d), int(py // d)), []).append((px, py))
             mean_grid.setdefault((int(mx // d), int(my // d)), []).append((mx, my))
+            if sbin is not None:
+                starts[sbin] = starts.get(sbin, 0) + 1
             if cap > 0 and len(out) >= cap:
                 break
+        if n_start_pruned:
+            self._status(f"  spread: thinned {n_start_pruned} track(s) that started in an "
+                         f"already-crowded {start_win}-frame window")
         return out
 
     # -------------------------------------------------------------------------
@@ -1061,15 +1162,49 @@ class BatchTrackerRunner:
         except Exception:
             pass
 
+    def _probe_vram(self, engine, frames: np.ndarray, Ws: int, Hs: int) -> None:
+        """Measure this card's real bytes-per-(frame*pixel) BEFORE chunking is decided.
+
+        _MEM_PER_FPX_DEFAULT is documented "conservative until calibrated", but _calibrate
+        only runs after the first real track_queries call while _decide_chunks runs before
+        it -- so the first shot of every run was sized against the pessimistic guess and cut
+        into more chunks than the card needs. More chunks means more seams and less temporal
+        context, i.e. worse tracking. A few frames and a handful of points cost almost
+        nothing and replace the guess with a measurement. Best-effort: any failure just
+        leaves the old constant in place.
+        """
+        if self._cal and self._cal > 0:
+            return                                  # already measured this run
+        try:
+            n = int(min(8, frames.shape[0]))
+            if n < 2:
+                return
+            blk = frames[:n]
+            q = np.zeros((1, 16, 3), dtype=np.float32)
+            q[0, :, 1] = np.linspace(Ws * 0.2, Ws * 0.8, 16)
+            q[0, :, 2] = np.linspace(Hs * 0.2, Hs * 0.8, 16)
+            torch.cuda.reset_peak_memory_stats()
+            engine.track_queries(blk, q)
+            self._calibrate(n, Hs, Ws)
+            torch.cuda.empty_cache()
+            if self._cal:
+                self._status(f"  VRAM probe: {self._cal:.1f} B per frame-pixel measured "
+                             f"(was assuming {self._MEM_PER_FPX_DEFAULT:.0f})")
+        except Exception as e:
+            self._status(f"  VRAM probe skipped ({e}); using the conservative default")
+
     def _decide_chunks(self, T: int, Ws: int, Hs: int) -> int:
         # Manual override wins.
         if int(self.cfg.chunks) >= 1:
             return max(1, min(int(self.cfg.chunks), 64))
-        factor = self._cal if (self._cal and self._cal > 0) else self._MEM_PER_FPX_DEFAULT
+        measured = bool(self._cal and self._cal > 0)
+        factor = self._cal if measured else self._MEM_PER_FPX_DEFAULT
         free = self._free_vram_bytes()
         if free <= 0 or Ws <= 0 or Hs <= 0:
             return 1
-        budget = free * 0.8
+        # Lean harder on a MEASURED figure than on the guess; the OOM ladder
+        # (oom_retry -> oom_scale_step -> oom_scale_floor) is still the safety net either way.
+        budget = free * (0.85 if measured else 0.8)
         per_frame = float(Hs) * float(Ws) * float(factor)
         if per_frame <= 0:
             return 1
@@ -1142,13 +1277,15 @@ class BatchTrackerRunner:
                 fresh_cap = max(int(getattr(self.cfg, "reseed_seed_floor", 64)),
                                 min(int(self.cfg.max_tracks), fresh_cap))
                 seed_mask, _info, _nm = self._make_seed_inclusion_mask(shot, cur_Ws, cur_Hs)
-                pts = self._detect_features(
-                    blk[0], mask=seed_mask, count=fresh_cap,
-                    quality=self.cfg.feature_quality, min_dist=self.cfg.min_feature_dist,
-                )
-                for (px, py) in pts:
-                    q_list.append((0.0, float(px), float(py)))
-                    gid_list.append(next_gid); next_gid += 1
+                # Stagger the entry times across the window instead of dumping every fresh
+                # seed on its first frame -- that is what made tracks arrive in bulk every
+                # reseed_every frames. The budget is split across the offsets, so this
+                # redistributes seeds over time rather than adding more of them.
+                fresh_q = self._staggered_queries(blk, seed_mask, fresh_cap, int(blk.shape[0]))
+                if fresh_q is not None:
+                    for (qt, px, py) in fresh_q[0]:
+                        q_list.append((float(qt), float(px), float(py)))
+                        gid_list.append(next_gid); next_gid += 1
 
                 if not q_list:
                     result = None
@@ -1275,9 +1412,20 @@ class BatchTrackerRunner:
                 else:
                     try:
                         import psutil  # type: ignore
-                        avail = int(psutil.virtual_memory().available)
+                        vm = psutil.virtual_memory()
+                        avail = int(vm.available)
                         need = int(estimate_clip_bytes(in_path, scale))
-                        stream = need > avail * float(self.cfg.host_ram_frac)
+                        # A fixed 0.5 is over-cautious on a big machine: holding the whole
+                        # clip lets moving-tile and refine share ONE decode, which is both
+                        # faster and more accurate than streaming. Scale the allowance with
+                        # total RAM, keeping the conservative fraction on small machines.
+                        frac = float(self.cfg.host_ram_frac)
+                        total_gb = vm.total / (1024.0 ** 3)
+                        if total_gb >= 96:
+                            frac = max(frac, 0.75)
+                        elif total_gb >= 48:
+                            frac = max(frac, 0.6)
+                        stream = need > avail * frac
                     except Exception:
                         stream = False
 
@@ -1298,6 +1446,13 @@ class BatchTrackerRunner:
                 Ws, Hs = int(source.scaled_w), int(source.scaled_h)
                 diag = float(np.sqrt(float(W0 * W0 + H0 * H0))) if (W0 > 0 and H0 > 0) else 1000.0
 
+                # Measure the card BEFORE sizing chunks, so the first shot of a run isn't
+                # cut up against the conservative constant (see _probe_vram).
+                if not (self._cal and self._cal > 0) and int(self.cfg.chunks) < 1:
+                    try:
+                        self._probe_vram(engine, source.get(fs0, min(8, T)), Ws, Hs)
+                    except Exception:
+                        pass
                 n_chunks = self._decide_chunks(T, Ws, Hs)
                 # Re-seeding: cap the window to reseed_every frames so fresh features are
                 # seeded at least that often (the chunked path seeds per window). Only ever
@@ -1311,7 +1466,10 @@ class BatchTrackerRunner:
                         n_chunks = n_reseed
                         reseed_msg = f" (re-seed every ~{every}f)"
                 free_gb = self._free_vram_bytes() / (1024.0 ** 3)
-                self._status(f"[{i}/{len(vids)}] frames={T} res={Ws}x{Hs} freeVRAM={free_gb:.1f}GB -> chunks={n_chunks}{reseed_msg}")
+                cal_msg = (f" cal={self._cal:.1f}B/frame-px" if (self._cal and self._cal > 0)
+                           else " cal=default(uncalibrated)")
+                self._status(f"[{i}/{len(vids)}] frames={T} res={Ws}x{Hs} freeVRAM={free_gb:.1f}GB"
+                             f"{cal_msg} -> chunks={n_chunks}{reseed_msg}")
 
                 log_f = log_b = log_mid_f = log_mid_b = ""
 
