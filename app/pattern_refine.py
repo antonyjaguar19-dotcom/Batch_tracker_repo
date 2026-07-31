@@ -240,6 +240,10 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     motion = _MOTION.get(str(cfg.refine_motion).lower(), cv2.MOTION_AFFINE)
     lost = float(cfg.refine_ncc_lost)
     reref = float(cfg.refine_ncc_reref)
+    # Hysteresis: it takes `lost` to be confident, but only `hold` to stay locked, so a
+    # correlation hovering around one hard threshold can no longer drop the point for a
+    # frame at a time while its pattern is plainly visible.
+    hold = min(float(getattr(cfg, "refine_ncc_hold", lost) or lost), lost)
 
     # 1. anchor = highest-contrast valid patch (within THIS segment -> re-acquires per segment)
     best_i, best_c, best_patch = -1, -1.0, None
@@ -287,7 +291,7 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             if g is None:
                 break
             res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp)
-            if res is None or res[2] < lost:
+            if res is None or res[2] < hold:
                 # Lock lost. This used to end the track here, which is how points were lost
                 # to occluders SAM3 never masked (a pole, a prop, a hand). Treat it as a
                 # candidate occlusion: leave the frame out and keep trying to re-find the
@@ -326,7 +330,10 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             # pattern random-walks off the feature. Accept a new patch only while it still
             # resembles the anchor, and re-check against the anchor periodically.
             since_anchor_check += 1
-            if cc < reref:  # hybrid: re-grab the pattern before it degrades further
+            # Only re-grab from a CONFIDENT frame. A frame merely held by hysteresis is by
+            # definition a poor match, so adopting its pixels as the new pattern is how a
+            # track walks off its feature.
+            if cc < reref and cc >= lost:  # hybrid: re-grab before the pattern degrades further
                 np2 = _extract(g, x, y, half)
                 if np2 is not None:
                     if drift_floor <= 0.0 or _corr(np2, anchor) >= drift_floor:
@@ -391,13 +398,18 @@ def build_neighbour_predictor(tracks: Dict[str, Track], cfg):
 
 def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                edge_clamp: bool) -> Track:
-    """Forward-backward consistency: re-track the refined segment BACKWARDS from its last
-    frame and keep only the frames the return pass agrees with.
+    """Forward-backward consistency: re-track the refined segment BACKWARDS and judge it.
 
-    A correctly tracked point comes back to where it started; a mistrack does not. This is
-    purely self-referential, so it is parallax-safe -- it never compares a track against
-    global motion, which would punish exactly the fast foreground points we want to keep.
-    Costs a second NCC sweep per segment. 0 = off.
+    A correctly tracked point comes back to where it started; a mistrack does not. Purely
+    self-referential, so parallax-safe -- it never compares a track against global motion,
+    which would punish exactly the fast foreground points we want to keep.
+
+    This is a verdict on the SEGMENT, not a per-frame delete. Deleting individual frames
+    wherever the return pass disagreed punched holes through the middle of perfectly visible
+    tracks -- they flickered on and off. The literature uses FB error the same way (Kalal's
+    forward-backward error rejects a point, it does not perforate it), and 3DE wants a
+    contiguous run, not a comb. So: a bad MEDIAN rejects the whole segment, and only a
+    contiguous bad TAIL is trimmed (there, lock genuinely was lost). 0 = off.
     """
     tol = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
     if tol <= 0.0 or len(seg) < 3:
@@ -405,6 +417,7 @@ def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     half = int(cfg.refine_patch_px) // 2
     search = int(cfg.refine_search_px)
     lost = float(cfg.refine_ncc_lost)
+    reref = float(cfg.refine_ncc_reref)
 
     g_last = get(int(seg[-1][0]) - 1)
     if g_last is None:
@@ -413,7 +426,10 @@ def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     if patch is None:
         return seg
 
-    out: Track = [seg[-1]]
+    # Walk back, re-referencing exactly like the forward pass. Without this the single
+    # end-frame patch decorrelates as it travels, so the FB error grew with distance from
+    # the end and the test failed frames that were tracked perfectly well.
+    errs: List[Tuple[int, float]] = []
     for f, fx, fy in reversed(seg[:-1]):
         g = get(int(f) - 1)
         if g is None:
@@ -421,11 +437,28 @@ def _fb_filter(seg: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
         res = _ncc_match(g, patch, fx, fy, search, half, edge_clamp)
         if res is None or res[2] < lost:
             break
-        bx, by, _cc = res
-        if math.hypot(bx - float(fx), by - float(fy)) > tol:
-            continue          # the return pass disagrees here -> drop just this frame
-        out.append((f, fx, fy))
-    return sorted(out, key=lambda t: t[0])
+        bx, by, cc = res
+        errs.append((int(f), math.hypot(bx - float(fx), by - float(fy))))
+        if cc < reref:
+            np2 = _extract(g, bx, by, half)
+            if np2 is not None:
+                patch = np2
+    if not errs:
+        return seg
+
+    if float(np.median([e for _f, e in errs])) > tol:
+        return []              # the segment as a whole does not survive its own return trip
+
+    # Trim only a contiguous bad TAIL (errs is newest-first, so that is its head).
+    cut_from = None
+    for f, e in errs:
+        if e > tol:
+            cut_from = f if cut_from is None else min(cut_from, f)
+        else:
+            break
+    if cut_from is None:
+        return seg
+    return [p for p in seg if int(p[0]) < cut_from]
 
 
 def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
