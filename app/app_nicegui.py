@@ -60,7 +60,7 @@ _suppress_select = False  # guard so programmatic selection doesn't re-trigger h
 # browser), a chip changes which rows exist server-side, so it does rebuild the table.
 # 'Masked' is back now that mask state comes from one batched listdir of each shot's own
 # folder at scan time, instead of a per-shot probe during the scan.
-STATUS_CHIPS = ["All", "No plate", "Pending", "Analyzed", "Masked", "Tracked"]
+STATUS_CHIPS = ["All", "Selected", "No plate", "Pending", "Analyzed", "Masked", "Tracked"]
 _status_chip = {"v": "All"}
 
 
@@ -79,6 +79,8 @@ def _is_tracked(d) -> bool:
 
 def _passes_status(d) -> bool:
     s = _status_chip["v"]
+    if s == "Selected":
+        return bool(getattr(d, "use", False))
     if s == "No plate":
         return not d.plate_dir or not d.frames
     if s == "Pending":
@@ -306,6 +308,8 @@ def apply_pasted_list(text: str):
 def on_status_chip(e):
     _status_chip["v"] = e.value or "All"
     refresh_table()
+    if _status_chip["v"] == "Selected" and not table.rows:
+        ui.notify("No shots ticked yet.", type="info")
 
 
 def load_editor(name: str):
@@ -1430,7 +1434,12 @@ with ui.column().classes("w-full gap-3 p-3"):
                               ).tooltip("Paste a production shot list to tick them all at once.")
             ui.separator().props("vertical").classes("bt-vsep")
             ui.toggle(STATUS_CHIPS, value="All", on_change=on_status_chip
-                      ).props("dense no-caps unelevated toggle-color=primary size=sm")
+                      ).props("dense no-caps unelevated toggle-color=primary size=sm"
+                              ).tooltip("Narrow the list. 'Selected' shows only the shots you have ticked — "
+                                        "use it to review a selection before running. Unticking a shot while "
+                                        "on 'Selected' leaves the row in place until the list next rebuilds "
+                                        "(click the chip again to re-apply), so the list can't jump under your "
+                                        "cursor mid-click.")
 
         table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple",
                          pagination={"rowsPerPage": 0}
