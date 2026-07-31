@@ -1084,12 +1084,14 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 track_chunks.tooltip("Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
                                      "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
 
-                ui.label("Track spacing (px · density dial)")
-                track_spacing = ui.slider(min=10, max=120, value=int(getattr(state, "track_spacing_px", 40)), step=5).props("label-always")
-                track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 40)))
-                track_spacing.tooltip("Min pixel gap between kept tracks, measured ON SCREEN at several sampled frames "
-                                      "(not on each track's average position), so tracks can't clump at the start or end "
-                                      "of a moving shot. Small = denser/more tracks, large = sparser/fewer.")
+                ui.label("Track spacing (px @1920 · density dial)")
+                track_spacing = ui.slider(min=10, max=300, value=int(getattr(state, "track_spacing_px", 60)), step=5).props("label-always")
+                track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 60)))
+                track_spacing.tooltip("Min gap between kept tracks, measured ON SCREEN at several sampled frames (not on "
+                                      "each track's average position), so tracks can't clump at the start or end of a "
+                                      "moving shot. Quoted against a 1920-wide plate and scaled up automatically — at 4K "
+                                      "a value of 60 becomes 120px — so one setting looks the same at any resolution. "
+                                      "Raise it for fewer, wider-spaced tracks.")
 
                 ui.label("Mask safety margin at track time (px)")
                 mask_margin = ui.slider(min=0, max=40, value=int(getattr(state, "mask_margin_px", 8)), step=1).props("label-always")
