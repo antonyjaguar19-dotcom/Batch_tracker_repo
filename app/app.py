@@ -1065,7 +1065,11 @@ class AppState:
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
     track_chunks: int = 0          # TAPNext temporal chunks: 0=auto (VRAM-sized), >=1 forces
     track_spacing_px: int = 40     # TAPNext: min px spacing between kept tracks (density dial)
+    spread_ref_frames: int = 5     # TAPNext: frames sampled to measure that spacing ON SCREEN
     track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
+    mask_dilation_px: int = 10     # SAM3: grow the exclude region at MASK time (soft edges)
+    mask_margin_px: int = 8        # TAPNext: pull seeding/gating in from the matte edge
+    min_corner_anisotropy: float = 0.08  # TAPNext: reject 1-D edge points that slide (0=off)
     moving_tile: bool = True       # TAPNext: native moving-tile re-track before NCC (4K accuracy)
     reseed: bool = True            # TAPNext: periodic re-seeding (replenish tracks on fast shots)
     reseed_every: int = 30         # TAPNext: max frames between re-seeds (window cap)
@@ -1783,11 +1787,23 @@ def worker_mask(in_dir, out_dir, weights, state: AppState):
         if not os.path.isfile(weights): raise FileNotFoundError(f"SAM3 Weights file not found: {weights}")
         mb = bool(getattr(state, "motion_backstop", True))
         logger(f"CV motion backstop: {'ON' if mb else 'OFF'}")
+        # Grow the exclude region so trackers stay off soft matte edges (hair, motion-blur
+        # fringe). sam3_runner has always implemented this but nothing ever set it, so it sat
+        # at 0 and tracks kept landing in the halo just outside the matte and sliding.
+        mdil = max(0, int(getattr(state, "mask_dilation_px", 10) or 0))
+        logger(f"Mask edge dilation: {mdil}px" if mdil else "Mask edge dilation: OFF")
+        base = dict(guide_json_path=Path(run_guide_path), input_root=Path(in_dir),
+                    output_root=Path(out_dir), weights_path=Path(weights))
         try:
-            cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights), motion_backstop=mb)
+            cfg = SamConfig(**base, motion_backstop=mb, mask_dilation_px=mdil)
         except TypeError:
-            # Older SamConfig without the motion_backstop field
-            cfg = SamConfig(guide_json_path=Path(run_guide_path), input_root=Path(in_dir), output_root=Path(out_dir), weights_path=Path(weights))
+            # Older SamConfig without motion_backstop / mask_dilation_px
+            try:
+                cfg = SamConfig(**base, motion_backstop=mb)
+                if mdil:
+                    logger("  (this SAM3 build has no mask_dilation_px - edge margin skipped)")
+            except TypeError:
+                cfg = SamConfig(**base)
         run_sam3_batch(cfg, log_cb=logger, progress_cb=lambda d,t: _set_progress(f"{d}/{t} frames", d, t), status_cb=logger)
         _free_vram("after SAM3")
         logger("Masking Complete.")
@@ -1954,7 +1970,12 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 filter_max_jump_px=float(getattr(state, "filter_max_jump_px", 0.0) or 0.0),
                 filter_max_jitter_px=float(getattr(state, "filter_max_jitter_px", 0.0) or 0.0),
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 40) or 40),
+                spread_ref_frames=int(getattr(state, "spread_ref_frames", 5) or 5),
                 max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
+                # Pull seeds/gating in from the matte edge, and reject 1-D (edge) features
+                # that NCC can only slide along. See RunnerConfig for the reasoning.
+                mask_margin_px=int(getattr(state, "mask_margin_px", 8) or 0),
+                min_corner_anisotropy=float(getattr(state, "min_corner_anisotropy", 0.08) or 0.0),
                 enable_moving_tile=bool(getattr(state, "moving_tile", True)),
                 enable_reseed=bool(getattr(state, "reseed", True)),
                 reseed_every=int(getattr(state, "reseed_every", 30) or 30),
