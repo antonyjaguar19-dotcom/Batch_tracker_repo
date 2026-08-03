@@ -41,11 +41,22 @@ _MOTION = {
 
 
 def _extract(gray: np.ndarray, x: float, y: float, half: int) -> Optional[np.ndarray]:
-    """Integer-centred patch of size (2*half+1); None if it would fall off frame."""
+    """Patch of size (2*half+1) centred at the SUB-PIXEL position; None if off frame.
+
+    This used to slice the array at int(round(x)), so the reference pattern was quantised to
+    whole pixels and could not represent where the feature actually sat -- re-quantised on
+    every re-reference, which is a floor on how still a track can possibly be. Sampling with
+    getRectSubPix (what _ecc_refine below already does, and what 3DE and SynthEyes do) costs
+    a slight bilinear softening and buys the sub-pixel truth.
+    """
     xi, yi = int(round(x)), int(round(y))
     if xi - half < 0 or yi - half < 0 or xi + half + 1 > gray.shape[1] or yi + half + 1 > gray.shape[0]:
         return None
-    return gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
+    P = 2 * half + 1
+    try:
+        return cv2.getRectSubPix(gray, (P, P), (float(x), float(y)))
+    except cv2.error:
+        return gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
 
 
 def _structure_eigs(patch: np.ndarray) -> Tuple[float, float]:
@@ -94,18 +105,47 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
-    """Quadratic sub-pixel offset of the NCC response peak at integer `loc`."""
+    """Sub-pixel offset of the correlation peak at integer `loc`.
+
+    Two upgrades over the separable parabola this replaces, both aimed at PIXEL-LOCKING --
+    the tendency of a crude fit to pull estimates toward whole pixels, which is what shows
+    up as a track wobbling in place while the feature never moved:
+
+      * a full 2-D quadratic over the 3x3 neighbourhood, so the cross term is used. Fitting
+        x and y independently discards it entirely, which is worst on a diagonal feature.
+      * where all nine samples are positive, the fit is done on the LOG of the response. A
+        normalised correlation peak is much closer to Gaussian than to parabolic, and the
+        log-parabola estimator is correspondingly less biased.
+
+    Falls back to the plain quadratic when any sample is <= 0 (TM_CCOEFF_NORMED can go
+    negative), and to the separable fit when the Hessian is singular.
+    """
     mx, my = loc
     h, w = resp.shape
-    dx = dy = 0.0
-    if 0 < mx < w - 1:
-        l, c, r = float(resp[my, mx - 1]), float(resp[my, mx]), float(resp[my, mx + 1])
-        d = l - 2 * c + r
-        if abs(d) > 1e-9: dx = 0.5 * (l - r) / d
-    if 0 < my < h - 1:
-        u, c, d0 = float(resp[my - 1, mx]), float(resp[my, mx]), float(resp[my + 1, mx])
-        d = u - 2 * c + d0
-        if abs(d) > 1e-9: dy = 0.5 * (u - d0) / d
+    if not (0 < mx < w - 1 and 0 < my < h - 1):
+        return (0.0, 0.0)          # peak on the window border: no neighbourhood to fit
+    r = resp[my - 1:my + 2, mx - 1:mx + 2].astype(np.float64)
+
+    if float(r.min()) > 0.0:
+        r = np.log(r)              # Gaussian peak -> parabolic in log space
+
+    fx = (r[1, 2] - r[1, 0]) * 0.5
+    fy = (r[2, 1] - r[0, 1]) * 0.5
+    fxx = r[1, 2] - 2.0 * r[1, 1] + r[1, 0]
+    fyy = r[2, 1] - 2.0 * r[1, 1] + r[0, 1]
+    fxy = (r[2, 2] - r[2, 0] - r[0, 2] + r[0, 0]) * 0.25
+    det = fxx * fyy - fxy * fxy
+
+    if abs(det) > 1e-12:
+        dx = -(fyy * fx - fxy * fy) / det
+        dy = -(fxx * fy - fxy * fx) / det
+    else:
+        # Degenerate surface (a ridge, or a flat top): fall back to the separable fit.
+        dx = 0.5 * (r[1, 0] - r[1, 2]) / fxx if abs(fxx) > 1e-12 else 0.0
+        dy = 0.5 * (r[0, 1] - r[2, 1]) / fyy if abs(fyy) > 1e-12 else 0.0
+
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return (0.0, 0.0)
     return (max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)))
 
 
@@ -307,6 +347,13 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     # correlation hovering around one hard threshold can no longer drop the point for a
     # frame at a time while its pattern is plainly visible.
     hold = min(float(getattr(cfg, "refine_ncc_hold", lost) or lost), lost)
+    # ECC polish. _ecc_refine is proper iterative sub-pixel estimation against the real
+    # pixels, but it only ever ran when the motion model was NOT translation -- and
+    # translation is the default, so on normal settings the exported position was always a
+    # 3-sample curve fit. Running it in translation mode too replaces that with gradient
+    # descent. This does not revisit the affine->translation decision: that was about
+    # affine's extra rotation/scale freedom adding wobble; translation-only ECC has none.
+    ecc_polish = bool(getattr(cfg, "refine_ecc_polish", False))
 
     # 1. anchor = highest-contrast valid patch (within THIS segment -> re-acquires per segment)
     best_i, best_c, best_patch = -1, -1.0, None
@@ -391,6 +438,12 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             if motion != cv2.MOTION_TRANSLATION:
                 er = _ecc_refine(g, patch, x, y, half, motion)
                 if er is not None and er[2] >= lost:
+                    x, y, cc = er
+            elif ecc_polish:
+                # Only adopt it if the correlation did not get worse, so the polish can
+                # never turn a good NCC answer into a poorer one.
+                er = _ecc_refine(g, patch, x, y, half, cv2.MOTION_TRANSLATION)
+                if er is not None and er[2] >= cc:
                     x, y, cc = er
             refined[i] = (f, float(x), float(y))
             last_good = refined[i]

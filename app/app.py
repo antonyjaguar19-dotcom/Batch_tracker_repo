@@ -809,7 +809,8 @@ _EXR_EXTS = {".exr"}
 _PROXY_OK_EXTS = {".jpg", ".jpeg", ".png"}
 
 def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
-                         max_side: int = 0, workers: int = 8) -> str:
+                         max_side: int = 0, workers: int = 8,
+                         lossless: bool = False) -> str:
     """SAM3 (PIL) and Qwen (cv2.imread) cannot decode EXR. If `plate_dir` holds .exr
     frames, tonemap each to an 8-bit JPG under <cache_root>/_proxies/<key>/ and return
     that dir. If frames are already jpg/jpeg/png, return `plate_dir` unchanged.
@@ -837,11 +838,20 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
         # Already viewable by PIL/cv2 — no proxy needed.
         return plate_dir
 
+    # Lossless (PNG) proxies for TRACKING: JPEG artefacts sit on the 8x8 DCT block grid and
+    # do not travel with the image, so they inject sub-pixel noise -- which is exactly the
+    # "track wobbles in place" symptom. Analysis and masking are not sub-pixel sensitive and
+    # keep JPEG, since PNG costs several times the disk.
+    ext = ".png" if lossless else ".jpg"
     import hashlib
-    key = hashlib.md5(f"{src.resolve()}@{int(max_side)}".encode("utf-8", "ignore")).hexdigest()[:16]
+    # The format MUST be part of the key, and the existing-file scan MUST match the chosen
+    # extension: miss either and a shot that already has JPEG proxies silently keeps using
+    # them for tracking, so the fix appears to do nothing.
+    key = hashlib.md5(
+        f"{src.resolve()}@{int(max_side)}@{ext}".encode("utf-8", "ignore")).hexdigest()[:16]
     pdir = Path(cache_root) / "_proxies" / key
     pdir.mkdir(parents=True, exist_ok=True)
-    existing = [f for f in pdir.iterdir() if f.is_file() and f.suffix.lower() == ".jpg"] if pdir.exists() else []
+    existing = [f for f in pdir.iterdir() if f.is_file() and f.suffix.lower() == ext] if pdir.exists() else []
     if len(existing) >= len(exr):
         return str(pdir)  # already generated
 
@@ -902,16 +912,20 @@ def ensure_plate_proxies(plate_dir: str, cache_root: str, log_cb=None,
                 s = ms / float(m)
                 out8 = _cv2.resize(out8, (int(round(w * s)), int(round(h * s))),
                                    interpolation=_cv2.INTER_AREA)
-        outfp = pdir / (f.stem + ".jpg")
+        outfp = pdir / (f.stem + ext)
         try:
-            _cv2.imwrite(str(outfp), out8, [int(_cv2.IMWRITE_JPEG_QUALITY), 95])
+            # PNG level 1: still lossless, and much faster to write than the default 3 --
+            # these are a per-shot cache, not something we ship.
+            params = ([int(_cv2.IMWRITE_PNG_COMPRESSION), 1] if lossless
+                      else [int(_cv2.IMWRITE_JPEG_QUALITY), 95])
+            _cv2.imwrite(str(outfp), out8, params)
             return 1
         except Exception as ex:
             _log(f"EXR proxy write failed for {f.name}: {ex}")
             return 0
 
     n_workers = max(1, min(int(workers or 1), len(exr)))
-    _log(f"Generating {len(exr)} JPG proxy frame(s) from EXR "
+    _log(f"Generating {len(exr)} {'PNG (lossless)' if lossless else 'JPG'} proxy frame(s) from EXR "
          f"({'downscaled ' + str(ms) + 'px' if ms else 'full-res'}, {n_workers} threads) → {pdir}")
     made = 0
     from concurrent.futures import ThreadPoolExecutor
@@ -1121,6 +1135,9 @@ class AppState:
     gap_aware_refine: bool = True  # TAPNext: keep disappear/reappear points as one track (per-segment refine)
     pattern_refine: bool = True    # TAPNext: 3DE-style NCC/affine pattern lock at native res
     refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
+    # Sub-pixel accuracy (the "track wobbles in place" fixes)
+    refine_ecc_polish: bool = True      # gradient sub-pixel polish after the NCC peak
+    lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
     min_occlusion_run: int = 3         # ignore 1-2 frame mask-edge chatter (anti-flicker)
@@ -2092,10 +2109,14 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
             # re-decode), no mp4 encode, native plate resolution.
             pd = str(getattr(data, "plate_dir", "") or "")
             if pd:
-                jpgdir = ensure_plate_proxies(pd, cache, logger)
+                # Lossless for TRACKING: JPEG block artefacts don't move with the image, so
+                # they read as sub-pixel jitter on an otherwise static feature.
+                lossless = bool(getattr(state, "lossless_track_proxies", True))
+                jpgdir = ensure_plate_proxies(pd, cache, logger, lossless=lossless)
                 if jpgdir and os.path.isdir(jpgdir):
                     seq_path = jpgdir
-                    logger(f"{shot_name}: tracking full-res proxy sequence -> {jpgdir}")
+                    logger(f"{shot_name}: tracking full-res "
+                           f"{'lossless ' if lossless else ''}proxy sequence -> {jpgdir}")
         if not video_dir and not seq_path:
             logger(f"Skip {shot_name}: no footage. Point the shot at a render (.mp4 or JPEG "
                    f"folder) in the editor, or set a plate version."); continue
@@ -2154,6 +2175,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 refine_gap_aware=bool(getattr(state, "gap_aware_refine", True)),
                 enable_pattern_refine=bool(getattr(state, "pattern_refine", True)),
                 refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
+                refine_ecc_polish=bool(getattr(state, "refine_ecc_polish", True)),
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.
                 occlusion_continuity=bool(getattr(state, "occlusion_continuity", True)),
