@@ -1272,6 +1272,46 @@ def _fmt_pct(x: float) -> str:
     except Exception: return "0.0%"
 def _safe_div(a: float, b: float) -> float: return a / b if b else 0.0
 
+def _filter_exported_tracks(txt_path: str, state, width: int = 0, height: int = 0,
+                            n_frames: int = 0, fallback: int = 0) -> int:
+    """Cut an exported 3DE track file down to the solve-ready set. Returns the new count.
+
+    Runs the SAME score -> gate -> spread -> cap selection the TAPNext path uses, via
+    app/track_filter.py. It lives here rather than in syntheyes_engine because it is
+    pipeline policy, not SynthEyes driving, and because it applies to any backend that
+    hands back a finished 3DE file.
+
+    Best-effort: on any failure the file is left exactly as SynthEyes wrote it and the
+    original count is returned. Losing the filter is an inconvenience; losing the tracks
+    after a long SynthEyes run is not acceptable.
+    """
+    try:
+        from app.track_filter import FilterConfig, filter_tracks
+        from app.export_3de import write_tracks_txt
+    except Exception as e:
+        logger(f"  track filter unavailable ({e}); exporting unfiltered")
+        return fallback
+    try:
+        end_frame, tracks = _parse_tracks_txt(txt_path)
+        if not tracks:
+            return fallback
+        T = int(n_frames or end_frame or 0) or max(
+            (p[0] for pts in tracks.values() for p in pts), default=1)
+        cfg = FilterConfig.from_state(state)
+        kept = filter_tracks(tracks, T, int(width), int(height), cfg, log=logger)
+        if not kept:
+            logger("  track filter kept nothing; leaving the export untouched")
+            return fallback
+        if len(kept) >= len(tracks):
+            return len(kept)
+        write_tracks_txt(txt_path, kept, end_frame=int(end_frame or T))
+        logger(f"  track filter: {len(tracks)} -> {len(kept)} solve-ready track(s)")
+        return len(kept)
+    except Exception as e:
+        logger(f"  track filter failed ({e}); exporting unfiltered")
+        return fallback
+
+
 def compute_track_metrics(tracks_txt_path: str, width: int = 0, height: int = 0) -> Tuple[str, str]:
     end_frame, tracks = _parse_tracks_txt(tracks_txt_path)
     if not tracks: return "No tracks", "No tracks (file missing or empty)."
@@ -2312,6 +2352,14 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                     # shot used to report success AND publish an empty .txt over a previously
                     # good one; now it is a failure and goes to the TAPNext retry pass.
                     if n_trk > 0:
+                        # Same solve-ready selection the TAPNext path runs. Without it
+                        # SynthEyes exported everything it tracked (800 on the 'Normal'
+                        # preset) and the cleanup landed on the artist -- and since
+                        # SynthEyes is the DEFAULT backend, that was the common case.
+                        n_trk = _filter_exported_tracks(
+                            os.path.join(str(out_root), out_base), state,
+                            width=int(img_w or 0), height=int(img_h or 0),
+                            n_frames=int(frame_count or 0), fallback=n_trk)
                         any_ran = True
                         logger(f"  DONE: {shot_name}/{task_id} — {n_trk} trackers")
                     else:
