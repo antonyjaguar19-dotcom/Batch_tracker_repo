@@ -25,6 +25,7 @@ trimming/gating afterwards.
 """
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,7 +40,15 @@ _TILE = 256  # native crop == TAPNext input size -> zero downscale of the tile c
 
 
 def _tile_origin(cx: float, cy: float, W: int, H: int) -> Tuple[int, int]:
-    """Top-left of a _TILE crop centred on (cx,cy), clamped inside the frame."""
+    """Top-left of a _TILE crop centred on (cx,cy), clamped inside the frame.
+
+    NOTE: the point's sub-pixel phase within the tile necessarily wraps once per pixel of
+    motion, because the crop is taken on the integer grid. Rounding vs flooring only moves
+    WHERE that wrap falls, not whether it happens, so neither is better -- holding the phase
+    genuinely constant would mean resampling the crop, which destroys the native pixels this
+    stage exists to give the model. The per-window artifact is fixed at the seam instead
+    (see the overlap blending in _retrack_one).
+    """
     ox = int(round(cx - _TILE / 2.0))
     oy = int(round(cy - _TILE / 2.0))
     ox = max(0, min(ox, W - _TILE))
@@ -49,11 +58,18 @@ def _tile_origin(cx: float, cy: float, W: int, H: int) -> Tuple[int, int]:
 
 def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSource,
                  engine, W: int, H: int, win: int, edge_margin: int,
-                 edge_track: bool = True) -> Dict[int, Tuple[float, float]]:
+                 edge_track: bool = True, overlap: int = 4) -> Dict[int, Tuple[float, float]]:
     """Re-track one coarse path with a native tile that follows it. Returns {frame:(x,y)}.
 
     The coarse path (xs,ys) only PLACES the tile per window; the tile's own TAPNext run
     decides the refined sub-pixel position. Frames the tile cannot reach keep coarse.
+
+    Windows OVERLAP by `overlap` frames and their estimates are cross-faded across the
+    overlap. Previously each window butt-jointed onto the last (`i0 = last_ok`) and was a
+    fresh model call seeded from the previous window's drifted end, so every seam put a
+    small STEP into the path -- repeating each window, which is exactly the regular beat
+    seen in centre-2D. A blended seam cannot step, and a beat made of steps goes with them.
+    overlap=0 restores the old butt-joint behaviour.
     """
     n = len(frs)
     out: Dict[int, Tuple[float, float]] = {int(frs[k]): (float(xs[k]), float(ys[k])) for k in range(n)}
@@ -61,6 +77,14 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
         return out
     half = _TILE / 2.0
     reach = half - edge_margin
+    # Accumulate weighted estimates so an overlapped frame is a mix of both windows rather
+    # than whichever wrote last.
+    acc: Dict[int, Tuple[float, float, float]] = {}   # frame -> (sum_wx, sum_wy, sum_w)
+
+    def _add(frame: int, x: float, y: float, w: float):
+        sx, sy, sw = acc.get(frame, (0.0, 0.0, 0.0))
+        acc[frame] = (sx + x * w, sy + y * w, sw + w)
+
     cx, cy = float(xs[0]), float(ys[0])
     i0 = 0
     while i0 < n - 1:
@@ -84,11 +108,16 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
             continue
         crop = np.ascontiguousarray(win_bgr[:L, oy:oy + _TILE, ox:ox + _TILE])
         q = np.zeros((1, 1, 3), np.float32)
-        q[0, 0] = (0.0, cx - ox, cy - oy)   # query at current pos, tile-local, local frame 0
+        # Seed from the SMOOTH coarse guide, not the previous window's drifted end. Handing
+        # the end position forward made every seam inherit the last one's error instead of
+        # correcting it, which is what let the per-window step accumulate into a visible beat.
+        sx0, sy0 = float(xs[i0]), float(ys[i0])
+        q[0, 0] = (0.0, sx0 - ox, sy0 - oy)   # query at the guide, tile-local, local frame 0
         tr, vs = engine.track_queries(crop, q)   # tr (L,1,2) [x,y] in tile space, vs (L,1)
         tr = tr[:, 0, :]
         vs = vs[:, 0]
         last_ok = i0
+        got: List[Tuple[int, float, float, int]] = []   # (frame, x, y, k) for this window
         for k in range(1, tr.shape[0]):
             if not vs[k]:
                 break
@@ -104,15 +133,35 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
                 if hit_unclamped or not edge_track:
                     break
             gx = ox + float(tr[k, 0]); gy = oy + float(tr[k, 1])
-            out[int(frs[i0 + k])] = (gx, gy)
+            got.append((int(frs[i0 + k]), gx, gy, k))
             cx, cy = gx, gy
             last_ok = i0 + k
+
+        # Weight this window with a symmetric taper, applied only now that its real length
+        # is known. Ramping in but not OUT still leaves a discontinuity where the window
+        # stops -- the seam step just moves rather than disappearing. Fading both ends means
+        # neighbouring windows sum smoothly across the overlap.
+        if got:
+            kmax = got[-1][3]
+            for (frame, gx, gy, k) in got:
+                if overlap > 0:
+                    w = min(1.0, k / float(overlap + 1), (kmax - k + 1) / float(overlap + 1))
+                else:
+                    w = 1.0
+                _add(frame, gx, gy, max(w, 1e-3))
         if last_ok <= i0:            # no progress this window -> step forward on the coarse path
             i0 += 1
             if i0 < n:
                 cx, cy = float(xs[i0]), float(ys[i0])
         else:
-            i0 = last_ok
+            # Step back by `overlap` so the next window RE-TRACKS the tail of this one and
+            # the two estimates can be blended there. Always advance at least one frame.
+            nxt = last_ok - overlap if overlap > 0 else last_ok
+            i0 = max(i0 + 1, min(nxt, last_ok))
+
+    for frame, (sx, sy, sw) in acc.items():
+        if sw > 0.0:
+            out[frame] = (sx / sw, sy / sw)
     return out
 
 
@@ -136,6 +185,7 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         return final_tracks, f"plate {W0}x{H0} < tile {_TILE}; skipped"
 
     win = int(getattr(cfg, "mt_window", 16) or 16)
+    overlap = max(0, min(int(getattr(cfg, "mt_overlap", 4) or 0), max(0, win - 2)))
     edge_margin = int(getattr(cfg, "mt_edge_margin", 40) or 40)
     edge_track = bool(getattr(cfg, "mt_edge_track", True))
     flip = bool(getattr(cfg, "flip_y_for_3de", True)) and H0 > 0
@@ -160,7 +210,7 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
 
     if status:
         status(f"Moving-tile: {len(final_tracks)} tracks, tile {_TILE}px win={win} "
-               f"({'streamed' if stream else 'full-decode'} {W0}x{H0})")
+               f"overlap={overlap} ({'streamed' if stream else 'full-decode'} {W0}x{H0})")
 
     out: Dict[str, Track] = {}
     moved = 0
@@ -169,7 +219,8 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         frs = np.array([int(p[0]) for p in pts], dtype=int)
         xs = np.array([float(p[1]) for p in pts], dtype=float)
         ys = np.array([(float(H0 - 1) - float(p[2])) if flip else float(p[2]) for p in pts], dtype=float)
-        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, win, edge_margin, edge_track)
+        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, win, edge_margin, edge_track,
+                               overlap=overlap)
         new_tr: Track = []
         any_moved = False
         for k in range(len(frs)):
