@@ -190,6 +190,11 @@ class RunnerConfig:
     # rot/scale DoF only adds wobble on pan/translation-dominant plates (measured regression).
     # Set to "affine"/"euclidean" for shots with real camera roll or zoom.
     refine_motion: str = "translation"   # translation | euclidean | affine
+    # Sub-pixel polish. _ecc_refine is proper iterative estimation against the real pixels,
+    # but it only ever ran when refine_motion was NOT translation -- and translation is the
+    # default, so the exported position was always a 3-sample curve fit. Running it in
+    # translation mode too is what stops a track wobbling on a feature that never moved.
+    refine_ecc_polish: bool = True
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
 
     # --- Re-acquisition after an occlusion --------------------------------------------

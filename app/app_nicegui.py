@@ -1404,6 +1404,18 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 flt_jitter.tooltip("Drops a track whose mean frame-to-frame jitter (change in velocity) exceeds "
                                    "this many plate pixels. Self-consistency only, so a fast SMOOTH point passes. 0 = off. Try ~3.")
 
+                sw_ecc = ui.switch("Sub-pixel polish (ECC)", value=getattr(state, "refine_ecc_polish", True),
+                                   on_change=lambda e: setattr(state, "refine_ecc_polish", bool(e.value)))
+                sw_ecc.tooltip("Finishes each point by fitting it against the actual pixels instead of estimating "
+                               "from three correlation samples. This is what stops a track wobbling in place on a "
+                               "feature that never moved — check it in 3DE's centre-2D view zoomed in. Slightly "
+                               "slower per point.")
+                sw_png = ui.switch("Lossless tracking proxies (PNG)", value=getattr(state, "lossless_track_proxies", True),
+                                   on_change=lambda e: setattr(state, "lossless_track_proxies", bool(e.value)))
+                sw_png.tooltip("Tracks EXR plates via PNG instead of JPEG proxies. JPEG artefacts sit on a fixed "
+                               "8x8 block grid and do not move with the image, so they read as sub-pixel jitter. "
+                               "Costs several times the proxy disk in the shot cache and a slower first pass; "
+                               "analysis and masking keep JPEG either way.")
                 sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
                                        on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
                 sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
