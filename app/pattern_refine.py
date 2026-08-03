@@ -179,6 +179,42 @@ def _adaptive_search(pts: Track, cfg) -> int:
     return int(max(base, min(smax, round(base + k * speed))))
 
 
+def _peak_flatness(resp: np.ndarray, maxloc: Tuple[int, int], maxv: float) -> float:
+    """How BROAD the correlation peak is: mean of the 8 neighbours / peak. In [0,1].
+
+    This is the quantity that separates a trackable feature from an untrackable one, and
+    nothing in the pipeline measured it. A sharp corner's response falls away steeply, so the
+    ratio is small; a defocused blob correlates almost as well one pixel over, so the ratio
+    approaches 1 and the position is barely constrained at all -- which is precisely why such
+    a point wobbles however good the sub-pixel maths is.
+
+    It is a RATIO, so it is invariant to overall contrast: a faint but sharp feature is not
+    punished for being faint, only for being soft.
+    """
+    my, mx = maxloc[1], maxloc[0]
+    h, w = resp.shape[:2]
+    if maxv <= 1e-6:
+        return 1.0
+    # Sample a ring several pixels out, NOT the immediate neighbours. Normalised correlation
+    # is smooth, so even a crisp feature still scores ~0.9 one pixel from its peak -- judging
+    # by adjacent samples squeezes every track into a narrow band and discriminates poorly.
+    # Over a few pixels a sharp peak has fallen away substantially while a defocused blob has
+    # barely moved, which is the whole distinction.
+    r = max(2, min(5, (min(h, w) - 1) // 2))
+    if r < 2 or not (r <= mx < w - r and r <= my < h - r):
+        return 1.0                       # no room for the ring -> assume the worst
+    ring_vals = []
+    for dy in (-r, 0, r):
+        for dx in (-r, 0, r):
+            if dx == 0 and dy == 0:
+                continue
+            ring_vals.append(float(resp[my + dy, mx + dx]))
+    centre = float(resp[my, mx])
+    if centre <= 1e-6 or not ring_vals:
+        return 1.0
+    return float(max(0.0, min(1.0, float(np.mean(ring_vals)) / centre)))
+
+
 def _peak_is_ambiguous(resp: np.ndarray, maxloc: Tuple[int, int], maxv: float,
                        ratio: float, half: int) -> bool:
     """True when a rival peak is nearly as strong as the winner, somewhere else in the box.
@@ -245,7 +281,21 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
     dx, dy = _subpix_peak(resp, maxloc)
     px = x0 + maxloc[0] + dx + half
     py = y0 + maxloc[1] + dy + half
+    # How well this frame pins the point down, stashed for the caller. Kept off the return
+    # tuple so every existing `x, y, cc = res` unpack keeps working.
+    _LAST_FLATNESS["v"] = _peak_flatness(resp, maxloc, float(maxv))
     return (float(px), float(py), float(maxv))
+
+
+# Peak flatness of the most recent _ncc_match. A module-level stash rather than a wider
+# return tuple, so the ~10 existing call sites are untouched; read it immediately after a
+# successful match. Single-threaded per refine call, which is how refine_tracks runs.
+_LAST_FLATNESS: Dict[str, float] = {"v": 1.0}
+
+# Median localisation certainty of the segment _refine_segment last returned, in [0,1].
+# Same stash-not-signature approach as _LAST_FLATNESS: _refine_segment's (points, reason)
+# contract is consumed in several places and is not worth widening for a diagnostic.
+_CERTAINTY: Dict[str, float] = {"v": 0.0}
 
 
 def _ecc_refine(gray: np.ndarray, patch: np.ndarray, px: float, py: float,
@@ -387,6 +437,8 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     drift_floor = float(getattr(cfg, "refine_drift_floor", 0.0) or 0.0)
     drift_every = int(getattr(cfg, "refine_drift_check_every", 0) or 0)
     anchor = best_patch.copy()          # NEVER replaced: the drift guard's ground truth
+    # Per-frame localisation certainty, reduced to one number for the caller (see _CERTAINTY).
+    certs: List[float] = []
 
     # 2. refine outward both directions from the anchor
     for direction in (1, -1):
@@ -445,6 +497,16 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                 continue
             gap = 0
             x, y, cc = res
+            # Localisation certainty for this frame: how sharply the correlation peak falls
+            # away. This is the ONLY signal that separates a defocused point from a good one
+            # -- its motion statistics (long, smooth, no jumps) look excellent, which is why
+            # the quality score rates it highly.
+            #
+            # Deliberately NOT scaled by the patch's own structure: that test would have to
+            # be relative to the track's own anchor, and a uniformly soft track passes its
+            # own floor, so it discriminates nothing. The threshold is instead set per shot
+            # from the spread of certainties actually measured (see track_filter).
+            certs.append(1.0 - float(_LAST_FLATNESS.get("v", 1.0)))
             if motion != cv2.MOTION_TRANSLATION:
                 er = _ecc_refine(g, patch, x, y, half, motion)
                 if er is not None and er[2] >= lost:
@@ -498,6 +560,7 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                     break                       # drifted off the feature -> stop this side
             i += direction
 
+    _CERTAINTY["v"] = float(np.median(certs)) if certs else 0.0
     return [refined[k] for k in sorted(refined.keys())], "ok"
 
 
@@ -713,6 +776,7 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
 
     pieces: List[Track] = []
     combined: Track = []
+    seg_certs: List[float] = []  # localisation certainty of each refined segment
     prev_tail_patch = None       # patch at the end of the last accepted segment
     for seg in segments:
         if len(seg) >= 2:
@@ -722,6 +786,8 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
         if reason == "edge":
             continue          # 1-D feature: drop these points; keeping them RAW would be
                               # both jittery (coarse 256px position) and still sliding.
+        if reason == "ok":
+            seg_certs.append(float(_CERTAINTY.get("v", 0.0)))
         use = ref if (ref is not None and len(ref) >= min_len) else seg
         if ref is not None:
             use = _fb_filter(use, get, cfg, edge_clamp)
@@ -745,6 +811,9 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
 
     if combined:
         pieces.append(combined)
+    # Track-level certainty = the weakest refined segment, so one badly-localised stretch is
+    # not averaged away by good ones.
+    _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else 0.0
     return [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
 
 
@@ -815,9 +884,11 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     predict = build_neighbour_predictor({k: to_img(v) for k, v in final_tracks.items()}, cfg)
 
     out: Dict[str, Track] = {}
+    certainty: Dict[str, float] = {}
     trimmed = dropped = split = gapped = 0
     for name, tr in final_tracks.items():
         pieces = _refine_one_multi(to_img(tr), prov.get, cfg, predict)
+        cert = float(_CERTAINTY.get("v", 0.0))
         if not pieces:
             dropped += 1
             continue
@@ -833,7 +904,9 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
                 gapped += 1
             # Only a piece that failed verification gets a new id; the first keeps the
             # original name so downstream naming is unchanged for the common case.
-            out[name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"] = to_out(piece)
+            tid = name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"
+            out[tid] = to_out(piece)
+            certainty[tid] = cert
 
     # Wobble report: amplitude says how bad, period says WHERE it comes from. A period
     # clustering near mt_window points at the moving-tile seams; no dominant period means a
@@ -864,4 +937,9 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     fb = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
     if fb > 0.0:
         bits.append(f"(fwd-bwd<={fb:.1f}px)")
+    if certainty:
+        bits.append(f"certainty med={float(np.median(list(certainty.values()))):.2f}")
+    # Hand the per-track certainty to the caller for selection. Stashed on the function so
+    # the (tracks, info) return contract used by tracker_core is unchanged.
+    refine_tracks.last_certainty = certainty
     return out, " ".join(bits)

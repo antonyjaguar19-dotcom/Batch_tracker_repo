@@ -1139,6 +1139,11 @@ class AppState:
     refine_ecc_polish: bool = True      # gradient sub-pixel polish after the NCC peak
     mt_overlap: int = 4                 # blend moving-tile window seams (0 = old butt-joint)
     refine_ncc_reref: float = 0.68      # how hard the point locks to its seeded pattern
+    # Per-shot auto-tune. A batch tool cannot be hand-tuned per shot, so the bot measures each
+    # plate (sharpness, grain, texture, motion) and derives the settings below from it.
+    # Anything the user explicitly moves is recorded in auto_tune_overrides and always wins.
+    auto_tune: bool = True
+    auto_tune_overrides: Dict[str, object] = field(default_factory=dict)
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
@@ -2180,6 +2185,11 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 refine_ecc_polish=bool(getattr(state, "refine_ecc_polish", True)),
                 mt_overlap=int(getattr(state, "mt_overlap", 4) or 0),
                 refine_ncc_reref=float(getattr(state, "refine_ncc_reref", 0.68) or 0.68),
+                # Auto-tune reads the plate; Qwen's quality_flags (already computed by
+                # Analyze, and previously used for nothing but a table cell) cross-check it.
+                auto_tune=bool(getattr(state, "auto_tune", True)),
+                auto_tune_overrides=dict(getattr(state, "auto_tune_overrides", {}) or {}),
+                quality_flags=list(getattr(data, "quality_flags", []) or []),
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.
                 occlusion_continuity=bool(getattr(state, "occlusion_continuity", True)),
