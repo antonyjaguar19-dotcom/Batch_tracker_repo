@@ -16,6 +16,7 @@ import torch # Need torch for empty_cache
 from app.video_io import read_video_frames_bgr_scaled, FrameSource, estimate_clip_bytes
 from app.tapnext_engine import TapNextEngine
 from app.export_3de import write_tracks_txt
+from app import track_filter as _tf
 
 StatusCB = Optional[Callable[[str], None]]
 
@@ -102,7 +103,20 @@ class RunnerConfig:
     # clears the spacing test in more places. spread_min_dist_px is the only density dial.
     enable_spread_select: bool = True
     spread_min_dist_px: int = 40   # min px spacing between kept tracks (density dial)
-    max_output_tracks: int = 0     # soft cap; 0 = unlimited
+    # Export a solve-ready set, not everything that survived. A 3DE camera solve wants on the
+    # order of 100 long, clean, well-spread points -- handing over 1000+ just moves the work
+    # to the artist. Best-scoring first, so the cap keeps the good ones.
+    max_output_tracks: int = 120   # 0 = unlimited (the old behaviour)
+
+    # --- Final quality gate ------------------------------------------------------------
+    # _track_quality_score only RANKED tracks; nothing ever dropped a weak one, so a short or
+    # scrappy track still shipped if there was room. These are absolute floors applied before
+    # spread selection. All are scaled down on short shots and relaxed if they would empty
+    # the export -- returning nothing is worse than returning too much.
+    min_track_frames: int = 24        # visible frames a track must have; 0 = off
+    min_track_span_frac: float = 0.0  # or a fraction of the shot length; 0 = off
+    min_track_score: float = 0.35     # quality floor in [0,1]; 0 = off
+    quality_gate_floor: int = 8       # never gate below this many surviving tracks
     # Spacing is measured ON SCREEN at this many evenly-spaced reference frames, not on each
     # track's lifetime MEAN position. With a moving camera two tracks can sit a few px apart
     # for most of the shot while their means are 40px+ apart -- the mean test passed both and
@@ -944,6 +958,8 @@ class BatchTrackerRunner:
                 else:
                     diag_short += 1
 
+        candidates = self._apply_quality_gate(candidates, T)
+
         if self.cfg.enable_spread_select and candidates:
             # Spacing is measured in the same space the candidate coords are in: the full
             # plate (out_w when the tracked file was a downscaled proxy, else W0).
@@ -954,6 +970,56 @@ class BatchTrackerRunner:
         total_kept = len(final_tracks_out)
 
         return final_tracks_out, total_kept, total_candidates, diag_after_filter, diag_after_gate, diag_short
+
+    def _apply_quality_gate(self, candidates: List[dict], T: int) -> List[dict]:
+        """Drop tracks that are not worth an artist's time, before spread selection.
+
+        Scoring alone only ORDERED the candidates -- a short, scrappy track still shipped if
+        there was room, which is how an export reaches four figures and the cleanup lands on
+        the artist. These are absolute floors: too short to constrain a solve, or too poor to
+        trust.
+
+        Two safeguards, because an over-eager gate is worse than a permissive one:
+          * the length requirement scales down on short shots (a 30-frame plate cannot
+            produce 24-frame tracks in quantity);
+          * if the gate would leave fewer than `quality_gate_floor` tracks it is relaxed and
+            the best survivors are kept instead, so a hard shot still exports something.
+        """
+        if not candidates:
+            return candidates
+        need_f = int(getattr(self.cfg, "min_track_frames", 0) or 0)
+        frac = float(getattr(self.cfg, "min_track_span_frac", 0.0) or 0.0)
+        if frac > 0.0:
+            need_f = max(need_f, int(round(frac * max(1, T))))
+        # Never demand more than a quarter of the shot: on a short plate that would gate
+        # everything away for a reason the artist cannot act on.
+        if need_f > 0:
+            need_f = max(4, min(need_f, int(0.25 * max(1, T)) or 4))
+        need_s = float(getattr(self.cfg, "min_track_score", 0.0) or 0.0)
+        if need_f <= 0 and need_s <= 0.0:
+            return candidates
+
+        kept, short, weak = [], 0, 0
+        for c in candidates:
+            if need_f > 0 and len(c["pts"]) < need_f:
+                short += 1
+                continue
+            if need_s > 0.0 and float(c["score"]) < need_s:
+                weak += 1
+                continue
+            kept.append(c)
+
+        floor = max(1, int(getattr(self.cfg, "quality_gate_floor", 8) or 1))
+        if len(kept) < floor and len(candidates) > len(kept):
+            kept = sorted(candidates, key=lambda c: c["score"], reverse=True)[:floor]
+            self._status(f"  quality gate: only {len(kept)} track(s) cleared it -> relaxed, "
+                         f"keeping the best {len(kept)} instead (short/poor shot)")
+            return kept
+        if short or weak:
+            self._status(f"  quality gate: dropped {short} too-short (<{need_f}f) and "
+                         f"{weak} low-quality (<{need_s:.2f}) of {len(candidates)} -> "
+                         f"{len(kept)} worth exporting")
+        return kept
 
     def _bad_track(self, pts: List[Tuple[int, float, float]]) -> bool:
         """True if a track is too jittery or jumpy (plate px), per the user thresholds.
@@ -980,155 +1046,23 @@ class BatchTrackerRunner:
             return True
         return False
 
+    # --- Track selection ---------------------------------------------------------
+    # The implementation lives in app/track_filter.py (pure Python, no torch) so the
+    # SynthEyes backend can share it. These stay as thin delegates: one implementation
+    # means the two backends cannot drift apart.
+
     def _track_quality_score(self, pts: List[Tuple[int, float, float]], T: int, diag: float) -> float:
-        """Per-track quality in ~[0,1] from the track's OWN trajectory only.
+        return _tf.score_track(pts, T, diag, self.cfg)
 
-        PARALLAX-SAFE: no term compares the track against global/median motion, so a fast
-        foreground (high-parallax) point is not penalised for moving unlike the background.
-        Mistracks are caught by self-consistency (jitter/jump on the track's own path).
-        Terms: coverage (long, gapless), smoothness (low own jitter), stability (no jumps).
-        """
-        n = len(pts)
-        if n < 2:
-            return 0.0
-        frames = [p[0] for p in pts]
-        span = max(1, frames[-1] - frames[0] + 1)
-        cov = float(n) / float(max(1, T))       # fraction of shot the track is alive
-        fill = float(n) / float(span)           # 1.0 = no internal gaps
-        cov_score = 0.5 * min(1.0, cov) + 0.5 * fill
-
-        vels = []
-        for i in range(n - 1):
-            dt = max(1, pts[i + 1][0] - pts[i][0])
-            d = math.hypot(pts[i + 1][1] - pts[i][1], pts[i + 1][2] - pts[i][2])
-            vels.append(d / dt)
-        max_jump = max(vels) if vels else 0.0
-        if len(vels) > 1:
-            jitter = sum(abs(vels[k + 1] - vels[k]) for k in range(len(vels) - 1)) / (len(vels) - 1)
-        else:
-            jitter = 0.0
-        d = float(diag) if diag > 0 else 1.0
-        smooth_score = 1.0 / (1.0 + jitter / (0.005 * d))   # scale: 0.5% of frame diagonal
-        stab_score = 1.0 / (1.0 + max_jump / (0.020 * d))   # scale: 2% of frame diagonal
-
-        w_c, w_s, w_j = self.cfg.w_coverage, self.cfg.w_smoothness, self.cfg.w_stability
-        wsum = (w_c + w_s + w_j) or 1.0
-        return (w_c * cov_score + w_s * smooth_score + w_j * stab_score) / wsum
+    def _apply_quality_gate(self, candidates: List[dict], T: int) -> List[dict]:
+        return _tf.quality_gate(candidates, T, self.cfg, log=self._status)
 
     def _spacing_px(self, out_width: int = 0) -> int:
-        """Effective min spacing in PLATE pixels.
-
-        The slider is quoted against spread_ref_width (1920). Candidate coords are in full
-        plate space, so on a 4K plate a raw 40px gap is only ~1% of the width -- dense enough
-        to still read as clumped -- and worse on 6K/8K. Scaling by plate width keeps one
-        slider value looking the same at any resolution.
-        """
-        d = max(1, int(self.cfg.spread_min_dist_px))
-        if not bool(getattr(self.cfg, "spread_scale_with_res", True)):
-            return d
-        ref = max(1, int(getattr(self.cfg, "spread_ref_width", 1920) or 1920))
-        w = int(out_width or 0)
-        if w <= 0:
-            return d
-        return max(1, int(round(d * (w / float(ref)))))
+        return _tf.spacing_px(self.cfg, out_width)
 
     def _select_spread(self, candidates: List[dict],
                        out_width: int = 0) -> Dict[str, List[Tuple[int, float, float]]]:
-        """Greedy min-spacing selection over score-sorted candidates.
-
-        Walk best-first; accept a track only if it stays >= spread_min_dist_px from every
-        already-accepted track AT EVERY SAMPLED REFERENCE FRAME where both are visible.
-
-        Spacing used to be measured between the two tracks' LIFETIME MEAN positions, which is
-        not what the artist sees: with a moving camera two tracks can sit a few px apart for
-        most of the shot while their means are 40px+ apart, so both were accepted and they
-        clumped on screen. Sampling real positions fixes that; the dial keeps its meaning.
-
-        Because spacing (default 40px) >> any pass duplicate offset, near-identical duplicates
-        are still rejected implicitly -- this doubles as the pass dedup. One coarse cell grid
-        PER reference frame keeps each spacing test O(neighbours).
-        """
-        d = self._spacing_px(out_width)
-        d2 = float(d * d)
-        cap = int(self.cfg.max_output_tracks or 0)
-        out: Dict[str, List[Tuple[int, float, float]]] = {}
-        if d != int(self.cfg.spread_min_dist_px):
-            self._status(f"  spread: {self.cfg.spread_min_dist_px}px @{self.cfg.spread_ref_width} "
-                         f"-> {d}px at this plate width ({out_width})")
-
-        # Reference frames: evenly spaced over the frame range the candidates actually span.
-        k = max(1, int(getattr(self.cfg, "spread_ref_frames", 5) or 1))
-        f_lo = min(c["pts"][0][0] for c in candidates)
-        f_hi = max(c["pts"][-1][0] for c in candidates)
-        if k == 1 or f_hi <= f_lo:
-            ref_frames = [f_lo]
-        else:
-            step = (f_hi - f_lo) / float(k - 1)
-            ref_frames = sorted({int(round(f_lo + i * step)) for i in range(k)})
-
-        # Per-candidate position at each reference frame. A track need not be visible at one:
-        # it simply doesn't compete there. Nearest-sample within half a step keeps a track
-        # that is alive around the reference frame but has a gap exactly on it.
-        tol = max(1, int((f_hi - f_lo) / (2.0 * max(1, len(ref_frames) - 1)))) if f_hi > f_lo else 1
-
-        def positions_at_refs(pts):
-            by_frame = {f: (x, y) for f, x, y in pts}
-            got = {}
-            for rf in ref_frames:
-                if rf in by_frame:
-                    got[rf] = by_frame[rf]
-                    continue
-                near = min(by_frame, key=lambda f: abs(f - rf))
-                if abs(near - rf) <= tol:
-                    got[rf] = by_frame[near]
-            return got
-
-        grids: Dict[int, Dict[Tuple[int, int], List[Tuple[float, float]]]] = {rf: {} for rf in ref_frames}
-        mean_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
-        # Temporal spacing: how many accepted tracks already START in each short window.
-        start_cap = int(getattr(self.cfg, "spread_max_starts_per_window", 0) or 0)
-        start_win = max(1, int(getattr(self.cfg, "spread_start_window", 8) or 8))
-        starts: Dict[int, int] = {}
-        n_start_pruned = 0
-
-        def clashes(grid, px, py):
-            cx, cy = int(px // d), int(py // d)
-            for gx in (cx - 1, cx, cx + 1):
-                for gy in (cy - 1, cy, cy + 1):
-                    for (ax, ay) in grid.get((gx, gy), ()):
-                        if (ax - px) ** 2 + (ay - py) ** 2 < d2:
-                            return True
-            return False
-
-        for c in sorted(candidates, key=lambda c: c["score"], reverse=True):
-            # Best-first, so a full start-window keeps the strongest tracks that began there
-            # and turns the rest away -- thinning a burst rather than banning one outright.
-            sbin = int(c["pts"][0][0]) // start_win if start_cap > 0 else None
-            if sbin is not None and starts.get(sbin, 0) >= start_cap:
-                n_start_pruned += 1
-                continue
-            at = positions_at_refs(c["pts"])
-            mx, my = c["mean"]
-            if not at:
-                # Short track falling between every sample: fall back to the mean test rather
-                # than waving it through unchecked.
-                if clashes(mean_grid, mx, my):
-                    continue
-            elif any(clashes(grids[rf], px, py) for rf, (px, py) in at.items()):
-                continue
-
-            out[c["id"]] = c["pts"]
-            for rf, (px, py) in at.items():
-                grids[rf].setdefault((int(px // d), int(py // d)), []).append((px, py))
-            mean_grid.setdefault((int(mx // d), int(my // d)), []).append((mx, my))
-            if sbin is not None:
-                starts[sbin] = starts.get(sbin, 0) + 1
-            if cap > 0 and len(out) >= cap:
-                break
-        if n_start_pruned:
-            self._status(f"  spread: thinned {n_start_pruned} track(s) that started in an "
-                         f"already-crowded {start_win}-frame window")
-        return out
+        return _tf.select_spread(candidates, self.cfg, out_width=out_width, log=self._status)
 
     # -------------------------------------------------------------------------
     # VRAM/RAM-safe chunked tracking
