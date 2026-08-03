@@ -41,11 +41,22 @@ _MOTION = {
 
 
 def _extract(gray: np.ndarray, x: float, y: float, half: int) -> Optional[np.ndarray]:
-    """Integer-centred patch of size (2*half+1); None if it would fall off frame."""
+    """Patch of size (2*half+1) centred at the SUB-PIXEL position; None if off frame.
+
+    This used to slice the array at int(round(x)), so the reference pattern was quantised to
+    whole pixels and could not represent where the feature actually sat -- re-quantised on
+    every re-reference, which is a floor on how still a track can possibly be. Sampling with
+    getRectSubPix (what _ecc_refine below already does, and what 3DE and SynthEyes do) costs
+    a slight bilinear softening and buys the sub-pixel truth.
+    """
     xi, yi = int(round(x)), int(round(y))
     if xi - half < 0 or yi - half < 0 or xi + half + 1 > gray.shape[1] or yi + half + 1 > gray.shape[0]:
         return None
-    return gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
+    P = 2 * half + 1
+    try:
+        return cv2.getRectSubPix(gray, (P, P), (float(x), float(y)))
+    except cv2.error:
+        return gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
 
 
 def _structure_eigs(patch: np.ndarray) -> Tuple[float, float]:
@@ -94,18 +105,47 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
-    """Quadratic sub-pixel offset of the NCC response peak at integer `loc`."""
+    """Sub-pixel offset of the correlation peak at integer `loc`.
+
+    Two upgrades over the separable parabola this replaces, both aimed at PIXEL-LOCKING --
+    the tendency of a crude fit to pull estimates toward whole pixels, which is what shows
+    up as a track wobbling in place while the feature never moved:
+
+      * a full 2-D quadratic over the 3x3 neighbourhood, so the cross term is used. Fitting
+        x and y independently discards it entirely, which is worst on a diagonal feature.
+      * where all nine samples are positive, the fit is done on the LOG of the response. A
+        normalised correlation peak is much closer to Gaussian than to parabolic, and the
+        log-parabola estimator is correspondingly less biased.
+
+    Falls back to the plain quadratic when any sample is <= 0 (TM_CCOEFF_NORMED can go
+    negative), and to the separable fit when the Hessian is singular.
+    """
     mx, my = loc
     h, w = resp.shape
-    dx = dy = 0.0
-    if 0 < mx < w - 1:
-        l, c, r = float(resp[my, mx - 1]), float(resp[my, mx]), float(resp[my, mx + 1])
-        d = l - 2 * c + r
-        if abs(d) > 1e-9: dx = 0.5 * (l - r) / d
-    if 0 < my < h - 1:
-        u, c, d0 = float(resp[my - 1, mx]), float(resp[my, mx]), float(resp[my + 1, mx])
-        d = u - 2 * c + d0
-        if abs(d) > 1e-9: dy = 0.5 * (u - d0) / d
+    if not (0 < mx < w - 1 and 0 < my < h - 1):
+        return (0.0, 0.0)          # peak on the window border: no neighbourhood to fit
+    r = resp[my - 1:my + 2, mx - 1:mx + 2].astype(np.float64)
+
+    if float(r.min()) > 0.0:
+        r = np.log(r)              # Gaussian peak -> parabolic in log space
+
+    fx = (r[1, 2] - r[1, 0]) * 0.5
+    fy = (r[2, 1] - r[0, 1]) * 0.5
+    fxx = r[1, 2] - 2.0 * r[1, 1] + r[1, 0]
+    fyy = r[2, 1] - 2.0 * r[1, 1] + r[0, 1]
+    fxy = (r[2, 2] - r[2, 0] - r[0, 2] + r[0, 0]) * 0.25
+    det = fxx * fyy - fxy * fxy
+
+    if abs(det) > 1e-12:
+        dx = -(fyy * fx - fxy * fy) / det
+        dy = -(fxx * fy - fxy * fx) / det
+    else:
+        # Degenerate surface (a ridge, or a flat top): fall back to the separable fit.
+        dx = 0.5 * (r[1, 0] - r[1, 2]) / fxx if abs(fxx) > 1e-12 else 0.0
+        dy = 0.5 * (r[0, 1] - r[2, 1]) / fyy if abs(fyy) > 1e-12 else 0.0
+
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return (0.0, 0.0)
     return (max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)))
 
 
@@ -307,6 +347,13 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     # correlation hovering around one hard threshold can no longer drop the point for a
     # frame at a time while its pattern is plainly visible.
     hold = min(float(getattr(cfg, "refine_ncc_hold", lost) or lost), lost)
+    # ECC polish. _ecc_refine is proper iterative sub-pixel estimation against the real
+    # pixels, but it only ever ran when the motion model was NOT translation -- and
+    # translation is the default, so on normal settings the exported position was always a
+    # 3-sample curve fit. Running it in translation mode too replaces that with gradient
+    # descent. This does not revisit the affine->translation decision: that was about
+    # affine's extra rotation/scale freedom adding wobble; translation-only ECC has none.
+    ecc_polish = bool(getattr(cfg, "refine_ecc_polish", False))
 
     # 1. anchor = highest-contrast valid patch (within THIS segment -> re-acquires per segment)
     best_i, best_c, best_patch = -1, -1.0, None
@@ -353,7 +400,17 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             g = get(f - 1)
             if g is None:
                 break
-            res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig)
+            # ANCHOR LEADS. Match the ORIGINAL seeded pattern first and use the re-referenced
+            # patch only when the anchor cannot answer. Letting the re-referenced patch lead
+            # turned this into an incremental frame-to-frame tracker: each frame inherited the
+            # last frame's small error, so the point wandered smoothly around the very feature
+            # it seeded on. Matching the anchor every frame pins it to where it started.
+            res = _ncc_match(g, anchor, cx, cy, search, half, edge_clamp, ambig)
+            if res is None or res[2] < hold:
+                alt = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig) \
+                    if patch is not anchor else None
+                if alt is not None and (res is None or alt[2] > res[2]):
+                    res = alt
             if res is None or res[2] < hold:
                 # Lock lost. This used to end the track here, which is how points were lost
                 # to occluders SAM3 never masked (a pole, a prop, a hand). Treat it as a
@@ -392,6 +449,12 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                 er = _ecc_refine(g, patch, x, y, half, motion)
                 if er is not None and er[2] >= lost:
                     x, y, cc = er
+            elif ecc_polish:
+                # Only adopt it if the correlation did not get worse, so the polish can
+                # never turn a good NCC answer into a poorer one.
+                er = _ecc_refine(g, patch, x, y, half, cv2.MOTION_TRANSLATION)
+                if er is not None and er[2] >= cc:
+                    x, y, cc = er
             refined[i] = (f, float(x), float(y))
             last_good = refined[i]
 
@@ -407,6 +470,23 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                 np2 = _extract(g, x, y, half)
                 if np2 is not None:
                     if drift_floor <= 0.0 or _corr(np2, anchor) >= drift_floor:
+                        # Re-align the replacement to the anchor before adopting it. A patch
+                        # grabbed at a position that is off by d bakes d into the reference,
+                        # and every later frame inherits it -- the mechanism behind a track
+                        # smoothly wandering across its own feature. Locating the anchor
+                        # INSIDE the new patch and correcting by that offset makes adopting
+                        # it positionally neutral.
+                        rel = _ncc_match(np2, anchor, float(half), float(half),
+                                         max(2, half // 3), half, True, 1.0)
+                        if rel is not None:
+                            ddx, ddy = rel[0] - half, rel[1] - half
+                            if math.hypot(ddx, ddy) <= max(1.0, half / 3.0):
+                                x, y = x + ddx, y + ddy
+                                refined[i] = (f, float(x), float(y))
+                                last_good = refined[i]
+                                re2 = _extract(g, x, y, half)   # explicit: `ndarray or x`
+                                if re2 is not None:             # is ambiguous in numpy
+                                    np2 = re2
                         patch = np2
                     else:
                         patch = anchor.copy()   # snapped too far: fall back to the original
@@ -419,6 +499,43 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             i += direction
 
     return [refined[k] for k in sorted(refined.keys())], "ok"
+
+
+def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
+    """(amplitude_px, dominant_period_frames) of a track's deviation from its own smooth path.
+
+    Three rounds of "the tracks wobble" have been diagnosed by eye. The PERIOD is what names
+    the cause: a beat clustering at the moving-tile window length points at that stage's
+    seams, whereas a random walk has no dominant period at all. Detrending with a moving
+    average leaves the wobble; the strongest FFT bin names its beat.
+
+    Diagnostic only -- nothing is smoothed or filtered on the basis of it.
+    """
+    n = len(track)
+    if n < 8:
+        return (0.0, 0)
+    pts = sorted(track, key=lambda p: p[0])
+    xs = np.array([p[1] for p in pts], dtype=np.float64)
+    ys = np.array([p[2] for p in pts], dtype=np.float64)
+
+    k = max(3, min(9, (n // 4) | 1))          # odd moving-average window
+    ker = np.ones(k) / float(k)
+    rx = xs - np.convolve(xs, ker, mode="same")
+    ry = ys - np.convolve(ys, ker, mode="same")
+    edge = k // 2                              # convolve edges are unreliable -- drop them
+    if n - 2 * edge < 6:
+        return (0.0, 0)
+    rx, ry = rx[edge:n - edge], ry[edge:n - edge]
+
+    amp = float(np.hypot(rx.std(), ry.std()))
+    m = len(rx)
+    spec = np.abs(np.fft.rfft(rx)) + np.abs(np.fft.rfft(ry))
+    spec[0] = 0.0                              # ignore DC
+    bin_i = int(np.argmax(spec))
+    period = int(round(m / bin_i)) if bin_i > 0 else 0
+    if period > max_period:
+        period = 0                             # too slow to be a periodic artifact
+    return (amp, period)
 
 
 def build_neighbour_predictor(tracks: Dict[str, Track], cfg):
@@ -717,6 +834,24 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             # Only a piece that failed verification gets a new id; the first keeps the
             # original name so downstream naming is unchanged for the common case.
             out[name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"] = to_out(piece)
+
+    # Wobble report: amplitude says how bad, period says WHERE it comes from. A period
+    # clustering near mt_window points at the moving-tile seams; no dominant period means a
+    # random walk instead. Diagnostic only.
+    if out:
+        meas = [measure_wobble(t) for t in out.values()]
+        amps = [a for a, _p in meas if a > 0.0]
+        pers = [p for _a, p in meas if p > 1]
+        if amps:
+            med = float(np.median(amps))
+            if pers:
+                vals, counts = np.unique(np.array(pers), return_counts=True)
+                modal = int(vals[int(np.argmax(counts))])
+                share = int(100 * counts.max() / len(pers))
+                status and status(f"Wobble: median {med:.3f}px, most common period "
+                                  f"{modal}f ({share}% of tracks)")
+            else:
+                status and status(f"Wobble: median {med:.3f}px, no dominant period")
 
     aniso = float(getattr(cfg, "min_corner_anisotropy", 0.0) or 0.0)
     bits = [f"refined={len(out)}/{len(final_tracks)}", f"trimmed={trimmed}", f"dropped={dropped}"]
