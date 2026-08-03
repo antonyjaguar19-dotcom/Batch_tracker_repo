@@ -452,17 +452,23 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             g = get(f - 1)
             if g is None:
                 break
-            # ANCHOR LEADS. Match the ORIGINAL seeded pattern first and use the re-referenced
-            # patch only when the anchor cannot answer. Letting the re-referenced patch lead
-            # turned this into an incremental frame-to-frame tracker: each frame inherited the
-            # last frame's small error, so the point wandered smoothly around the very feature
-            # it seeded on. Matching the anchor every frame pins it to where it started.
+            # Try BOTH patterns and take the better match, rather than preferring one.
+            #
+            # Anchor-first was wrong: it accepted the anchor's answer whenever it merely
+            # cleared `hold` (0.45), so on footage where appearance drifts -- handheld,
+            # changing light -- a mediocre anchor match was used even when the current
+            # pattern matched far better. A weak match has a BROAD, noisy peak, so the
+            # position wobbles; and because certainty is read off that same peak, the
+            # certainty figures became noise and the gate then kept arbitrary tracks.
+            # Best-of-both keeps the anchor's pull against drift without ever preferring a
+            # worse match to a better one.
             res = _ncc_match(g, anchor, cx, cy, search, half, edge_clamp, ambig)
-            if res is None or res[2] < hold:
-                alt = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig) \
-                    if patch is not anchor else None
+            if patch is not anchor:
+                alt = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig)
                 if alt is not None and (res is None or alt[2] > res[2]):
-                    res = alt
+                    # Re-run the winner last so _LAST_FLATNESS describes the peak actually
+                    # used -- certainty must reflect the match we kept, not the one we lost.
+                    res = _ncc_match(g, patch, cx, cy, search, half, edge_clamp, ambig)
             if res is None or res[2] < hold:
                 # Lock lost. This used to end the track here, which is how points were lost
                 # to occluders SAM3 never masked (a pole, a prop, a hand). Treat it as a
