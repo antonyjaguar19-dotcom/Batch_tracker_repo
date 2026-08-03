@@ -1229,6 +1229,15 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                               "If the floor would empty a shot it is relaxed automatically and the best are kept.")
 
             ui.separator().classes("q-my-sm")
+            sw_auto = ui.switch("Auto-tune per shot", value=bool(getattr(state, "auto_tune", True)),
+                                on_change=lambda e: setattr(state, "auto_tune", bool(e.value)))
+            sw_auto.tooltip("Reads each shot before tracking it — how sharp it is, how grainy, how much detail, "
+                            "how fast it moves — and sets the feature strength, pattern size and match thresholds "
+                            "to suit. A handheld plate with a defocused background needs different numbers from a "
+                            "locked-off sharp one, and a batch tool cannot be tuned by hand per shot. The log names "
+                            "what it measured and what it chose. Any slider you move yourself overrides it.")
+
+            ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
                                     on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")
