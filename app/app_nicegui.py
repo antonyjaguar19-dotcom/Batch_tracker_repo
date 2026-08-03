@@ -1213,6 +1213,30 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                               "solve wants on the order of 100 good points — exporting everything that was tracked "
                               "just moves the cleanup onto you. 0 = export everything (old behaviour).")
 
+            ui.label("Never export fewer than")
+            min_exp = ui.number(value=int(getattr(state, "min_export_tracks", 40)), min=0, max=200, precision=0
+                                ).props("dense outlined").classes("w-full")
+            min_exp.on_value_change(lambda e: setattr(state, "min_export_tracks", int(e.value or 0)))
+            min_exp.tooltip("If fewer tracks clear the quality bar than this, the shortfall is made up from the "
+                            "best of the rejected ones and those are marked 'weak' in the per-shot CSV. A handful "
+                            "of tracks and no explanation is not a usable delivery. 0 = only ever export what passes.")
+
+            ui.label("Pattern frames averaged (1 = off)")
+            tpl = ui.slider(min=1, max=11, value=int(getattr(state, "template_frames", 5)), step=1).props("label-always")
+            tpl.on_value_change(lambda e: setattr(state, "template_frames", int(e.value or 1)))
+            tpl.tooltip("Builds each point's reference pattern by averaging it over this many frames instead of "
+                        "grabbing one. Averaging cancels grain, which sharpens every match that pattern ever makes "
+                        "— so tracks get more accurate AND more of them clear the quality bar. The best-value "
+                        "setting here for grainy or handheld plates.")
+
+            ui.label("Refine passes per frame (1 = off)")
+            iters = ui.slider(min=1, max=6, value=int(getattr(state, "refine_iterations", 3)), step=1).props("label-always")
+            iters.on_value_change(lambda e: setattr(state, "refine_iterations", int(e.value or 1)))
+            iters.tooltip("Repeats match → polish → re-match until the point stops moving. One pass leaves the "
+                          "answer short whenever the starting guess was poor, which is the fast-motion and "
+                          "low-contrast case. Each pass is only kept if it does not make the match worse. "
+                          "Main cost of the slower run.")
+
             ui.label("Minimum track length (frames)")
             min_len = ui.slider(min=0, max=120, value=int(getattr(state, "min_track_frames", 24)), step=4).props("label-always")
             min_len.on_value_change(lambda e: setattr(state, "min_track_frames", int(e.value or 0)))
