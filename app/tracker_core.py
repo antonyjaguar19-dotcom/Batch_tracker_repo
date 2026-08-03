@@ -43,6 +43,8 @@ class RunnerConfig:
     # between plates, since certainty depends on contrast, grain and lens.
     min_track_certainty: float = 0.0
     certainty_rel: float = 0.80
+    certainty_max_cut: float = 0.6   # a gate wanting more than this is measuring badly
+    track_report: bool = True        # write a per-track CSV beside the exported tracks
     
     max_tracks: int = 1200      
     feature_quality: float = 0.02 
@@ -1644,6 +1646,24 @@ class BatchTrackerRunner:
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:
                         self._status(f"[{i}/{len(vids)}] Pattern-refine skipped: {e}")
+
+                # Per-track numbers for THIS shot, beside the tracks. Eyeballing real footage
+                # and passing synthetic tests kept disagreeing; this makes the next question
+                # answerable from a column instead of another guess.
+                if final_tracks_out and bool(getattr(self.cfg, "track_report", True)):
+                    try:
+                        from app.pattern_refine import measure_wobble, refine_tracks as _rt
+                        rep = os.path.join(
+                            self.cfg.output_dir,
+                            f"{shot}{('__' + self.cfg.output_tag.strip()) if (self.cfg.output_tag or '').strip() else ''}"
+                            f"__trackreport.csv")
+                        got = _tf.dump_track_report(
+                            rep, final_tracks_out, getattr(_rt, "last_certainty", {}) or {},
+                            T, W0, H0, self.cfg, wobble_fn=measure_wobble)
+                        if got:
+                            self._status(f"[{i}/{len(vids)}] Track report -> {os.path.basename(got)}")
+                    except Exception as e:
+                        self._status(f"[{i}/{len(vids)}] Track report skipped: {e}")
 
                 tag = (self.cfg.output_tag or '').strip()
                 base = f"{shot}__tapnext.txt" if not tag else f"{shot}__{tag}__tapnext.txt"
