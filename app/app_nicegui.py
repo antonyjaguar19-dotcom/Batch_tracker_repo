@@ -1200,6 +1200,34 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                 "both backends. Only affects masks made from now on: re-run Generate masks to apply it "
                                 "to existing shots (or use the track-time margin in TAPNext++ settings instead).")
 
+            # Applies to BOTH backends: the selection runs on the finished tracks, so it
+            # trims a SynthEyes export just as it does a TAPNext one. Lives here rather than
+            # in the TAPNext box, which is hidden whenever SynthEyes is selected.
+            ui.separator().classes("q-my-sm")
+            ui.label("Final track selection (both backends)").classes("bt-section")
+            ui.label("Export only the best N tracks")
+            track_max = ui.number(value=int(getattr(state, "track_max_output", 120)), min=0, max=1000, precision=0
+                                  ).props("dense outlined").classes("w-full")
+            track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
+            track_max.tooltip("How many tracks reach 3DE, best-scoring first and still evenly spread. A camera "
+                              "solve wants on the order of 100 good points — exporting everything that was tracked "
+                              "just moves the cleanup onto you. 0 = export everything (old behaviour).")
+
+            ui.label("Minimum track length (frames)")
+            min_len = ui.slider(min=0, max=120, value=int(getattr(state, "min_track_frames", 24)), step=4).props("label-always")
+            min_len.on_value_change(lambda e: setattr(state, "min_track_frames", int(e.value or 0)))
+            min_len.tooltip("Drop tracks too short to constrain a solve. Automatically scaled down on short "
+                            "shots (never more than a quarter of the shot), so a 40-frame plate still exports. "
+                            "0 = keep any length.")
+
+            ui.label("Quality floor (0 = off)")
+            min_score = ui.slider(min=0.0, max=0.8, value=float(getattr(state, "min_track_score", 0.35)), step=0.05).props("label-always")
+            min_score.on_value_change(lambda e: setattr(state, "min_track_score", float(e.value or 0.0)))
+            min_score.tooltip("Discard tracks scoring below this on length, smoothness and stability — judged "
+                              "on each track's OWN path, so a fast foreground point is never punished for "
+                              "moving unlike the background. Raise it if you are still deleting tracks by hand. "
+                              "If the floor would empty a shot it is relaxed automatically and the best are kept.")
+
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
@@ -1362,28 +1390,6 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 aniso.tooltip("Drops points sitting on a straight edge (rope, plate lines, TV-screen borders). Such a point "
                               "can only be pinned across the edge, never along it, so it slides left/right. Higher = stricter "
                               "(fewer, more corner-like tracks). Try 0.15 if sliding persists, 0.04 if too many tracks are lost.")
-                ui.label("Export only the best N tracks").classes("bt-section q-mt-sm")
-                track_max = ui.number(value=int(getattr(state, "track_max_output", 120)), min=0, max=1000, precision=0
-                                      ).props("dense outlined").classes("w-full")
-                track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
-                track_max.tooltip("How many tracks reach 3DE, best-scoring first and still evenly spread. A camera "
-                                  "solve wants on the order of 100 good points — exporting everything that survived "
-                                  "just moves the cleanup onto you. 0 = export everything (old behaviour).")
-
-                ui.label("Minimum track length (frames)")
-                min_len = ui.slider(min=0, max=120, value=int(getattr(state, "min_track_frames", 24)), step=4).props("label-always")
-                min_len.on_value_change(lambda e: setattr(state, "min_track_frames", int(e.value or 0)))
-                min_len.tooltip("Drop tracks too short to constrain a solve. Automatically scaled down on short "
-                                "shots (never more than a quarter of the shot), so a 40-frame plate still exports. "
-                                "0 = keep any length.")
-
-                ui.label("Quality floor (0 = off)")
-                min_score = ui.slider(min=0.0, max=0.8, value=float(getattr(state, "min_track_score", 0.35)), step=0.05).props("label-always")
-                min_score.on_value_change(lambda e: setattr(state, "min_track_score", float(e.value or 0.0)))
-                min_score.tooltip("Discard tracks scoring below this on length, smoothness and stability — judged "
-                                  "on each track's OWN path, so a fast foreground point is never punished for "
-                                  "moving unlike the background. Raise it if you are still deleting tracks by hand. "
-                                  "If the floor would empty a shot it is relaxed automatically and the best are kept.")
 
                 ui.label("Bad-track filter (plate px · 0 = off)")
                 with ui.row().classes("w-full no-wrap gap-2"):
