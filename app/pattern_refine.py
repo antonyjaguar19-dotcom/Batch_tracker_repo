@@ -83,6 +83,61 @@ def _anisotropy(patch: np.ndarray) -> float:
     return (lo / hi) if hi > 1e-12 else 0.0
 
 
+def _build_template(pts: Track, best_i: int, best_patch: np.ndarray,
+                    get: Callable[[int], Optional[np.ndarray]], half: int,
+                    n_avg: int, edge_clamp: bool) -> np.ndarray:
+    """Average the feature over several frames to make a low-noise reference pattern.
+
+    The reference used to be ONE patch from ONE frame, so it carried that frame's grain --
+    and grain in the template blunts every correlation peak it is ever matched against, for
+    the whole track. Averaging N aligned frames cuts template noise by roughly sqrt(N) while
+    leaving the signal, which sharpens every subsequent peak.
+
+    That matters beyond accuracy: certainty is measured from peak sharpness, so a cleaner
+    template raises certainty, and more tracks then clear the same quality bar. Quality and
+    count move together rather than against each other.
+
+    Each contributing frame is NCC-aligned to the anchor first (it is the same feature, so
+    the alignment is exact); a frame that will not align is skipped rather than smeared in.
+    n_avg <= 1 returns the anchor unchanged.
+    """
+    if n_avg <= 1 or best_patch is None:
+        return best_patch
+    acc = best_patch.astype(np.float64).copy()
+    used = 1
+    span = max(1, int(n_avg))
+    # Walk outward from the anchor so the closest (most similar) frames contribute first.
+    order = []
+    for d in range(1, span * 2):
+        for s in (1, -1):
+            j = best_i + s * d
+            if 0 <= j < len(pts):
+                order.append(j)
+        if used + len(order) >= span * 2:
+            break
+    for j in order:
+        if used >= span:
+            break
+        f, x, y = pts[j]
+        g = get(int(f) - 1)
+        if g is None:
+            continue
+        # Align to the anchor before averaging: a patch taken at a slightly wrong position
+        # would blur the template rather than clean it, which is worse than not averaging.
+        res = _ncc_match(g, best_patch, float(x), float(y), max(2, half // 2), half,
+                         edge_clamp, 1.0)
+        if res is None or res[2] < 0.5:
+            continue
+        p = _extract(g, res[0], res[1], half)
+        if p is None or p.shape != best_patch.shape:
+            continue
+        acc += p.astype(np.float64)
+        used += 1
+    if used <= 1:
+        return best_patch
+    return (acc / float(used)).astype(best_patch.dtype)
+
+
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
     """Normalised correlation between two equally-sized patches. Used to ask 'is this still
     the same feature?' -- against the anchor for drift, and across a gap for re-acquisition.
@@ -124,6 +179,12 @@ def _subpix_peak(resp: np.ndarray, loc: Tuple[int, int]) -> Tuple[float, float]:
     h, w = resp.shape
     if not (0 < mx < w - 1 and 0 < my < h - 1):
         return (0.0, 0.0)          # peak on the window border: no neighbourhood to fit
+
+    # NOT upsampled. Interpolating the response onto a finer grid and reading its maximum
+    # sounds better and measures WORSE: on a correlation peak (near-Gaussian) the
+    # log-quadratic fit below is analytically near-exact -- 3e-09px on a synthetic Gaussian --
+    # while bicubic interpolation of the coarse grid contributes its own error, ~0.035px.
+    # Tried and rejected on the numbers; kept as a note so it is not re-attempted.
     r = resp[my - 1:my + 2, mx - 1:mx + 2].astype(np.float64)
 
     if float(r.min()) > 0.0:
@@ -404,6 +465,7 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     # descent. This does not revisit the affine->translation decision: that was about
     # affine's extra rotation/scale freedom adding wobble; translation-only ECC has none.
     ecc_polish = bool(getattr(cfg, "refine_ecc_polish", False))
+    refine_iters = int(getattr(cfg, "refine_iterations", 1) or 1)
 
     # 1. anchor = highest-contrast valid patch (within THIS segment -> re-acquires per segment)
     best_i, best_c, best_patch = -1, -1.0, None
@@ -436,6 +498,11 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     reacq = float(getattr(cfg, "refine_ncc_reacquire", 0.75) or 0.75)
     drift_floor = float(getattr(cfg, "refine_drift_floor", 0.0) or 0.0)
     drift_every = int(getattr(cfg, "refine_drift_check_every", 0) or 0)
+    # Clean the reference by averaging aligned frames before anything is matched against it.
+    # A grainy template blunts every peak it ever produces, and certainty is read off those
+    # peaks -- so this lifts accuracy and the surviving track count together.
+    n_avg = int(getattr(cfg, "template_frames", 1) or 1)
+    best_patch = _build_template(pts, best_i, best_patch, get, half, n_avg, edge_clamp)
     anchor = best_patch.copy()          # NEVER replaced: the drift guard's ground truth
     # Per-frame localisation certainty, reduced to one number for the caller (see _CERTAINTY).
     certs: List[float] = []
@@ -513,16 +580,30 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
             # own floor, so it discriminates nothing. The threshold is instead set per shot
             # from the spread of certainties actually measured (see track_filter).
             certs.append(1.0 - float(_LAST_FLATNESS.get("v", 1.0)))
-            if motion != cv2.MOTION_TRANSLATION:
-                er = _ecc_refine(g, patch, x, y, half, motion)
-                if er is not None and er[2] >= lost:
-                    x, y, cc = er
-            elif ecc_polish:
-                # Only adopt it if the correlation did not get worse, so the polish can
-                # never turn a good NCC answer into a poorer one.
-                er = _ecc_refine(g, patch, x, y, half, cv2.MOTION_TRANSLATION)
-                if er is not None and er[2] >= cc:
-                    x, y, cc = er
+            # Iterate match -> polish -> re-match until the position settles. One pass leaves
+            # the answer short of the optimum whenever the starting guess was poor, which is
+            # exactly the fast-motion and low-contrast case. Each step is only adopted if it
+            # does not worsen the correlation, so iterating can refine but never degrade.
+            for _it in range(max(1, refine_iters)):
+                moved = 0.0
+                if motion != cv2.MOTION_TRANSLATION:
+                    er = _ecc_refine(g, patch, x, y, half, motion)
+                    if er is not None and er[2] >= lost:
+                        moved = math.hypot(er[0] - x, er[1] - y)
+                        x, y, cc = er
+                elif ecc_polish:
+                    # Only adopt it if the correlation did not get worse, so the polish can
+                    # never turn a good NCC answer into a poorer one.
+                    er = _ecc_refine(g, patch, x, y, half, cv2.MOTION_TRANSLATION)
+                    if er is not None and er[2] >= cc:
+                        moved = math.hypot(er[0] - x, er[1] - y)
+                        x, y, cc = er
+                if _it + 1 >= max(1, refine_iters) or moved < 0.01:
+                    break                       # settled: further passes would not move it
+                again = _ncc_match(g, patch, x, y, max(2, search // 2), half, edge_clamp, ambig)
+                if again is None or again[2] < cc:
+                    break                       # re-match did not help -> keep what we have
+                x, y, cc = again
             refined[i] = (f, float(x), float(y))
             last_good = refined[i]
 

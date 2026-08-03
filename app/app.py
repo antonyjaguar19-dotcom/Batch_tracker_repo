@@ -1122,7 +1122,12 @@ class AppState:
     spread_scale_with_res: bool = True  # TAPNext: scale that spacing by plate width / 1920
     # Export a solve-ready set rather than everything that survived: 1000+ tracks just moves
     # the cleanup onto the artist. Best-scoring first, so the cap keeps the good ones.
-    track_max_output: int = 120    # TAPNext: cap on exported tracks per task, 0=unlimited
+    # The quality bar decides the count; this is only a ceiling. Quality comes from tracking
+    # better (multi-frame template, upsampled peak, iterated refine), not from discarding.
+    track_max_output: int = 600    # TAPNext: safety ceiling on exported tracks, 0=unlimited
+    min_export_tracks: int = 40    # top a thin export up from the best rejects, flagged
+    template_frames: int = 5       # frames averaged into the reference pattern (1 = off)
+    refine_iterations: int = 3     # match/polish passes per frame (1 = off)
     min_track_frames: int = 24     # TAPNext: drop tracks shorter than this (scaled on short shots)
     min_track_score: float = 0.35  # TAPNext: quality floor in [0,1]; 0 = off
     mask_dilation_px: int = 10     # SAM3: grow the exclude region at MASK time (soft edges)
@@ -2167,7 +2172,10 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 60) or 60),
                 spread_ref_frames=int(getattr(state, "spread_ref_frames", 5) or 5),
                 spread_scale_with_res=bool(getattr(state, "spread_scale_with_res", True)),
-                max_output_tracks=int(getattr(state, "track_max_output", 120) or 0),
+                max_output_tracks=int(getattr(state, "track_max_output", 600) or 0),
+                min_export_tracks=int(getattr(state, "min_export_tracks", 40) or 0),
+                template_frames=int(getattr(state, "template_frames", 5) or 1),
+                refine_iterations=int(getattr(state, "refine_iterations", 3) or 1),
                 # Final gate: ship a solve-ready set, not everything that survived.
                 min_track_frames=int(getattr(state, "min_track_frames", 24) or 0),
                 min_track_score=float(getattr(state, "min_track_score", 0.35) or 0.0),

@@ -123,7 +123,11 @@ class RunnerConfig:
     # Export a solve-ready set, not everything that survived. A 3DE camera solve wants on the
     # order of 100 long, clean, well-spread points -- handing over 1000+ just moves the work
     # to the artist. Best-scoring first, so the cap keeps the good ones.
-    max_output_tracks: int = 120   # 0 = unlimited (the old behaviour)
+    # The quality bar decides the count -- if 400 tracks clear it, export 400. This is only a
+    # safety ceiling, not a target. Quality is earned by tracking better (a clean multi-frame
+    # template, an upsampled peak, an iterated refine), not by discarding more.
+    max_output_tracks: int = 600
+    min_export_tracks: int = 40    # below this, top up from the best rejects and flag them
 
     # --- Final quality gate ------------------------------------------------------------
     # _track_quality_score only RANKED tracks; nothing ever dropped a weak one, so a short or
@@ -223,6 +227,11 @@ class RunnerConfig:
     # default, so the exported position was always a 3-sample curve fit. Running it in
     # translation mode too is what stops a track wobbling on a feature that never moved.
     refine_ecc_polish: bool = True
+    # Quality bought with time, per the "despite the time" brief. All three sharpen the
+    # correlation peak, which is what certainty measures -- so they raise the surviving track
+    # COUNT as well as the accuracy, rather than trading one for the other.
+    template_frames: int = 5      # frames averaged into the reference pattern (1 = old)
+    refine_iterations: int = 3    # match -> polish -> re-match passes per frame (1 = old)
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
 
     # --- Re-acquisition after an occlusion --------------------------------------------
@@ -991,7 +1000,9 @@ class BatchTrackerRunner:
                 else:
                     diag_short += 1
 
+        n_scored = len(candidates)
         candidates = self._apply_quality_gate(candidates, T)
+        n_after_quality = len(candidates)
 
         if self.cfg.enable_spread_select and candidates:
             # Spacing is measured in the same space the candidate coords are in: the full
@@ -1002,6 +1013,17 @@ class BatchTrackerRunner:
             final_tracks_out = {c["id"]: c["pts"] for c in candidates}
         total_kept = len(final_tracks_out)
 
+        # Per-stage accounting. Seven filters stack multiplicatively here, and a thin export
+        # used to leave all of them as suspects. One line naming each stage's toll makes the
+        # responsible one obvious instead of inferred.
+        self._status(
+            f"  tracks: {total_candidates} seeded -> {diag_after_filter} past motion filter "
+            f"-> {diag_after_gate} past mask gate -> {n_scored} scored "
+            f"({diag_short} too short/jumpy) -> {n_after_quality} past quality bar "
+            f"-> {total_kept} after spacing"
+            + (f", capped at {int(self.cfg.max_output_tracks)}"
+               if self.cfg.max_output_tracks and total_kept >= int(self.cfg.max_output_tracks)
+               else ""))
         return final_tracks_out, total_kept, total_candidates, diag_after_filter, diag_after_gate, diag_short
 
     def _apply_quality_gate(self, candidates: List[dict], T: int) -> List[dict]:
@@ -1639,9 +1661,15 @@ class BatchTrackerRunner:
                             status=lambda m: self._status(f"TRACK: {m}"), bgr_source=refine_src)
                         # Certainty is only known once refine has measured the correlation
                         # peaks, so this gate cannot live with the others before it.
+                        _certs = getattr(refine_tracks, "last_certainty", {}) or {}
+                        _before_gate = dict(final_tracks_out)
                         final_tracks_out = _tf.certainty_gate(
-                            final_tracks_out, getattr(refine_tracks, "last_certainty", {}) or {},
-                            self.cfg, log=self._status)
+                            final_tracks_out, _certs, self.cfg, log=self._status)
+                        # A handful of tracks and no explanation is not a usable delivery.
+                        # Top a thin export back up from the best rejects, flagged.
+                        final_tracks_out, _weak_ids = _tf.backfill_to_floor(
+                            final_tracks_out, _before_gate, _certs, self.cfg,
+                            log=self._status)
                         total_kept = len(final_tracks_out)
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:
@@ -1659,7 +1687,8 @@ class BatchTrackerRunner:
                             f"__trackreport.csv")
                         got = _tf.dump_track_report(
                             rep, final_tracks_out, getattr(_rt, "last_certainty", {}) or {},
-                            T, W0, H0, self.cfg, wobble_fn=measure_wobble)
+                            T, W0, H0, self.cfg, wobble_fn=measure_wobble,
+                            weak=locals().get("_weak_ids") or set())
                         if got:
                             self._status(f"[{i}/{len(vids)}] Track report -> {os.path.basename(got)}")
                     except Exception as e:
