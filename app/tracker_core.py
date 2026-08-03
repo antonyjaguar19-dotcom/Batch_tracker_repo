@@ -102,7 +102,20 @@ class RunnerConfig:
     # clears the spacing test in more places. spread_min_dist_px is the only density dial.
     enable_spread_select: bool = True
     spread_min_dist_px: int = 40   # min px spacing between kept tracks (density dial)
-    max_output_tracks: int = 0     # soft cap; 0 = unlimited
+    # Export a solve-ready set, not everything that survived. A 3DE camera solve wants on the
+    # order of 100 long, clean, well-spread points -- handing over 1000+ just moves the work
+    # to the artist. Best-scoring first, so the cap keeps the good ones.
+    max_output_tracks: int = 120   # 0 = unlimited (the old behaviour)
+
+    # --- Final quality gate ------------------------------------------------------------
+    # _track_quality_score only RANKED tracks; nothing ever dropped a weak one, so a short or
+    # scrappy track still shipped if there was room. These are absolute floors applied before
+    # spread selection. All are scaled down on short shots and relaxed if they would empty
+    # the export -- returning nothing is worse than returning too much.
+    min_track_frames: int = 24        # visible frames a track must have; 0 = off
+    min_track_span_frac: float = 0.0  # or a fraction of the shot length; 0 = off
+    min_track_score: float = 0.35     # quality floor in [0,1]; 0 = off
+    quality_gate_floor: int = 8       # never gate below this many surviving tracks
     # Spacing is measured ON SCREEN at this many evenly-spaced reference frames, not on each
     # track's lifetime MEAN position. With a moving camera two tracks can sit a few px apart
     # for most of the shot while their means are 40px+ apart -- the mean test passed both and
@@ -944,6 +957,8 @@ class BatchTrackerRunner:
                 else:
                     diag_short += 1
 
+        candidates = self._apply_quality_gate(candidates, T)
+
         if self.cfg.enable_spread_select and candidates:
             # Spacing is measured in the same space the candidate coords are in: the full
             # plate (out_w when the tracked file was a downscaled proxy, else W0).
@@ -954,6 +969,56 @@ class BatchTrackerRunner:
         total_kept = len(final_tracks_out)
 
         return final_tracks_out, total_kept, total_candidates, diag_after_filter, diag_after_gate, diag_short
+
+    def _apply_quality_gate(self, candidates: List[dict], T: int) -> List[dict]:
+        """Drop tracks that are not worth an artist's time, before spread selection.
+
+        Scoring alone only ORDERED the candidates -- a short, scrappy track still shipped if
+        there was room, which is how an export reaches four figures and the cleanup lands on
+        the artist. These are absolute floors: too short to constrain a solve, or too poor to
+        trust.
+
+        Two safeguards, because an over-eager gate is worse than a permissive one:
+          * the length requirement scales down on short shots (a 30-frame plate cannot
+            produce 24-frame tracks in quantity);
+          * if the gate would leave fewer than `quality_gate_floor` tracks it is relaxed and
+            the best survivors are kept instead, so a hard shot still exports something.
+        """
+        if not candidates:
+            return candidates
+        need_f = int(getattr(self.cfg, "min_track_frames", 0) or 0)
+        frac = float(getattr(self.cfg, "min_track_span_frac", 0.0) or 0.0)
+        if frac > 0.0:
+            need_f = max(need_f, int(round(frac * max(1, T))))
+        # Never demand more than a quarter of the shot: on a short plate that would gate
+        # everything away for a reason the artist cannot act on.
+        if need_f > 0:
+            need_f = max(4, min(need_f, int(0.25 * max(1, T)) or 4))
+        need_s = float(getattr(self.cfg, "min_track_score", 0.0) or 0.0)
+        if need_f <= 0 and need_s <= 0.0:
+            return candidates
+
+        kept, short, weak = [], 0, 0
+        for c in candidates:
+            if need_f > 0 and len(c["pts"]) < need_f:
+                short += 1
+                continue
+            if need_s > 0.0 and float(c["score"]) < need_s:
+                weak += 1
+                continue
+            kept.append(c)
+
+        floor = max(1, int(getattr(self.cfg, "quality_gate_floor", 8) or 1))
+        if len(kept) < floor and len(candidates) > len(kept):
+            kept = sorted(candidates, key=lambda c: c["score"], reverse=True)[:floor]
+            self._status(f"  quality gate: only {len(kept)} track(s) cleared it -> relaxed, "
+                         f"keeping the best {len(kept)} instead (short/poor shot)")
+            return kept
+        if short or weak:
+            self._status(f"  quality gate: dropped {short} too-short (<{need_f}f) and "
+                         f"{weak} low-quality (<{need_s:.2f}) of {len(candidates)} -> "
+                         f"{len(kept)} worth exporting")
+        return kept
 
     def _bad_track(self, pts: List[Tuple[int, float, float]]) -> bool:
         """True if a track is too jittery or jumpy (plate px), per the user thresholds.
