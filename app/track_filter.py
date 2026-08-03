@@ -12,6 +12,7 @@ backends cannot drift apart.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -42,6 +43,9 @@ class FilterConfig:
     # best decile. Self-calibrating, which an absolute number cannot be -- certainty depends
     # on the plate's contrast, grain and lens. 0 = off.
     certainty_rel: float = 0.80
+    # Most of the track set a certainty bar may remove. If it wants more than this, the
+    # measure is more likely wrong than the footage is, so it is capped and reported.
+    certainty_max_cut: float = 0.6
     # even spread + cap
     spread_min_dist_px: int = 40
     spread_scale_with_res: bool = True
@@ -289,6 +293,40 @@ def select_spread(candidates: List[dict], cfg, out_width: int = 0,
     return out
 
 
+def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, float],
+                      T: int, width: int, height: int, cfg,
+                      wobble_fn: Optional[Callable] = None) -> str:
+    """Write a per-track CSV: length, score, certainty, wobble amplitude and period.
+
+    Several rounds of tracking fixes have been judged by eye on real footage and by
+    synthetic tests in the harness, and the two kept disagreeing. This puts the actual
+    numbers for the actual shot on disk, so the next question is answered by reading a
+    column rather than guessing. Best-effort -- a reporting failure must never cost a run.
+    """
+    try:
+        diag = math.hypot(float(width or 0), float(height or 0)) or 1000.0
+        rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y"]
+        for tid, pts in sorted(tracks.items()):
+            p = sorted(pts, key=lambda q: q[0])
+            if not p:
+                continue
+            n = len(p)
+            span = int(p[-1][0]) - int(p[0][0]) + 1
+            sc = score_track(p, T, diag, cfg)
+            ct = float(certainty.get(tid, float("nan")))
+            amp, per = wobble_fn(p) if wobble_fn else (float("nan"), 0)
+            mx = sum(q[1] for q in p) / n
+            my = sum(q[2] for q in p) / n
+            rows.append(f"{tid},{n},{span},{sc:.4f},{ct:.4f},{amp:.4f},{per},"
+                        f"{mx:.1f},{my:.1f}")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(rows) + "\n")
+        return path
+    except Exception:
+        return ""
+
+
 def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
                    log: Optional[Callable] = None) -> Dict[str, Track]:
     """Drop poorly-localised tracks AFTER refine, when certainty is finally known.
@@ -316,12 +354,60 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     # exactly the handheld-with-defocused-background case.
     vals = [float(certainty.get(k, 0.0)) for k in tracks if k in certainty]
     thr = need
+
+    # Describe the distribution once: whether it holds two populations, and where they part.
+    # This is a property of the numbers, not of which bar is switched on, so both the
+    # threshold choice below and the safety rail further down read the same analysis.
+    split_gap, gap_mid = 0.0, 0.0
+    if vals:
+        a = np.array(vals, dtype=float)
+        sv = np.sort(a)
+        gaps = np.diff(sv)
+        if len(gaps):
+            gi = int(np.argmax(gaps))
+            if float(gaps[gi]) >= 0.05:
+                split_gap = float(gaps[gi])
+                gap_mid = float((sv[gi] + sv[gi + 1]) * 0.5)
+
     if rel > 0.0 and vals:
-        best = float(np.percentile(np.array(vals, dtype=float), 90))
-        thr = max(thr, rel * best)
+        a = np.array(vals, dtype=float)
+        best = float(np.percentile(a, 90))
+        lo = float(np.percentile(a, 10))
+        # Only worth applying when there IS a spread to discriminate. On a uniformly sharp
+        # (or uniformly soft) plate every track scores alike, and a relative bar would then
+        # be cutting on noise rather than on a real soft cluster.
+        if float(a.max()) - float(a.min()) < 0.05:
+            _log(f"  certainty gate: spread too narrow ({lo:.2f}-{best:.2f}) to separate "
+                 f"anything -- skipped")
+            return tracks
+        # Prefer the natural gap over a percentile bar. A percentile assumes the good tracks
+        # are the majority, and on a defocused background they are the MINORITY -- most of
+        # the frame is soft, so P90 lands inside the bad cluster and the bar collapses. A gap
+        # makes no such assumption.
+        thr = max(thr, gap_mid) if split_gap > 0.0 else max(thr, rel * best)
     if thr <= 0.0:
         return tracks
     keep = {k: v for k, v in tracks.items() if float(certainty.get(k, 1.0)) >= thr}
+
+    # A large cut is fine when it is DISCRIMINATING and suspect when it is arbitrary -- and
+    # size alone cannot tell those apart. A sharp subject against a mostly-defocused
+    # background genuinely needs most tracks gone, while a noisy certainty measure would cut
+    # just as deeply for no reason. So judge the split instead: if the threshold falls inside
+    # a real gap in the distribution, there are two populations and the cut is well founded
+    # at any size. If it lands mid-continuum, it is slicing an arbitrary point and gets capped.
+    max_cut = float(getattr(cfg, "certainty_max_cut", 0.6) or 0.0)
+    if max_cut > 0.0 and len(keep) < (1.0 - max_cut) * len(tracks) and len(vals) >= 4:
+        if split_gap > 0.0:
+            _log(f"  certainty gate: {len(tracks) - len(keep)}/{len(tracks)} dropped, but the "
+                 f"split is clean (gap {split_gap:.2f} at {thr:.2f}) -- two populations, "
+                 f"so the cut stands")
+        else:
+            n_keep = max(1, int(round((1.0 - max_cut) * len(tracks))))
+            best_ids = sorted(tracks, key=lambda k: float(certainty.get(k, 0.0)),
+                              reverse=True)[:n_keep]
+            _log(f"  certainty gate: would have cut {len(tracks) - len(keep)}/{len(tracks)} "
+                 f"with no clear split in the numbers -- capped at {len(tracks) - n_keep}")
+            return {k: tracks[k] for k in best_ids}
     need = thr
     floor = max(1, int(getattr(cfg, "quality_gate_floor", 8) or 1))
     if len(keep) < min(floor, len(tracks)):
