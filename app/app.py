@@ -1106,7 +1106,11 @@ class AppState:
     track_spacing_px: int = 60     # TAPNext: min spacing between kept tracks, quoted @1920
     spread_ref_frames: int = 5     # TAPNext: frames sampled to measure that spacing ON SCREEN
     spread_scale_with_res: bool = True  # TAPNext: scale that spacing by plate width / 1920
-    track_max_output: int = 0      # TAPNext: soft cap on exported tracks per task, 0=unlimited
+    # Export a solve-ready set rather than everything that survived: 1000+ tracks just moves
+    # the cleanup onto the artist. Best-scoring first, so the cap keeps the good ones.
+    track_max_output: int = 120    # TAPNext: cap on exported tracks per task, 0=unlimited
+    min_track_frames: int = 24     # TAPNext: drop tracks shorter than this (scaled on short shots)
+    min_track_score: float = 0.35  # TAPNext: quality floor in [0,1]; 0 = off
     mask_dilation_px: int = 10     # SAM3: grow the exclude region at MASK time (soft edges)
     mask_margin_px: int = 8        # TAPNext: pull seeding/gating in from the matte edge
     min_corner_anisotropy: float = 0.08  # TAPNext: reject 1-D edge points that slide (0=off)
@@ -2095,7 +2099,10 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 spread_min_dist_px=int(getattr(state, "track_spacing_px", 60) or 60),
                 spread_ref_frames=int(getattr(state, "spread_ref_frames", 5) or 5),
                 spread_scale_with_res=bool(getattr(state, "spread_scale_with_res", True)),
-                max_output_tracks=int(getattr(state, "track_max_output", 0) or 0),
+                max_output_tracks=int(getattr(state, "track_max_output", 120) or 0),
+                # Final gate: ship a solve-ready set, not everything that survived.
+                min_track_frames=int(getattr(state, "min_track_frames", 24) or 0),
+                min_track_score=float(getattr(state, "min_track_score", 0.35) or 0.0),
                 # Pull seeds/gating in from the matte edge, and reject 1-D (edge) features
                 # that NCC can only slide along. See RunnerConfig for the reasoning.
                 mask_margin_px=int(getattr(state, "mask_margin_px", 8) or 0),
