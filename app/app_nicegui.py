@@ -1404,6 +1404,34 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 flt_jitter.tooltip("Drops a track whose mean frame-to-frame jitter (change in velocity) exceeds "
                                    "this many plate pixels. Self-consistency only, so a fast SMOOTH point passes. 0 = off. Try ~3.")
 
+                ui.label("Pattern lock strength")
+                lock = ui.slider(min=0.60, max=0.90, value=float(getattr(state, "refine_ncc_reref", 0.68)), step=0.02).props("label-always")
+                lock.on_value_change(lambda e: setattr(state, "refine_ncc_reref", float(e.value or 0.68)))
+                lock.tooltip("How stubbornly a point holds the pattern it seeded on before grabbing a fresh one. "
+                             "High values re-grab constantly, which turns it into a frame-by-frame tracker and lets "
+                             "the point wander smoothly around its own feature. Low = locked to what it started on "
+                             "(most accurate; tracks may end earlier when lighting or perspective really changes).")
+
+                ui.label("Moving-tile seam blend (frames · 0 = off)")
+                mt_ov = ui.slider(min=0, max=8, value=int(getattr(state, "mt_overlap", 4)), step=1).props("label-always")
+                mt_ov.on_value_change(lambda e: setattr(state, "mt_overlap", int(e.value or 0)))
+                mt_ov.tooltip("The native re-track works in windows. Without a blend each window handed over with a "
+                              "small step, once per window — a regular wobble you can see in centre-2D. This "
+                              "cross-fades the hand-off. Raise it if a regular beat is still visible; the tracking "
+                              "log now reports the wobble's period.")
+
+                sw_ecc = ui.switch("Sub-pixel polish (ECC)", value=getattr(state, "refine_ecc_polish", True),
+                                   on_change=lambda e: setattr(state, "refine_ecc_polish", bool(e.value)))
+                sw_ecc.tooltip("Finishes each point by fitting it against the actual pixels instead of estimating "
+                               "from three correlation samples. This is what stops a track wobbling in place on a "
+                               "feature that never moved — check it in 3DE's centre-2D view zoomed in. Slightly "
+                               "slower per point.")
+                sw_png = ui.switch("Lossless tracking proxies (PNG)", value=getattr(state, "lossless_track_proxies", True),
+                                   on_change=lambda e: setattr(state, "lossless_track_proxies", bool(e.value)))
+                sw_png.tooltip("Tracks EXR plates via PNG instead of JPEG proxies. JPEG artefacts sit on a fixed "
+                               "8x8 block grid and do not move with the image, so they read as sub-pixel jitter. "
+                               "Costs several times the proxy disk in the shot cache and a slower first pass; "
+                               "analysis and masking keep JPEG either way.")
                 sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
                                        on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
                 sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
