@@ -6,7 +6,7 @@ import gc
 import time
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Dict, List, Tuple
 
 import numpy as np
@@ -26,8 +26,23 @@ class RunnerConfig:
     input_dir: str
     output_dir: str
     
-    seeding_mode: str = "features" 
+    seeding_mode: str = "features"
     bidirectional: bool = True
+
+    # --- Per-shot auto-tune -------------------------------------------------------------
+    # This is a batch tool, so the settings below cannot be hand-tuned per shot -- yet a
+    # handheld plate with a defocused background and a locked-off macro shot were given
+    # identical constants, and at most one of those can be right. When on, each shot is
+    # measured (sharpness, grain, texture, motion) and the relevant values derived from it;
+    # anything the user has explicitly set still wins. See app/shot_profile.py.
+    auto_tune: bool = True
+    auto_tune_overrides: Dict[str, object] = field(default_factory=dict)
+    quality_flags: List[str] = field(default_factory=list)   # Qwen's, when Analyze has run
+    # Localisation certainty floor, normally set by the auto-tune (0 = off), plus a RELATIVE
+    # bar judged against the shot's own best tracks -- an absolute number cannot travel
+    # between plates, since certainty depends on contrast, grain and lens.
+    min_track_certainty: float = 0.0
+    certainty_rel: float = 0.80
     
     max_tracks: int = 1200      
     feature_quality: float = 0.02 
@@ -1112,6 +1127,33 @@ class BatchTrackerRunner:
         except Exception:
             pass
 
+    def _auto_tune(self, source, fs0: int, T: int) -> None:
+        """Measure this shot and write the derived parameters onto self.cfg.
+
+        Best-effort by design: if anything here fails the shot simply tracks with the
+        existing values. An auto-tuner that can break a batch is worse than one that
+        occasionally declines to help.
+        """
+        try:
+            from app import shot_profile as _sp
+            n = int(min(6, max(2, T)))
+            frames = source.get(fs0, n)
+            prof = _sp.profile_shot(frames, flags=list(getattr(self.cfg, "quality_flags", []) or []))
+            tuned = _sp.tune(prof, overrides=dict(getattr(self.cfg, "auto_tune_overrides", {}) or {}))
+            changed = []
+            for k, v in tuned.items():
+                if hasattr(self.cfg, k) and getattr(self.cfg, k) != v:
+                    changed.append(f"{k}={v}")
+                setattr(self.cfg, k, v)
+            self._status(f"  auto-tune: {prof.describe()}"
+                         + (f" | flags: {', '.join(prof.flags)}" if prof.flags else ""))
+            if changed:
+                self._status(f"  auto-tune -> {', '.join(changed)}")
+            for note in prof.notes:
+                self._status(f"  auto-tune note: {note}")
+        except Exception as e:
+            self._status(f"  auto-tune skipped ({e}); using the configured values")
+
     def _probe_vram(self, engine, frames: np.ndarray, Ws: int, Hs: int) -> None:
         """Measure this card's real bytes-per-(frame*pixel) BEFORE chunking is decided.
 
@@ -1396,6 +1438,13 @@ class BatchTrackerRunner:
                 Ws, Hs = int(source.scaled_w), int(source.scaled_h)
                 diag = float(np.sqrt(float(W0 * W0 + H0 * H0))) if (W0 > 0 and H0 > 0) else 1000.0
 
+                # Read THIS shot and set the tracking parameters from it. A batch tool cannot
+                # be hand-tuned per shot, so the alternative was one set of constants for
+                # every plate -- which is why a handheld shot with a defocused background
+                # tracked badly with settings that suit a sharp locked-off one.
+                if bool(getattr(self.cfg, "auto_tune", False)):
+                    self._auto_tune(source, fs0, T)
+
                 # Measure the card BEFORE sizing chunks, so the first shot of a run isn't
                 # cut up against the conservative constant (see _probe_vram).
                 if not (self._cal and self._cal > 0) and int(self.cfg.chunks) < 1:
@@ -1586,6 +1635,11 @@ class BatchTrackerRunner:
                         final_tracks_out, rinfo = refine_tracks(
                             final_tracks_out, in_path, W0, H0, orig_total, self.cfg,
                             status=lambda m: self._status(f"TRACK: {m}"), bgr_source=refine_src)
+                        # Certainty is only known once refine has measured the correlation
+                        # peaks, so this gate cannot live with the others before it.
+                        final_tracks_out = _tf.certainty_gate(
+                            final_tracks_out, getattr(refine_tracks, "last_certainty", {}) or {},
+                            self.cfg, log=self._status)
                         total_kept = len(final_tracks_out)
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:
