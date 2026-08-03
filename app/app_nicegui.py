@@ -1213,6 +1213,14 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                               "solve wants on the order of 100 good points — exporting everything that was tracked "
                               "just moves the cleanup onto you. 0 = export everything (old behaviour).")
 
+            ui.label("Max holes per track (-1 = allow any)")
+            gaps = ui.slider(min=-1, max=8, value=int(getattr(state, "max_track_gaps", 2)), step=1).props("label-always")
+            gaps.on_value_change(lambda e: setattr(state, "max_track_gaps", int(e.value if e.value is not None else 2)))
+            gaps.tooltip("A track that survives someone walking past it carries one long hole, which is worth "
+                         "keeping as a single track. A track with a dozen short holes is not an occluded track — "
+                         "it kept losing and regaining lock, and it blinks on and off in the 3DE viewport. Above "
+                         "this many holes the track is cut into its continuous pieces instead.")
+
             ui.label("Never export fewer than")
             min_exp = ui.number(value=int(getattr(state, "min_export_tracks", 40)), min=0, max=200, precision=0
                                 ).props("dense outlined").classes("w-full")

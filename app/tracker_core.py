@@ -128,6 +128,10 @@ class RunnerConfig:
     # template, an upsampled peak, an iterated refine), not by discarding more.
     max_output_tracks: int = 600
     min_export_tracks: int = 40    # below this, top up from the best rejects and flag them
+    # Holes a track may carry before it is cut into continuous runs. One or two long gaps is
+    # an occluded track worth keeping whole; a dozen short ones is a marginal track that kept
+    # losing lock, and it blinks on and off in the 3DE viewport. -1 = off.
+    max_track_gaps: int = 2
 
     # --- Final quality gate ------------------------------------------------------------
     # _track_quality_score only RANKED tracks; nothing ever dropped a weak one, so a short or
@@ -1670,6 +1674,11 @@ class BatchTrackerRunner:
                         final_tracks_out, _weak_ids = _tf.backfill_to_floor(
                             final_tracks_out, _before_gate, _certs, self.cfg,
                             log=self._status)
+                        # A track that kept losing and regaining lock exports as one id full
+                        # of holes, which blinks on and off in the 3DE viewport. Cut those
+                        # into continuous runs; genuine occlusion gaps stay.
+                        final_tracks_out = _tf.defragment(final_tracks_out, self.cfg,
+                                                          log=self._status)
                         total_kept = len(final_tracks_out)
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:

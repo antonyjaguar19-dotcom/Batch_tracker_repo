@@ -59,6 +59,12 @@ class FilterConfig:
     # ...but never hand back a handful with no explanation. Below this, fill with the best
     # remaining and mark them weak, so a thin shot is still workable and visibly so.
     min_export_tracks: int = 40
+    # Holes a track may carry before it is cut into continuous runs instead. One or two long
+    # gaps is an occluded track worth keeping whole; a dozen short ones is a marginal track
+    # that kept losing lock, and it blinks on and off in the 3DE viewport. -1 = off.
+    max_track_gaps: int = 2
+    min_occlusion_run: int = 3      # a hole shorter than this was never a real occlusion
+    refine_min_len: int = 8         # a run shorter than this is not worth exporting
 
     @classmethod
     def from_state(cls, state) -> "FilterConfig":
@@ -68,6 +74,7 @@ class FilterConfig:
             min_track_frames=int(g("min_track_frames", 24) or 0),
             min_track_score=float(g("min_track_score", 0.35) or 0.0),
             spread_min_dist_px=int(g("track_spacing_px", 60) or 40),
+            max_track_gaps=int(g("max_track_gaps", 2)),
             spread_ref_frames=int(g("spread_ref_frames", 5) or 1),
             spread_scale_with_res=bool(g("spread_scale_with_res", True)),
             spread_max_starts_per_window=int(g("spread_max_starts_per_window", 0) or 0),
@@ -298,6 +305,83 @@ def select_spread(candidates: List[dict], cfg, out_width: int = 0,
     return out
 
 
+def defragment(tracks: Dict[str, Track], cfg,
+               log: Optional[Callable] = None) -> Dict[str, Track]:
+    """Split heavily-broken tracks into their continuous runs.
+
+    Occlusion continuity deliberately lets a track survive a crossing by carrying a HOLE, so
+    a background point is not deleted because someone walked past it. One long gap is exactly
+    that and is worth keeping under a single id.
+
+    Many SHORT gaps are a different animal: not an occluded track but a marginal one that
+    kept losing and regaining lock. Nothing limited that, so a point could lose lock fifteen
+    times, re-acquire fifteen times, and export as one id -- which is why tracks blink on and
+    off in the 3DE viewport like an LED.
+
+    Rule: a track may carry up to `max_track_gaps` holes, and every hole must be at least
+    `min_occlusion_run` frames (i.e. plausibly a real occlusion). Anything else is cut into
+    its continuous runs, and runs too short to be useful are dropped. Every exported track is
+    then either solid or holed only where something genuinely crossed it.
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    max_gaps = int(getattr(cfg, "max_track_gaps", -1))
+    if max_gaps < 0 or not tracks:
+        return tracks
+    min_hole = max(1, int(getattr(cfg, "min_occlusion_run", 1) or 1))
+    min_run = max(2, int(getattr(cfg, "refine_min_len", 8) or 2))
+
+    out: Dict[str, Track] = {}
+    n_split = n_dropped = 0
+    for tid, pts in tracks.items():
+        p = sorted(pts, key=lambda q: int(q[0]))
+        runs: List[Track] = []
+        cur: Track = [p[0]] if p else []
+        holes: List[int] = []
+        for a, b in zip(p, p[1:]):
+            step = int(b[0]) - int(a[0])
+            if step == 1:
+                cur.append(b)
+            else:
+                holes.append(step - 1)
+                runs.append(cur)
+                cur = [b]
+        if cur:
+            runs.append(cur)
+
+        # A SOLID track is never this function's business, whatever its length -- length is
+        # the quality gate's job, and silently applying one here would be a surprise from
+        # something called "defragment".
+        if not holes:
+            out[tid] = p
+            continue
+
+        # Keep a holed track whole only if it looks genuinely occluded: few holes, each long
+        # enough to be something crossing, AND every visible stretch substantial enough to
+        # see. Without that last test, three 3-frame fragments separated by long gaps read as
+        # "two occlusions" and still blink.
+        if (len(holes) <= max_gaps and all(h >= min_hole for h in holes)
+                and all(len(r) >= min_run for r in runs)):
+            out[tid] = p
+            continue
+
+        # Too broken to be one track: emit the usable runs separately.
+        keep_runs = [r for r in runs if len(r) >= min_run]
+        if not keep_runs:
+            n_dropped += 1
+            continue
+        n_split += 1
+        for k, r in enumerate(keep_runs):
+            out[tid if k == 0 else f"{tid}_f{k}"] = r
+
+    if n_split or n_dropped:
+        _log(f"  defragment: {n_split} track(s) were breaking up repeatedly -> split into "
+             f"continuous runs, {n_dropped} dropped entirely ({len(tracks)} -> {len(out)})")
+    return out
+
+
 def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
                       certainty: Dict[str, float], cfg,
                       log: Optional[Callable] = None) -> Tuple[Dict[str, Track], set]:
@@ -486,4 +570,7 @@ def filter_tracks(tracks: Dict[str, Track], T: int, width: int, height: int, cfg
     if not candidates:
         return {}
     candidates = quality_gate(candidates, T, cfg, log=log)
-    return select_spread(candidates, cfg, out_width=int(width or 0), log=log)
+    sel = select_spread(candidates, cfg, out_width=int(width or 0), log=log)
+    # Cut repeatedly-broken tracks into continuous runs before export, so nothing blinks on
+    # and off in the viewport.
+    return defragment(sel, cfg, log=log)
