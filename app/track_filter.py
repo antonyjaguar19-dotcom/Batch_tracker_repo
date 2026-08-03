@@ -53,7 +53,12 @@ class FilterConfig:
     spread_ref_frames: int = 5
     spread_max_starts_per_window: int = 0
     spread_start_window: int = 8
-    max_output_tracks: int = 120
+    # The quality bar decides how many are exported -- if 400 clear it, export 400. This is
+    # only a safety ceiling against a pathological shot, not a target.
+    max_output_tracks: int = 600
+    # ...but never hand back a handful with no explanation. Below this, fill with the best
+    # remaining and mark them weak, so a thin shot is still workable and visibly so.
+    min_export_tracks: int = 40
 
     @classmethod
     def from_state(cls, state) -> "FilterConfig":
@@ -293,9 +298,43 @@ def select_spread(candidates: List[dict], cfg, out_width: int = 0,
     return out
 
 
+def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
+                      certainty: Dict[str, float], cfg,
+                      log: Optional[Callable] = None) -> Tuple[Dict[str, Track], set]:
+    """Top a thin export back up to min_export_tracks with the best of what was rejected.
+
+    Seven filters stacked multiplicatively could take 200 candidates down to 10, with no
+    single stage obviously at fault. A handful of tracks and no explanation is not a usable
+    delivery, so the shortfall is made up from the best rejects -- and every one of them is
+    FLAGGED, in the log and in the per-track CSV, so it is clear which to check rather than
+    quietly padding the count.
+
+    Returns (tracks, weak_ids).
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    floor = int(getattr(cfg, "min_export_tracks", 0) or 0)
+    if floor <= 0 or len(kept) >= floor or len(all_tracks) <= len(kept):
+        return kept, set()
+    spare = [k for k in all_tracks if k not in kept]
+    spare.sort(key=lambda k: float(certainty.get(k, 0.0)), reverse=True)
+    add = spare[:max(0, floor - len(kept))]
+    if not add:
+        return kept, set()
+    out = dict(kept)
+    for k in add:
+        out[k] = all_tracks[k]
+    _log(f"  only {len(kept)} track(s) cleared the quality bar -> topped up to {len(out)} "
+         f"with the best {len(add)} rejected, marked weak in the report")
+    return out, set(add)
+
+
 def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, float],
                       T: int, width: int, height: int, cfg,
-                      wobble_fn: Optional[Callable] = None) -> str:
+                      wobble_fn: Optional[Callable] = None,
+                      weak: Optional[set] = None) -> str:
     """Write a per-track CSV: length, score, certainty, wobble amplitude and period.
 
     Several rounds of tracking fixes have been judged by eye on real footage and by
@@ -305,7 +344,8 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
     """
     try:
         diag = math.hypot(float(width or 0), float(height or 0)) or 1000.0
-        rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y"]
+        weak = weak or set()
+        rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y,weak"]
         for tid, pts in sorted(tracks.items()):
             p = sorted(pts, key=lambda q: q[0])
             if not p:
@@ -318,7 +358,7 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
             mx = sum(q[1] for q in p) / n
             my = sum(q[2] for q in p) / n
             rows.append(f"{tid},{n},{span},{sc:.4f},{ct:.4f},{amp:.4f},{per},"
-                        f"{mx:.1f},{my:.1f}")
+                        f"{mx:.1f},{my:.1f},{1 if tid in weak else 0}")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(rows) + "\n")
