@@ -15,6 +15,8 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
+
 Track = List[Tuple[int, float, float]]
 
 
@@ -31,6 +33,15 @@ class FilterConfig:
     min_track_span_frac: float = 0.0
     min_track_score: float = 0.35
     quality_gate_floor: int = 8
+    # Localisation certainty floor. The three score terms above are all self-referential
+    # MOTION statistics, and a defocused blob tracks smoothly precisely because it has no
+    # detail -- long, low-jitter, no jumps -- so it scored WELL. Certainty (how sharply the
+    # correlation peak falls away) is the one axis a soft track cannot fake. 0 = off.
+    min_track_certainty: float = 0.0
+    # Relative certainty bar: keep tracks scoring at least this fraction of the shot's own
+    # best decile. Self-calibrating, which an absolute number cannot be -- certainty depends
+    # on the plate's contrast, grain and lens. 0 = off.
+    certainty_rel: float = 0.80
     # even spread + cap
     spread_min_dist_px: int = 40
     spread_scale_with_res: bool = True
@@ -125,13 +136,19 @@ def quality_gate(candidates: List[dict], T: int, cfg, log: Optional[Callable] = 
     if need_f <= 0 and need_s <= 0.0:
         return candidates
 
-    kept, short, weak = [], 0, 0
+    need_c = float(getattr(cfg, "min_track_certainty", 0.0) or 0.0)
+    kept, short, weak, soft = [], 0, 0, 0
     for c in candidates:
         if need_f > 0 and len(c["pts"]) < need_f:
             short += 1
             continue
         if need_s > 0.0 and float(c["score"]) < need_s:
             weak += 1
+            continue
+        # Only judge certainty when it was actually measured (the refine stage supplies it);
+        # a track with no measurement is not penalised for it.
+        if need_c > 0.0 and c.get("certainty") is not None and float(c["certainty"]) < need_c:
+            soft += 1
             continue
         kept.append(c)
 
@@ -141,9 +158,10 @@ def quality_gate(candidates: List[dict], T: int, cfg, log: Optional[Callable] = 
         _log(f"  quality gate: only {len(kept)} track(s) cleared it -> relaxed, "
              f"keeping the best {len(kept)} instead (short/poor shot)")
         return kept
-    if short or weak:
-        _log(f"  quality gate: dropped {short} too-short (<{need_f}f) and "
-             f"{weak} low-quality (<{need_s:.2f}) of {len(candidates)} -> "
+    if short or weak or soft:
+        _log(f"  quality gate: dropped {short} too-short (<{need_f}f), "
+             f"{weak} low-quality (<{need_s:.2f}) and {soft} poorly-localised "
+             f"(certainty <{need_c:.2f}, e.g. defocused) of {len(candidates)} -> "
              f"{len(kept)} worth exporting")
     return kept
 
@@ -269,6 +287,52 @@ def select_spread(candidates: List[dict], cfg, out_width: int = 0,
         _log(f"  spread: thinned {n_start_pruned} track(s) that started in an "
              f"already-crowded {start_win}-frame window")
     return out
+
+
+def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
+                   log: Optional[Callable] = None) -> Dict[str, Track]:
+    """Drop poorly-localised tracks AFTER refine, when certainty is finally known.
+
+    The main quality gate runs before refinement, so it cannot see this: certainty comes from
+    the correlation peaks the refine stage measures. It is the only signal that catches a
+    defocused point, because such a point's motion statistics -- long, smooth, no jumps --
+    are excellent. Same safeguard as the main gate: if the floor would empty the shot it is
+    relaxed and the best are kept.
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    need = float(getattr(cfg, "min_track_certainty", 0.0) or 0.0)
+    rel = float(getattr(cfg, "certainty_rel", 0.0) or 0.0)
+    if (need <= 0.0 and rel <= 0.0) or not tracks or not certainty:
+        return tracks
+
+    # RELATIVE threshold, judged against this shot's own best tracks. An absolute number
+    # cannot work across plates: certainty depends on contrast, grain and lens, so 0.5 might
+    # be excellent on one shot and poor on another. Comparing each track to the best decile
+    # of ITS OWN shot is self-calibrating -- on a uniformly sharp plate nothing is dropped,
+    # while on a sharp-subject/soft-background plate the soft cluster falls away. That is
+    # exactly the handheld-with-defocused-background case.
+    vals = [float(certainty.get(k, 0.0)) for k in tracks if k in certainty]
+    thr = need
+    if rel > 0.0 and vals:
+        best = float(np.percentile(np.array(vals, dtype=float), 90))
+        thr = max(thr, rel * best)
+    if thr <= 0.0:
+        return tracks
+    keep = {k: v for k, v in tracks.items() if float(certainty.get(k, 1.0)) >= thr}
+    need = thr
+    floor = max(1, int(getattr(cfg, "quality_gate_floor", 8) or 1))
+    if len(keep) < min(floor, len(tracks)):
+        best = sorted(tracks, key=lambda k: float(certainty.get(k, 0.0)), reverse=True)[:floor]
+        _log(f"  certainty gate: only {len(keep)} track(s) cleared {need:.2f} -> relaxed, "
+             f"keeping the best {len(best)} (soft plate)")
+        return {k: tracks[k] for k in best}
+    if len(keep) < len(tracks):
+        _log(f"  certainty gate: dropped {len(tracks) - len(keep)} poorly-localised track(s) "
+             f"(certainty <{need:.2f}) -> {len(keep)}")
+    return keep
 
 
 def filter_tracks(tracks: Dict[str, Track], T: int, width: int, height: int, cfg,
