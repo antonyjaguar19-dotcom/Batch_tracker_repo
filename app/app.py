@@ -1137,6 +1137,8 @@ class AppState:
     refine_patch_px: int = 31      # pattern-box size (px) for the refine pass
     # Sub-pixel accuracy (the "track wobbles in place" fixes)
     refine_ecc_polish: bool = True      # gradient sub-pixel polish after the NCC peak
+    mt_overlap: int = 4                 # blend moving-tile window seams (0 = old butt-joint)
+    refine_ncc_reref: float = 0.68      # how hard the point locks to its seeded pattern
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
@@ -2176,6 +2178,8 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 enable_pattern_refine=bool(getattr(state, "pattern_refine", True)),
                 refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
                 refine_ecc_polish=bool(getattr(state, "refine_ecc_polish", True)),
+                mt_overlap=int(getattr(state, "mt_overlap", 4) or 0),
+                refine_ncc_reref=float(getattr(state, "refine_ncc_reref", 0.68) or 0.68),
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.
                 occlusion_continuity=bool(getattr(state, "occlusion_continuity", True)),
