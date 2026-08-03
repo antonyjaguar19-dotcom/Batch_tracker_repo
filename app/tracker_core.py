@@ -151,6 +151,11 @@ class RunnerConfig:
     # baseline+NCC 4.03px, moving-tile+NCC 1.30px. Non-destructive (see moving_tile_refine.py).
     enable_moving_tile: bool = True
     mt_window: int = 16             # frames per tile window before it re-centres on the guide
+    # Windows used to butt-joint, each a fresh model call seeded from the previous window's
+    # drifted end, so every seam put a small STEP into the path -- once per window, which is
+    # precisely the regular ~16-frame beat seen in centre-2D. Overlapping and cross-fading
+    # the seam removes the step, and with it the beat. 0 = the old butt-joint.
+    mt_overlap: int = 4
     mt_edge_margin: int = 40        # keep the coarse guide this many px inside the tile edge
     # Edge tracking: keep refining a point right up to the frame border instead of trimming it
     # when the search box / tile clamps against the edge (edge tracks anchor lens/solve corners).
@@ -185,7 +190,13 @@ class RunnerConfig:
     # hold on down to this lower bar; only below it is the lock genuinely lost. A frame held
     # this way is never used to re-grab the pattern. Set == refine_ncc_lost to disable.
     refine_ncc_hold: float = 0.45
-    refine_ncc_reref: float = 0.85  # corr below this (but >= lost) = re-grab the pattern
+    # Re-referencing is now the EXCEPTION, not the routine. At 0.85 against lost=0.60 the
+    # pattern was re-grabbed on most frames of real footage (grain, motion blur, a slight
+    # lighting shift all land in that band), which quietly turned a pattern tracker into an
+    # incremental frame-to-frame one -- and those random-walk, so the point wandered smoothly
+    # around the feature it seeded on. Keep the seeded pattern unless correlation is close to
+    # collapsing; the anchor is matched every frame regardless (see pattern_refine).
+    refine_ncc_reref: float = 0.68  # corr below this (but >= lost) = re-grab the pattern
     # translation default: with moving-tile placing the point accurately, affine's extra
     # rot/scale DoF only adds wobble on pan/translation-dominant plates (measured regression).
     # Set to "affine"/"euclidean" for shots with real camera roll or zoom.
