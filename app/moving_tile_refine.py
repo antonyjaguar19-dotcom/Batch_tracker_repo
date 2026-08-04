@@ -207,10 +207,17 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         elif sd == "never":
             stream = False
         src = FrameSource(video_path, 1.0, stream=stream)
+        src_note = "streamed" if stream else "full-decode"
+    else:
+        # Named separately because `stream` only exists on the branch above: reading it here
+        # raised UnboundLocalError on every shot that shared a decode, and the caller catches
+        # the exception as "Moving-tile skipped" -- so the stage silently did not run at all
+        # on the normal path.
+        src_note = "shared decode"
 
     if status:
         status(f"Moving-tile: {len(final_tracks)} tracks, tile {_TILE}px win={win} "
-               f"overlap={overlap} ({'streamed' if stream else 'full-decode'} {W0}x{H0})")
+               f"overlap={overlap} ({src_note} {W0}x{H0})")
 
     out: Dict[str, Track] = {}
     moved = 0
