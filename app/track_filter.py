@@ -79,6 +79,13 @@ class FilterConfig:
             spread_scale_with_res=bool(g("spread_scale_with_res", True)),
             spread_max_starts_per_window=int(g("spread_max_starts_per_window", 0) or 0),
             max_output_tracks=int(g("track_max_output", 120) or 0),
+            # These three were missing, and their absence was invisible because every one of
+            # them defaults to "off": on the SynthEyes backend -- the default one -- the
+            # certainty gate never fired and a thin export was never backed up to the floor,
+            # whatever the artist set in the UI.
+            min_export_tracks=int(g("min_export_tracks", 40) or 0),
+            min_track_certainty=float(g("min_track_certainty", 0.0) or 0.0),
+            certainty_rel=float(g("certainty_rel", 0.80) or 0.0),
         )
 
 
@@ -306,7 +313,7 @@ def select_spread(candidates: List[dict], cfg, out_width: int = 0,
 
 
 def defragment(tracks: Dict[str, Track], cfg,
-               log: Optional[Callable] = None) -> Dict[str, Track]:
+               log: Optional[Callable] = None, registry=None) -> Dict[str, Track]:
     """Split heavily-broken tracks into their continuous runs.
 
     Occlusion continuity deliberately lets a track survive a crossing by carrying a HOLE, so
@@ -374,7 +381,10 @@ def defragment(tracks: Dict[str, Track], cfg,
             continue
         n_split += 1
         for k, r in enumerate(keep_runs):
-            out[tid if k == 0 else f"{tid}_f{k}"] = r
+            new_id = tid if k == 0 else f"{tid}_f{k}"
+            if registry is not None and new_id != tid:
+                registry.derive(tid, new_id)   # the runs are all the same feature
+            out[new_id] = r
 
     if n_split or n_dropped:
         _log(f"  defragment: {n_split} track(s) were breaking up repeatedly -> split into "
@@ -418,7 +428,7 @@ def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
 def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, float],
                       T: int, width: int, height: int, cfg,
                       wobble_fn: Optional[Callable] = None,
-                      weak: Optional[set] = None) -> str:
+                      weak: Optional[set] = None, registry=None) -> str:
     """Write a per-track CSV: length, score, certainty, wobble amplitude and period.
 
     Several rounds of tracking fixes have been judged by eye on real footage and by
@@ -429,7 +439,12 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
     try:
         diag = math.hypot(float(width or 0), float(height or 0)) or 1000.0
         weak = weak or set()
-        rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y,weak"]
+        # The per-track columns are appended, never inserted: anything already reading this
+        # file by column index keeps working.
+        extra = ["kind", "patch_px", "motion", "sam_obj", "depth_class", "risk",
+                 "escalation", "geo_residual"] if registry is not None else []
+        rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y,weak"
+                + ("," + ",".join(extra) if extra else "")]
         for tid, pts in sorted(tracks.items()):
             p = sorted(pts, key=lambda q: q[0])
             if not p:
@@ -441,8 +456,12 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
             amp, per = wobble_fn(p) if wobble_fn else (float("nan"), 0)
             mx = sum(q[1] for q in p) / n
             my = sum(q[2] for q in p) / n
-            rows.append(f"{tid},{n},{span},{sc:.4f},{ct:.4f},{amp:.4f},{per},"
-                        f"{mx:.1f},{my:.1f},{1 if tid in weak else 0}")
+            row = (f"{tid},{n},{span},{sc:.4f},{ct:.4f},{amp:.4f},{per},"
+                   f"{mx:.1f},{my:.1f},{1 if tid in weak else 0}")
+            if extra:
+                m = registry.row(tid)
+                row += "," + ",".join(str(m.get(c, "")) for c in extra)
+            rows.append(row)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(rows) + "\n")

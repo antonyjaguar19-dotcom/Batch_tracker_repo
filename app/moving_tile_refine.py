@@ -167,7 +167,7 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
 
 def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,
                        total_frames: int, engine, cfg, status: StatusCB = None,
-                       src: "FrameSource | None" = None
+                       src: "FrameSource | None" = None, registry=None
                        ) -> Tuple[Dict[str, Track], str]:
     """Native moving-tile re-track of already-selected tracks (before pattern_refine).
 
@@ -221,13 +221,34 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
 
     out: Dict[str, Track] = {}
     moved = 0
+    shortened = 0
     for name, tr in final_tracks.items():
         pts = sorted(tr, key=lambda t: t[0])
         frs = np.array([int(p[0]) for p in pts], dtype=int)
         xs = np.array([float(p[1]) for p in pts], dtype=float)
         ys = np.array([(float(H0 - 1) - float(p[2])) if flip else float(p[2]) for p in pts], dtype=float)
-        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, win, edge_margin, edge_track,
-                               overlap=overlap)
+
+        # Per-track window. These four were read once for the whole shot, so a point crossing
+        # the frame and a point sitting still got the same 16-frame tile. The window only has
+        # to end before the guide reaches the tile edge -- _retrack_one breaks out there
+        # anyway -- so sizing it from THIS track's own speed keeps fast points inside the
+        # tile instead of relying on that break, and leaves slow points long (fewer seams,
+        # and the seam beat is what the wobble report keeps finding at mt_window).
+        tcfg = registry.view(name, cfg) if registry is not None else cfg
+        t_win = int(getattr(tcfg, "mt_window", win) or win)
+        t_overlap = max(0, min(int(getattr(tcfg, "mt_overlap", overlap) or 0), max(0, t_win - 2)))
+        t_margin = int(getattr(tcfg, "mt_edge_margin", edge_margin) or edge_margin)
+        if registry is not None and len(frs) >= 3:
+            step = np.hypot(np.diff(xs), np.diff(ys)) / np.maximum(1.0, np.diff(frs))
+            speed = float(np.median(step))
+            reach = float(_TILE // 2 - t_margin)
+            if speed > 0.0 and reach > 0.0 and speed * t_win > reach:
+                t_win = max(4, min(t_win, int(reach / speed)))
+                t_overlap = max(0, min(t_overlap, t_win - 2))
+                shortened += 1
+
+        refined = _retrack_one(frs, xs, ys, src, engine, W0, H0, t_win, t_margin, edge_track,
+                               overlap=t_overlap)
         new_tr: Track = []
         any_moved = False
         for k in range(len(frs)):
@@ -241,4 +262,7 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         if any_moved:
             moved += 1
 
-    return out, f"retracked={len(out)} moved={moved}"
+    info = f"retracked={len(out)} moved={moved}"
+    if shortened:
+        info += f" window-shortened={shortened} (fast tracks)"
+    return out, info

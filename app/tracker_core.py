@@ -6,7 +6,7 @@ import gc
 import time
 import math
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Dict, List, Tuple
 
 import numpy as np
@@ -17,6 +17,8 @@ from app.video_io import read_video_frames_bgr_scaled, FrameSource, estimate_cli
 from app.tapnext_engine import TapNextEngine
 from app.export_3de import write_tracks_txt
 from app import track_filter as _tf
+from app.track_meta import (SeedFeat, SeedStats, TrackMeta, TrackRegistry,
+                            classify_seed, policy_for)
 
 StatusCB = Optional[Callable[[str], None]]
 
@@ -237,6 +239,14 @@ class RunnerConfig:
     template_frames: int = 5      # frames averaged into the reference pattern (1 = old)
     refine_iterations: int = 3    # match -> polish -> re-match passes per frame (1 = old)
     refine_min_len: int = 8         # drop a refined track shorter than this many frames
+    # Per-track policy. Everything above is ONE setting applied to every point in the shot,
+    # so the crisp corner on a bolt head and the soft blob on a wall get the same 31px box,
+    # the same translation-only motion and the same NCC bars -- and those two features want
+    # opposite settings. With this on, each seed is measured (structure tensor, its own
+    # scale, rival density) and tracked with parameters chosen for what it actually is.
+    # Off by default so one binary produces baseline and treatment on the same footage in
+    # the same run. See app/track_meta.py and tools/eval_refs.py.
+    per_track_policy: bool = False
 
     # --- Re-acquisition after an occlusion --------------------------------------------
     # A lost lock used to END that side of the track, which is how points were lost to
@@ -313,6 +323,11 @@ class BatchTrackerRunner:
         # VRAM auto-sizing: bytes of CUDA peak per (frame*Hs*Ws); measured after first chunk.
         self._cal = None
         self._MEM_PER_FPX_DEFAULT = 50.0  # conservative until calibrated
+        # Per-track metadata (app/track_meta.py). _pass_seeds holds one (SeedFeat, kind) per
+        # query row, keyed by pass name, until _merge_filter_export turns the surviving
+        # columns into registry entries. Both are reset per shot in _run_impl.
+        self._pass_seeds: Dict[str, List[Tuple[SeedFeat, str]]] = {}
+        self.registry = TrackRegistry(enabled=bool(getattr(cfg, "per_track_policy", False)))
 
     def _resolve_frame_range(self, total: int) -> tuple[int, int]:
         """Return (fs, fe) 0-based half-open slice bounds from cfg.frame_start/end (1-based incl)."""
@@ -597,8 +612,73 @@ class BatchTrackerRunner:
         extra = f" | margin={margin}px ({before:.1f}%->{incl_pct:.1f}%)" if margin > 0 else ""
         return incl, f"{info} | mode={mode} | seed_region={incl_pct:.1f}%{extra}", n_masks
 
-    def _drop_edge_points(self, gray: np.ndarray, pts: np.ndarray) -> np.ndarray:
-        """Drop seeds sitting on 1-D features (aperture problem).
+    # Block sizes probed to find a feature's own size. The one whose corner response peaks is
+    # the scale the feature actually lives at, which is what should be setting its pattern box
+    # -- today one refine_patch_px is applied to a hairline corner and a soft blob alike.
+    _SCALE_BLOCKS = (3, 5, 9, 15)
+
+    def _seed_measurements(self, gray: np.ndarray, pts: np.ndarray,
+                           lmin: np.ndarray, lmax: np.ndarray,
+                           eig: np.ndarray) -> Tuple[List[SeedFeat], SeedStats]:
+        """Measure what each surviving seed is sitting on.
+
+        The eigenvalues are already in hand from the aperture test; this adds the three
+        things that test does not need but a per-track policy does: the feature's own scale,
+        how many near-identical rivals surround it, and its local contrast. Every threshold
+        derived here is a percentile of THIS frame, never an absolute -- an absolute
+        cornerness bar does not survive a change of exposure, codec or plate.
+        """
+        h, w = gray.shape[:2]
+        xi = np.clip(np.rint(pts[:, 0]).astype(np.int32), 0, w - 1)
+        yi = np.clip(np.rint(pts[:, 1]).astype(np.int32), 0, h - 1)
+
+        # Eigenvector angle: which direction an edge-like feature is UNCONSTRAINED in.
+        theta = np.arctan2(eig[yi, xi, 3], eig[yi, xi, 2])
+
+        # Scale: response at each probe block size, take the argmax per seed.
+        resp = np.stack([cv2.cornerMinEigenVal(gray, blockSize=b, ksize=3)[yi, xi]
+                         for b in self._SCALE_BLOCKS], axis=1)
+        scale_px = np.asarray(self._SCALE_BLOCKS, dtype=np.float32)[np.argmax(resp, axis=1)]
+
+        # Density of rivals: repetitive detail (bolts, rivets, window grids, tiles) is where
+        # NCC quietly snaps to the identical feature next door, so it needs measuring, not
+        # assuming. One box filter over a strong-corner mask, sampled at the seeds.
+        #
+        # The bar has to be high. Most of a plate is flat, so the cornerness map is mostly
+        # zeros and every percentile up to ~P95 IS zero -- a bar below that marks the whole
+        # frame "strong" and every seed comes back saturated at 1.0, which is no measurement
+        # at all. At P99 a rivet grid reads ~5x an isolated corner, which is the signal.
+        lmin_map = np.minimum(np.abs(eig[:, :, 0]), np.abs(eig[:, :, 1]))
+        thr = float(np.percentile(lmin_map, 99.0))
+        if thr <= 0.0:
+            thr = float(lmin_map.max()) * 0.05
+        strong = (lmin_map >= max(thr, 1e-12)).astype(np.float32)
+        density = cv2.boxFilter(strong, -1, (65, 65), normalize=True)[yi, xi]
+
+        # Local contrast, to guard the near-zero-variance patch NCC cannot use at all.
+        g32 = gray.astype(np.float32)
+        m = cv2.boxFilter(g32, -1, (33, 33), normalize=True)
+        m2 = cv2.boxFilter(g32 * g32, -1, (33, 33), normalize=True)
+        contrast = np.sqrt(np.maximum(0.0, m2 - m * m))[yi, xi]
+
+        stats = SeedStats(
+            lmin_p25=float(np.percentile(lmin, 25.0)) if lmin.size else 0.0,
+            lmin_p75=float(np.percentile(lmin, 75.0)) if lmin.size else 0.0,
+            density_p90=float(np.percentile(density, 90.0)) if density.size else 1.0,
+            scale_med=float(np.median(scale_px)) if scale_px.size else 0.0,
+        )
+        ratio = np.divide(lmin, lmax, out=np.zeros_like(lmax), where=lmax > 1e-12)
+        feats = [
+            SeedFeat(lmin=float(lmin[i]), lmax=float(lmax[i]), aniso=float(ratio[i]),
+                     theta=float(theta[i]), scale_px=float(scale_px[i]),
+                     local_density=float(density[i]), local_contrast=float(contrast[i]))
+            for i in range(pts.shape[0])
+        ]
+        return feats, stats
+
+    def _drop_edge_points(self, gray: np.ndarray, pts: np.ndarray
+                          ) -> Tuple[np.ndarray, List[SeedFeat], SeedStats]:
+        """Drop seeds sitting on 1-D features (aperture problem), and measure the survivors.
 
         A point on an edge -- a rope, a plate line, the border of a TV screen -- can only be
         localized ACROSS the edge, never ALONG it, so the NCC refine finds a response ridge
@@ -606,10 +686,15 @@ class BatchTrackerRunner:
         eigenvalue RATIO (lambda_min / lambda_max) measures exactly that: ~1 for a corner, ~0
         for a pure edge. It is contrast-invariant, so unlike goodFeaturesToTrack's relative
         qualityLevel it does not also discard faint-but-real corners.
+
+        The eigenvalues used to be reduced to that keep/drop boolean and thrown away. They
+        are the beginning of knowing what each track is sitting on, so they now come back
+        with the points (see _seed_measurements and app/track_meta.py).
         """
         thr = float(getattr(self.cfg, "min_corner_anisotropy", 0.0) or 0.0)
-        if thr <= 0.0 or pts.shape[0] == 0:
-            return pts
+        want_feats = bool(getattr(self.cfg, "per_track_policy", False))
+        if (thr <= 0.0 and not want_feats) or pts.shape[0] == 0:
+            return pts, [], SeedStats()
         # 6 channels: l1, l2, and the two eigenvectors. blockSize matches goodFeaturesToTrack.
         eig = cv2.cornerEigenValsAndVecs(gray, blockSize=5, ksize=3)
         h, w = gray.shape[:2]
@@ -619,13 +704,18 @@ class BatchTrackerRunner:
         l2 = eig[yi, xi, 1]
         lmax = np.maximum(np.abs(l1), np.abs(l2))
         lmin = np.minimum(np.abs(l1), np.abs(l2))
-        ratio = np.divide(lmin, lmax, out=np.zeros_like(lmax), where=lmax > 1e-12)
-        keep = ratio >= thr
-        n_drop = int(pts.shape[0] - np.sum(keep))
-        if n_drop:
-            self._status(f"  seeds: dropped {n_drop}/{pts.shape[0]} edge-like point(s) "
-                         f"(anisotropy < {thr:.2f}) - these slide along edges")
-        return pts[keep]
+        if thr > 0.0:
+            ratio = np.divide(lmin, lmax, out=np.zeros_like(lmax), where=lmax > 1e-12)
+            keep = ratio >= thr
+            n_drop = int(pts.shape[0] - np.sum(keep))
+            if n_drop:
+                self._status(f"  seeds: dropped {n_drop}/{pts.shape[0]} edge-like point(s) "
+                             f"(anisotropy < {thr:.2f}) - these slide along edges")
+            pts, lmin, lmax = pts[keep], lmin[keep], lmax[keep]
+        if not want_feats or pts.shape[0] == 0:
+            return pts, [], SeedStats()
+        feats, stats = self._seed_measurements(gray, pts, lmin, lmax, eig)
+        return pts, feats, stats
 
     def _stagger_offsets(self, n_frames: int) -> List[int]:
         """Frame offsets within a block at which fresh seeds should enter.
@@ -645,13 +735,18 @@ class BatchTrackerRunner:
         return sorted({min(n_frames - 2, int(round(i * step))) for i in range(k)})
 
     def _staggered_queries(self, frames: np.ndarray, seed_mask, total: int,
-                           n_frames: int) -> np.ndarray | None:
+                           n_frames: int) -> Tuple[Optional[np.ndarray], List[Tuple[SeedFeat, str]]]:
         """Build a (1,N,3) TAPNext query array whose seeds ENTER at staggered times.
 
         The per-offset budget is `total` split across the offsets, so staggering redistributes
         the same seed budget over time instead of multiplying it. Each batch detects features
         on the frame it actually enters on, so it seeds what is visible THERE -- content that
         only appears mid-window now gets tracked, which seeding frame 0 alone could never do.
+
+        Also returns one (SeedFeat, kind) per query row, in the same order. Classification
+        happens HERE because it is relative to the detection frame's own distribution, which
+        is only in hand at this point; the policy those classes imply is decided later, where
+        the proxy-to-plate scale factor is known (see _merge_filter_export).
         """
         offsets = self._stagger_offsets(int(n_frames))
         # The SHOT's seed budget is authoritative, not the per-round one. Each round runs its
@@ -667,6 +762,8 @@ class BatchTrackerRunner:
         # is the whole reason to seed mid-window.
         taken = None
         rad = max(2, int(self.cfg.min_feature_dist) or 2)
+        min_aniso = float(getattr(self.cfg, "min_corner_anisotropy", 0.0) or 0.0)
+        seeds: List[Tuple[SeedFeat, str]] = []
         for oi, off in enumerate(offsets):
             if off >= frames.shape[0] or remaining <= 0:
                 continue
@@ -675,15 +772,22 @@ class BatchTrackerRunner:
             m = seed_mask
             if taken is not None:
                 m = (~taken) if seed_mask is None else (seed_mask & ~taken)
-            pts = self._detect_features(
+            pts, feats, stats = self._detect_features(
                 frames[off], mask=m, count=per,
                 quality=self.cfg.feature_quality, min_dist=self.cfg.min_feature_dist,
             )
             if pts.shape[0] > remaining:
-                pts = pts[:remaining]
+                pts, feats = pts[:remaining], feats[:remaining]
             if pts.shape[0] == 0:
                 continue
             remaining -= int(pts.shape[0])
+            # Pad rather than skip when measurement is off: the seeds list must stay index-
+            # aligned with the query rows, or every track downstream inherits its neighbour's
+            # policy -- a silent, plausible-looking wrong answer.
+            if len(feats) == pts.shape[0]:
+                seeds.extend((f, classify_seed(f, stats, min_aniso)) for f in feats)
+            else:
+                seeds.extend((SeedFeat(), "") for _ in range(pts.shape[0]))
             if taken is None:
                 taken = np.zeros(frames.shape[1:3], dtype=bool)
             claim = taken.astype(np.uint8)
@@ -696,11 +800,12 @@ class BatchTrackerRunner:
             q[:, 2] = pts[:, 1]
             rows.append(q)
         if not rows:
-            return None
-        return np.concatenate(rows, axis=0)[None]
+            return None, []
+        return np.concatenate(rows, axis=0)[None], seeds
 
     def _detect_features(self, first_frame_bgr: np.ndarray, mask: np.ndarray | None,
-                         count: int, quality: float, min_dist: int) -> np.ndarray:
+                         count: int, quality: float, min_dist: int
+                         ) -> Tuple[np.ndarray, List[SeedFeat], SeedStats]:
         gray = cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2GRAY)
         m_uint8 = None
         if mask is not None:
@@ -715,7 +820,7 @@ class BatchTrackerRunner:
             blockSize=5
         )
         if pts is None or len(pts) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
+            return np.zeros((0, 2), dtype=np.float32), [], SeedStats()
         return self._drop_edge_points(gray, pts.reshape(-1, 2).astype(np.float32))
 
     def _apply_per_frame_mask_gating(
@@ -889,14 +994,22 @@ class BatchTrackerRunner:
             return empty_xy, empty_vis, empty_gate, f"[{pass_name}] Skipped (Segment < 2 frames)"
         
         # 1. SEEDING
+        seeds: List[Tuple[SeedFeat, str]] = []
         if self.cfg.seeding_mode == "features":
-            q = self._staggered_queries(frames, seed_mask, self.cfg.max_tracks, T_seg)
+            q, seeds = self._staggered_queries(frames, seed_mask, self.cfg.max_tracks, T_seg)
             if q is None or q.shape[1] < 5:
+                # Grid fallback seeds on its own rules, so the measured features describe
+                # points that are not being tracked. Drop them rather than mis-attribute.
+                seeds = []
                 tracks_xy, vis = engine.track_grid(frames, grid_size=int(self.cfg.grid_size), segm_mask=seed_mask)
             else:
                 tracks_xy, vis = engine.track_queries(frames, q)
         else:
             tracks_xy, vis = engine.track_grid(frames, grid_size=int(self.cfg.grid_size), segm_mask=seed_mask)
+        # Query row order is the track column order all the way to _merge_filter_export, so
+        # the seed a column came from is its index -- no matching needed. Keyed by pass name
+        # because the (xy, vis, gate) tuple those columns travel in is deliberately unchanged.
+        self._pass_seeds[pass_name] = seeds
             
         N = int(tracks_xy.shape[1])
         
@@ -975,6 +1088,14 @@ class BatchTrackerRunner:
             win = max(1, int(self.cfg.smooth_window or 1))
             if win % 2 == 0: win += 1
 
+            # Seeds were measured on the tracked proxy; the pattern box they imply is applied
+            # by pattern_refine at NATIVE resolution. Carry the same factor the coordinates
+            # just took, or a 4K plate tracked at half res gets boxes half the size it needs.
+            pass_seeds = self._pass_seeds.get(p_name, [])
+            px_scale = float(inv)
+            if ow > 0 and W0 > 0:
+                px_scale *= ow / float(W0)
+
             for j in kept_idx.tolist():
                 xs, ys = x_all[:, j].copy(), y_all[:, j].copy()
                 if win > 1:
@@ -1001,6 +1122,16 @@ class BatchTrackerRunner:
                         "mean": (sx / n, sy / n),
                         "score": self._track_quality_score(valid_pts, T, diag),
                     })
+                    if self.registry.enabled and j < len(pass_seeds):
+                        feat, kind = pass_seeds[j]
+                        if kind and kind != "flat":
+                            feat = replace(feat, scale_px=feat.scale_px * px_scale)
+                            self.registry.register(out_id, TrackMeta(
+                                seed_frame=valid_pts[0][0],
+                                seed_xy=(valid_pts[0][1], valid_pts[0][2]),
+                                pass_name=p_name, feat=feat, kind=kind,
+                                policy=policy_for(kind, feat, self.cfg),
+                            ))
                 else:
                     diag_short += 1
 
@@ -1253,9 +1384,16 @@ class BatchTrackerRunner:
         `fetch_block(proc_start, proc_count)` returns BGR frames already in processing order.
         Tracks that survive a window's overlap region are carried as queries into the next
         window, KEEPING their global id -> continuous tracks across seams. Returns
-        store: {gid: {order_idx: (x_orig, y_orig)}} (order_idx = index in processing order).
+        (store, feats_by_gid) where store is {gid: {order_idx: (x_orig, y_orig)}}
+        (order_idx = index in processing order).
+
+        feats_by_gid matters more than it looks: re-seeding is on by default, so this is the
+        path most real shots take. Here columns are keyed by global id rather than by query
+        row, so without carrying the seed measurements alongside them the per-track policy
+        would quietly apply to nothing on production footage.
         """
         store: Dict[int, Dict[int, Tuple[float, float]]] = {}
+        feats_by_gid: Dict[int, Tuple[SeedFeat, str]] = {}
         next_gid = 0
         carry: Dict[int, Tuple[float, float]] = {}
 
@@ -1301,10 +1439,19 @@ class BatchTrackerRunner:
                 # seed on its first frame -- that is what made tracks arrive in bulk every
                 # reseed_every frames. The budget is split across the offsets, so this
                 # redistributes seeds over time rather than adding more of them.
-                fresh_q = self._staggered_queries(blk, seed_mask, fresh_cap, int(blk.shape[0]))
+                fresh_q, fresh_seeds = self._staggered_queries(
+                    blk, seed_mask, fresh_cap, int(blk.shape[0]))
                 if fresh_q is not None:
-                    for (qt, px, py) in fresh_q[0]:
+                    # Seeds were measured at this window's working resolution, which an OOM
+                    # retry may have shrunk. Put the scale into ORIGINAL pixels here, while
+                    # the factor for THIS window is still in hand.
+                    seed_scale = W0 / float(cur_Ws) if cur_Ws > 0 else 1.0
+                    for qi, (qt, px, py) in enumerate(fresh_q[0]):
                         q_list.append((float(qt), float(px), float(py)))
+                        if qi < len(fresh_seeds):
+                            f, kind = fresh_seeds[qi]
+                            feats_by_gid[next_gid] = (
+                                replace(f, scale_px=f.scale_px * seed_scale), kind)
                         gid_list.append(next_gid); next_gid += 1
 
                 if not q_list:
@@ -1349,10 +1496,13 @@ class BatchTrackerRunner:
                         if tvis[tb_at, qi]:
                             carry[gid] = (float(txy[tb_at, qi, 0]) * ox, float(txy[tb_at, qi, 1]) * oy)
 
-        return store
+        return store, feats_by_gid
 
     @staticmethod
-    def _assemble(store: Dict[int, Dict[int, Tuple[float, float]]], T: int, to_local) -> Tuple[np.ndarray, np.ndarray]:
+    def _assemble(store: Dict[int, Dict[int, Tuple[float, float]]], T: int, to_local
+                  ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+        """Returns (xy, vis, cols); cols[i] is the global id of column i, which is what lets
+        a caller line the per-seed measurements back up with the assembled columns."""
         cols = [gid for gid, d in store.items() if len(d) >= 1]
         N = len(cols)
         xy = np.zeros((T, N, 2), dtype=np.float32)
@@ -1362,7 +1512,7 @@ class BatchTrackerRunner:
                 t = to_local(oidx)
                 if 0 <= t < T:
                     xy[t, ci, 0] = x; xy[t, ci, 1] = y; vis[t, ci] = True
-        return xy, vis
+        return xy, vis, cols
 
     def _track_chunked(self, engine, source: FrameSource, shot: str, fs0: int, T: int,
                        n_chunks: int, W0: int, H0: int, base_Ws: int, base_Hs: int):
@@ -1379,17 +1529,27 @@ class BatchTrackerRunner:
             k += 1
 
         passes = []
+
+        def _seeds_for(cols: List[int], feats: Dict[int, Tuple[SeedFeat, str]]
+                       ) -> List[Tuple[SeedFeat, str]]:
+            # One entry per assembled column, in column order -- an unmeasured carried point
+            # gets a blank rather than being skipped, so the list can never slip out of step
+            # and hand a track its neighbour's policy.
+            return [feats.get(g, (SeedFeat(), "")) for g in cols]
+
         # Forward
         fwd_fetch = lambda ps, pc: source.get(fs0 + ps, pc)
-        store_f = self._chain_core(engine, fwd_fetch, shot, T, windows, W0, H0, base_Ws, base_Hs)
-        fxy, fvis = self._assemble(store_f, T, lambda o: o)
+        store_f, feats_f = self._chain_core(engine, fwd_fetch, shot, T, windows, W0, H0, base_Ws, base_Hs)
+        fxy, fvis, cols_f = self._assemble(store_f, T, lambda o: o)
+        self._pass_seeds["FWD"] = _seeds_for(cols_f, feats_f)
         passes.append(("FWD", fxy, fvis, self._gate_assembled(shot, fxy, fvis, W0, H0, T)))
 
         # Backward (reverse processing order: proc frame o -> actual local (T-1-o))
         if self.cfg.bidirectional and not self._stop.is_set():
             rev_fetch = lambda ps, pc: source.get(fs0 + (T - (ps + pc)), pc)[::-1].copy()
-            store_b = self._chain_core(engine, rev_fetch, shot, T, windows, W0, H0, base_Ws, base_Hs)
-            bxy, bvis = self._assemble(store_b, T, lambda o: (T - 1 - o))
+            store_b, feats_b = self._chain_core(engine, rev_fetch, shot, T, windows, W0, H0, base_Ws, base_Hs)
+            bxy, bvis, cols_b = self._assemble(store_b, T, lambda o: (T - 1 - o))
+            self._pass_seeds["BWD"] = _seeds_for(cols_b, feats_b)
             passes.append(("BWD", bxy, bvis, self._gate_assembled(shot, bxy, bvis, W0, H0, T)))
 
         return passes
@@ -1421,6 +1581,11 @@ class BatchTrackerRunner:
             in_path = self.cfg.sequence_path if seq_mode else os.path.join(self.cfg.input_dir, fn)
             shot = fn if seq_mode else os.path.splitext(fn)[0]
             scale = self._scale_for(fn)
+            # Per-track metadata is per shot: ids repeat across shots (FWD_0001 every time),
+            # so carrying a registry over would hand shot 2 shot 1's measurements.
+            self._pass_seeds = {}
+            self.registry = TrackRegistry(
+                enabled=bool(getattr(self.cfg, "per_track_policy", False)))
 
             try:
                 # Decide host-RAM streaming (auto: only when a full decode would be too big).
@@ -1649,7 +1814,8 @@ class BatchTrackerRunner:
                         self._status(f"[{i}/{len(vids)}] Moving-tile native re-track at {W0}x{H0}...")
                         final_tracks_out, minfo = moving_tile_refine(
                             final_tracks_out, in_path, W0, H0, orig_total, engine, self.cfg,
-                            status=lambda m: self._status(f"TRACK: {m}"), src=refine_src)
+                            status=lambda m: self._status(f"TRACK: {m}"), src=refine_src,
+                            registry=(self.registry if self.registry.enabled else None))
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] MOVINGTILE {shot}: {minfo}")
                     except Exception as e:
                         self._status(f"[{i}/{len(vids)}] Moving-tile skipped: {e}")
@@ -1660,9 +1826,11 @@ class BatchTrackerRunner:
                     try:
                         from app.pattern_refine import refine_tracks
                         self._status(f"[{i}/{len(vids)}] Pattern-refine (NCC/{self.cfg.refine_motion}) at {W0}x{H0}...")
+                        _reg = self.registry if self.registry.enabled else None
                         final_tracks_out, rinfo = refine_tracks(
                             final_tracks_out, in_path, W0, H0, orig_total, self.cfg,
-                            status=lambda m: self._status(f"TRACK: {m}"), bgr_source=refine_src)
+                            status=lambda m: self._status(f"TRACK: {m}"), bgr_source=refine_src,
+                            registry=_reg)
                         # Certainty is only known once refine has measured the correlation
                         # peaks, so this gate cannot live with the others before it.
                         _certs = getattr(refine_tracks, "last_certainty", {}) or {}
@@ -1678,8 +1846,10 @@ class BatchTrackerRunner:
                         # of holes, which blinks on and off in the 3DE viewport. Cut those
                         # into continuous runs; genuine occlusion gaps stay.
                         final_tracks_out = _tf.defragment(final_tracks_out, self.cfg,
-                                                          log=self._status)
+                                                          log=self._status, registry=_reg)
                         total_kept = len(final_tracks_out)
+                        if _reg is not None:
+                            self._status(f"  {_reg.summary()}")
                         self._append_log(txt_log, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] REFINE {shot}: {rinfo}")
                     except Exception as e:
                         self._status(f"[{i}/{len(vids)}] Pattern-refine skipped: {e}")
@@ -1697,9 +1867,14 @@ class BatchTrackerRunner:
                         got = _tf.dump_track_report(
                             rep, final_tracks_out, getattr(_rt, "last_certainty", {}) or {},
                             T, W0, H0, self.cfg, wobble_fn=measure_wobble,
-                            weak=locals().get("_weak_ids") or set())
+                            weak=locals().get("_weak_ids") or set(),
+                            registry=(self.registry if self.registry.enabled else None))
                         if got:
                             self._status(f"[{i}/{len(vids)}] Track report -> {os.path.basename(got)}")
+                        # Full records beside the CSV: the CSV is for reading, this is for
+                        # analysing a whole batch offline once the columns raise a question.
+                        if self.registry.enabled:
+                            self.registry.dump(rep[:-len("__trackreport.csv")] + "__trackmeta.json")
                     except Exception as e:
                         self._status(f"[{i}/{len(vids)}] Track report skipped: {e}")
 

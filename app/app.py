@@ -1150,6 +1150,12 @@ class AppState:
     # Anything the user explicitly moves is recorded in auto_tune_overrides and always wins.
     auto_tune: bool = True
     auto_tune_overrides: Dict[str, object] = field(default_factory=dict)
+    # Per-track policy: measure what each seed is sitting on (corner / blob / edge / dense)
+    # and track it with parameters chosen for that, instead of one setting for the whole
+    # shot. Off by default so the same binary produces baseline and treatment on identical
+    # footage -- see app/track_meta.py and tools/eval_refs.py. TAPNext backend only:
+    # SynthEyes blips and peels internally, so there is no per-point loop to steer there.
+    per_track_policy: bool = False
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
@@ -2199,6 +2205,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 # Analyze, and previously used for nothing but a table cell) cross-check it.
                 auto_tune=bool(getattr(state, "auto_tune", True)),
                 auto_tune_overrides=dict(getattr(state, "auto_tune_overrides", {}) or {}),
+                per_track_policy=bool(getattr(state, "per_track_policy", False)),
                 quality_flags=list(getattr(data, "quality_flags", []) or []),
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.

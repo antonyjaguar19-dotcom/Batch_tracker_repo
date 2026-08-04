@@ -1,0 +1,36 @@
+{
+  "_note": "Locked baseline for the per-track policy work. If eval_refs stops reproducing these numbers, the code or the settings have drifted and nothing measured afterwards is comparable. Rename this folder to the real shot name.",
+
+  "code": {
+    "tag": "baseline-pre-per-track",
+    "commit_before_backup": "0c9ac71",
+    "branch_work_started_on": "ui/layout-refresh"
+  },
+
+  "settings": {
+    "track_backend": "tapnext",
+    "note": "RunnerConfig defaults at the tag above, auto_tune on. Fill in any UI knob that was moved off its default for this run - without that this file cannot tell code drift from settings drift.",
+    "refine_patch_px": 31,
+    "refine_motion": "translation",
+    "template_frames": 5,
+    "enable_moving_tile": true,
+    "enable_pattern_refine": true
+  },
+
+  "expected": {
+    "658": {
+      "class": "corner",
+      "mean_err": 7.00,
+      "first_step_loss": 4.18,
+      "fast_ratio": 0.94,
+      "slow_ratio": 1.22,
+      "jerk_ratio": 1.36
+    }
+  },
+
+  "acceptance": {
+    "phase1": "mean_err AND first_step_loss must fall on every class row, not just the average.",
+    "blocks": "slow_ratio rising ABOVE its own baseline on any row means wobble was added; jerk_ratio rising above its baseline; first_step_loss flat means the seed-to-policy mapping is wrong.",
+    "reading_the_baseline": "fast 0.94 under-shoots fast motion and slow 1.22 over-shoots slow motion. Together that is the position being pulled toward where the point WAS instead of measured fresh (compare_tracks.py:17-19), and the 1.22 is the visible wobble. Per-track search radius and motion model target exactly this pair - fast should rise toward 1.00 and slow should FALL toward 1.00. Judge against these numbers, not against 1.00 as a pass mark."
+  }
+}

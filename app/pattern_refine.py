@@ -937,7 +937,7 @@ class _GrayFromBGR:
 
 def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,
                   total_frames: int, cfg, status: StatusCB = None,
-                  bgr_source=None) -> Tuple[Dict[str, Track], str]:
+                  bgr_source=None, registry=None) -> Tuple[Dict[str, Track], str]:
     """NCC+affine pattern-refine already-selected tracks at native resolution.
 
     `final_tracks` frames are 1-based absolute; y may be flipped for 3DE
@@ -974,7 +974,12 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     certainty: Dict[str, float] = {}
     trimmed = dropped = split = gapped = 0
     for name, tr in final_tracks.items():
-        pieces = _refine_one_multi(to_img(tr), prov.get, cfg, predict)
+        # The whole per-track policy arrives through this one substitution: a view of the
+        # shot config carrying this track's overrides, or the shot config ITSELF when it has
+        # none. Nothing inside _refine_segment changes -- it already reads every parameter
+        # off cfg, so handing it a different cfg is all that per-track adaptation needs.
+        tcfg = registry.view(name, cfg) if registry is not None else cfg
+        pieces = _refine_one_multi(to_img(tr), prov.get, tcfg, predict)
         cert = float(_CERTAINTY.get("v", 0.0))
         if not pieces:
             dropped += 1
@@ -992,6 +997,8 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             # Only a piece that failed verification gets a new id; the first keeps the
             # original name so downstream naming is unchanged for the common case.
             tid = name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"
+            if registry is not None and tid != name:
+                registry.derive(name, tid)   # same feature, so it keeps the same policy
             out[tid] = to_out(piece)
             certainty[tid] = cert
 
