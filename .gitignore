@@ -17,3 +17,6 @@ _batches/
 
 # Local rollback copies (same content is already in git history)
 backup/
+
+# Generated bench shots (rendered frames + exports; rebuilt by bench/make_synth.py)
+bench/synth/
