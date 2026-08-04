@@ -148,14 +148,21 @@ the GPU until its `finally`.
 - **`app/shot_profile.py`** — measures each plate (sharpness, grain, texture, motion) and
   derives the shot's parameters (`auto_tune`, on by default). Anything the user explicitly
   set is recorded in `auto_tune_overrides` and always wins.
-- **`app/track_meta.py`** — per-track policy (`per_track_policy`, **off by default**, TAPNext
+- **`app/track_meta.py`** — per-track policy (`per_track_policy`, **on by default**, TAPNext
   only). Classifies each seed (corner/blob/edge/dense) and hands `_refine_segment` a
   read-through `_TrackCfg` view with per-track overrides. With no overrides `view()`
-  returns the shot config *object itself*, so the feature-off path is byte-identical to the
-  old one — that property is what lets one binary produce both baseline and treatment on
-  identical footage for `eval_refs`. `TrackRegistry` must follow ids through both split
-  sites (refine split `_b`.., defragment split `_f1`..) or every track gets its
-  neighbour's settings.
+  returns the shot config *object itself*, so setting it False is byte-identical to the
+  old single-setting path — that property is what lets one binary produce both baseline and
+  treatment on identical footage for `eval_refs`. `TrackRegistry` must follow ids through
+  both split sites (refine split `_b`.., defragment split `_f1`..) or every track gets its
+  neighbour's settings. It exists because one shot-wide setting has no right answer on a
+  plate that is sharp in one region and defocused in another.
+- **Track span**: `track_filter.stitch_passes` rejoins partial tracks of the same feature
+  across passes *before* the quality gate, and `pattern_refine._extend_ends` carries the
+  outer ends further while the original anchor still locks. Both exist because a staggered
+  seed entering late covers only the tail of the shot. Extension stops at the first failed
+  frame and never enters an internal gap — that gap is an occlusion, and re-acquisition is
+  what crosses it.
 
 ## Conventions
 

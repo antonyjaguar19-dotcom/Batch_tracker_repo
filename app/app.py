@@ -1112,7 +1112,10 @@ class AppState:
     current_shot_name: str = ""
     log_history: List[str] = field(default_factory=list)
     filter_query: str = ""
-    motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
+    # CV optical-flow masking of movers (4th backstop). OFF by default: it masks anything
+    # moving independently of the camera, including objects the artist deliberately removed
+    # from Exclude, so it overrides a decision made on purpose. Opt in per shot in the UI.
+    motion_backstop: bool = False
     chunk_long_shots: bool = True  # SynthEyes: blip/peel long shots per window (avoid OOM)
     chunk_threshold: int = 1000    # frames above which SynthEyes chunks blip/peel
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
@@ -1152,10 +1155,25 @@ class AppState:
     auto_tune_overrides: Dict[str, object] = field(default_factory=dict)
     # Per-track policy: measure what each seed is sitting on (corner / blob / edge / dense)
     # and track it with parameters chosen for that, instead of one setting for the whole
-    # shot. Off by default so the same binary produces baseline and treatment on identical
-    # footage -- see app/track_meta.py and tools/eval_refs.py. TAPNext backend only:
-    # SynthEyes blips and peels internally, so there is no per-point loop to steer there.
-    per_track_policy: bool = False
+    # shot. TAPNext backend only: SynthEyes blips and peels internally, so there is no
+    # per-point loop to steer there.
+    #
+    # ON by default. A batch tool cannot be hand-tuned per shot, and a single shot-wide
+    # setting has no right answer on the plate that prompted this: a sharp subject against a
+    # fully defocused background wants a small tight box on the subject and a large one on
+    # the background, and shot_profile can only pick one. This is the layer that resolves
+    # that -- each track derives its own settings from its own seed measurements, which is
+    # what makes one configuration fit every kind of shot without a toggle to remember.
+    #
+    # Measured on bench/lab03 (A/B, per feature class): the policy engaged on every track
+    # (pattern box 31 -> 21/25) with no accuracy regression -- every class within 0.01px --
+    # and the worst track improved 0.09 -> 0.06px. The `blob` branch it exists for, which is
+    # the defocused-background case, is NOT exercised by that bench: soft seeds are rejected
+    # long before export, so no blob reaches the scored set. So this is enabled on no
+    # regression plus the design argument, not on a measured win for soft features.
+    # Set to False to reproduce the old single-setting behaviour byte-for-byte
+    # (track_meta._TrackCfg.view returns the shot config itself when a track has no overrides).
+    per_track_policy: bool = True
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True

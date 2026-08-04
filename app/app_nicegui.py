@@ -1187,10 +1187,14 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 "(Locked 100 / Slow 500 / Normal 800 / Fast 2000) and ignores this slider. "
                 "The tracking log prints the count actually used and where it came from.")
 
-            sw_motion = ui.switch("CV motion backstop", value=True,
+            # Read the default off AppState rather than hardcoding it: with a literal True here
+            # the switch re-enabled the backstop on every launch no matter what the backend
+            # default said, which is the opposite of "off by default".
+            sw_motion = ui.switch("CV motion backstop",
+                                  value=bool(getattr(state, "motion_backstop", False)),
                                   on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
-            sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
-                              "Turn OFF if it masks things you removed from Exclude.")
+            sw_motion.tooltip("OFF by default. Masks objects moving independently of the camera, including ones "
+                              "NOT in your Exclude list — turn ON only when Qwen missed a mover.")
 
             ui.label("Mask edge dilation (px · applies at Mask time)")
             mask_dilate = ui.slider(min=0, max=30, value=int(getattr(state, "mask_dilation_px", 10)), step=1).props("label-always")

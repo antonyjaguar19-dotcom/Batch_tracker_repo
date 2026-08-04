@@ -842,6 +842,101 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
     return sorted(out, key=lambda t: t[0]) or None
 
 
+def _extend_ends(piece: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
+                 edge_clamp: bool, back: bool, forward: bool) -> Track:
+    """Carry a track past its first/last point while the pattern still locks.
+
+    TAPNext only starts a track where a seed entered, and only ends it where the pass ran
+    out -- neither is a statement about the feature, which is often plainly visible for
+    frames either side. This walks outward from the ends and keeps going while the ORIGINAL
+    pattern is still found where the track's own motion says it should be.
+
+    Every rule here exists to stop the walk drifting onto something else, because an
+    extension that wanders onto a passing occluder is far worse than a short track:
+
+      * STOP at the first frame that fails -- never skip a bad frame and carry on. Skipping
+        is precisely how a point walks through an occluder and reattaches on the far side,
+        and unlike mid-track refinement there is no later evidence to correct it.
+      * match the ORIGINAL anchor only, never a re-referenced patch, so the pattern cannot
+        migrate a little per frame and end up somewhere else entirely.
+      * demand `refine_ncc_reacquire` (the "this really is the same feature" bar), not the
+        looser `lost`/`hold` used mid-track.
+      * reject an ambiguous peak (match_ambiguity_ratio), which is what stops a repetitive
+        feature -- rivets, window grids -- capturing the walk.
+      * verify each new frame backwards: find the anchor again in the previous frame starting
+        from the NEW position and require it to land back where it came from.
+      * search around where the track's own velocity predicts, and cap the total distance.
+    """
+    if not bool(getattr(cfg, "refine_extend", True)) or len(piece) < 3:
+        return piece
+    cap = int(getattr(cfg, "refine_extend_max", 48) or 0)
+    if cap <= 0:
+        return piece
+    half = int(cfg.refine_patch_px) // 2
+    ambig = float(getattr(cfg, "match_ambiguity_ratio", 1.0) or 1.0)
+    need = float(getattr(cfg, "refine_ncc_reacquire", 0.75) or 0.75)
+    fb_max = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
+    search = max(4, min(int(_adaptive_search(piece, cfg)), 24))
+
+    # Anchor on the piece's sharpest frame, cleaned the same way the refine pass cleans its
+    # reference -- a grainy template blunts every peak it is matched against.
+    best_i, best_c, best_patch = -1, -1.0, None
+    for i, (f, x, y) in enumerate(piece):
+        g = get(int(f) - 1)
+        if g is None:
+            continue
+        p = _extract(g, float(x), float(y), half)
+        if p is None:
+            continue
+        c = _contrast_score(p)
+        if c > best_c:
+            best_c, best_i, best_patch = c, i, p
+    if best_patch is None:
+        return piece
+    anchor = _build_template(piece, best_i, best_patch, get,
+                             half, int(getattr(cfg, "template_frames", 1) or 1), edge_clamp)
+
+    out = list(piece)
+    for do, direction in ((back, -1), (forward, 1)):
+        if not do:
+            continue
+        seq = out if direction > 0 else out[::-1]
+        # Velocity from the two outermost points, which is the only motion evidence there is
+        # beyond the end of the track.
+        (f1, x1, y1), (f0, x0, y0) = seq[-1], seq[-2]
+        dt = max(1, abs(int(f1) - int(f0)))
+        vx, vy = (x1 - x0) / dt, (y1 - y0) / dt
+        cf, cx, cy = int(f1), float(x1), float(y1)
+        added: Track = []
+        for _ in range(cap):
+            nf = cf + direction
+            if nf < 1:
+                break
+            g = get(nf - 1)
+            if g is None:
+                break                       # past the end of the clip
+            px, py = cx + vx * direction, cy + vy * direction
+            res = _ncc_match(g, anchor, px, py, search, half, edge_clamp, ambig)
+            if res is None or res[2] < need:
+                break                       # first failure ends it -- never skip and continue
+            nx, ny, _cc = res
+            if fb_max > 0.0:
+                gp = get(cf - 1)
+                if gp is None:
+                    break
+                bk = _ncc_match(gp, anchor, nx, ny, search, half, edge_clamp, ambig)
+                if bk is None or math.hypot(bk[0] - cx, bk[1] - cy) > fb_max:
+                    break                   # it does not lead back where it came from
+            added.append((nf, float(nx), float(ny)))
+            # Track the velocity as it goes, so a gentle acceleration is followed rather than
+            # fought, but keep matching the ORIGINAL anchor.
+            vx, vy = (nx - cx) * direction, (ny - cy) * direction
+            cf, cx, cy = nf, float(nx), float(ny)
+        if added:
+            out = (out + added) if direction > 0 else (added[::-1] + out)
+    return sorted(out, key=lambda p: p[0])
+
+
 def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
                       cfg, predict=None) -> List[Track]:
     """Refine one track into one or MORE verified pieces.
@@ -863,7 +958,9 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
         if out is None:
             return []
         out = _fb_filter(out, get, cfg, edge_clamp)
-        return [out] if len(out) >= min_len else []
+        if len(out) < min_len:
+            return []
+        return [_extend_ends(out, get, cfg, edge_clamp, back=True, forward=True)]
 
     # Gap-aware: split into contiguous VISIBLE segments (occlusion = frame number jump > 1),
     # refine each on its OWN reference patch, and reassemble under one id. A segment that
@@ -938,7 +1035,17 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
     # 0.0-versus-real chasm read as a clean bimodal split, which let the certainty gate
     # override its own max_cut rail and drop all 23. NaN says "unknown" and the gate skips it.
     _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else float("nan")
-    return [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
+    kept = [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
+    # Extend only the OUTER ends of the track. The boundaries between pieces are occlusions
+    # -- that is what split them -- and walking into one is the drift this must never do; the
+    # existing re-acquisition path is what crosses a gap, on evidence.
+    if kept:
+        if len(kept) == 1:
+            kept[0] = _extend_ends(kept[0], get, cfg, edge_clamp, back=True, forward=True)
+        else:
+            kept[0] = _extend_ends(kept[0], get, cfg, edge_clamp, back=True, forward=False)
+            kept[-1] = _extend_ends(kept[-1], get, cfg, edge_clamp, back=False, forward=True)
+    return kept
 
 
 class _GrayFromBGR:

@@ -114,6 +114,18 @@ class RunnerConfig:
     # treated as boundary chatter and the frames are kept. 1 = no hysteresis.
     min_occlusion_run: int = 3
 
+    # --- Rejoin partial tracks of the same feature (pre-gate) ---------------------------
+    # TAPNext is causal, and seeds are staggered across the block on purpose, so a seed
+    # entering three-quarters of the way in covers only the final quarter. Another pass
+    # tracked that same feature over the earlier frames, but under a different id -- and
+    # spread selection then threw one of them away as a duplicate, which is why a track could
+    # stop part-way through a shot whose pattern is visible throughout. Stitching runs before
+    # the quality gate so the rejoined track is judged at its true length.
+    stitch_passes: bool = True
+    stitch_max_sep_px: float = 1.5   # two features do not sit this close for this long
+    stitch_min_overlap: int = 4      # shared frames needed to trust the pairing
+    stitch_max_gap: int = 2          # or join across at most this many missing frames
+
     # --- Quality-ranked, evenly-spread track selection (post-pass) ---
     # Collapses the 4x pass duplication, scores each surviving track on its OWN
     # trajectory (parallax-safe: no agreement-with-global-motion term), then greedily
@@ -262,6 +274,18 @@ class RunnerConfig:
     # than welded into one id: welding two different features is invisible until the solve
     # fails, so on doubt it splits.
     split_unverified_segments: bool = True
+
+    # --- Carry the track past its ends -------------------------------------------------
+    # A track starts where a seed entered and stops where its pass ran out; neither is a
+    # statement about the feature, which is usually still visible either side. Extension
+    # walks outward from the OUTER ends only (never into an internal gap -- that gap IS an
+    # occlusion, and re-acquisition above is what crosses it, on evidence). It matches the
+    # ORIGINAL anchor at the position the track's own velocity predicts, demands
+    # refine_ncc_reacquire rather than the looser mid-track bar, verifies each frame
+    # backwards, and STOPS at the first failure: skipping a bad frame is exactly how a point
+    # walks through an occluder and reattaches on the far side.
+    refine_extend: bool = True
+    refine_extend_max: int = 48        # frames per end; 0 = off
 
     # --- Accuracy passes ---------------------------------------------------------------
     # Drift guard: re-referencing used to re-grab the patch at the CURRENT position with
@@ -1136,6 +1160,13 @@ class BatchTrackerRunner:
                     diag_short += 1
 
         n_scored = len(candidates)
+        # Join partial tracks of the SAME feature from different passes before anything
+        # judges them on length. A seed entering late covers only the tail of the shot while
+        # another pass holds the head; un-joined, the quality gate sees two short tracks and
+        # spread selection then discards one of them as a duplicate.
+        n_before_stitch = len(candidates)
+        candidates = _tf.stitch_passes(candidates, T, diag, self.cfg, log=self._status)
+        n_stitched = n_before_stitch - len(candidates)
         candidates = self._apply_quality_gate(candidates, T)
         n_after_quality = len(candidates)
 

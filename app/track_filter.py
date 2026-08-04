@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import statistics as st
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -187,6 +188,192 @@ def quality_gate(candidates: List[dict], T: int, cfg, log: Optional[Callable] = 
              f"(certainty <{need_c:.2f}, e.g. defocused) of {len(candidates)} -> "
              f"{len(kept)} worth exporting")
     return kept
+
+
+def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
+                  log: Optional[Callable] = None) -> List[dict]:
+    """Join tracks from different passes that sit on the SAME feature into one track.
+
+    TAPNext is causal: a query entering at frame k only tracks forward from k. Seeds are
+    deliberately staggered across the block (tracker_core._staggered_queries) so content
+    appearing mid-shot gets tracked, which means a seed entering three-quarters of the way in
+    covers only the final quarter. The backward pass tracks that same physical feature over
+    the earlier frames -- but as a SEPARATE id, and nothing ever joined them. select_spread
+    then sees two tracks closer than the spacing threshold, calls the weaker one a duplicate
+    and throws it away. The artist gets a track that stops part-way through a shot whose
+    pattern is plainly visible throughout, and the half that was successfully tracked is
+    discarded.
+
+    So join them here, before the quality gate, where the coverage term of score_track can
+    see the full length. Nothing is re-tracked: these frames were already solved, just under
+    two names.
+
+    A wrong join is worse than a short track -- it teleports a point onto a different feature
+    -- so a merge must clear all of:
+      * agreement where they overlap: >= `min_overlap` shared frames, mean separation under
+        `max_sep` px. Two distinct features do not sit half a pixel apart for four frames.
+      * or bare adjacency (<= `max_gap` frames apart) with the join predicted by the primary's
+        own velocity, so a blind append cannot invent a jump.
+      * consistent velocity across the join.
+
+    The donor is shifted by the constant offset measured over the overlap before being
+    appended. Two independent estimates of the same feature legitimately differ by a constant
+    sub-pixel amount (a point 0.3px from the corner is still that corner, rigidly tracked);
+    leaving the offset in would put a visible step at the junction, which is the one artefact
+    this must not introduce. The offset is constant, so the track's SHAPE -- the only thing a
+    solve reads -- is untouched.
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    if not candidates or len(candidates) < 2:
+        return candidates
+    if not bool(getattr(cfg, "stitch_passes", True)):
+        return candidates
+
+    max_sep = float(getattr(cfg, "stitch_max_sep_px", 1.5) or 1.5)
+    min_overlap = int(getattr(cfg, "stitch_min_overlap", 4) or 4)
+    max_gap = int(getattr(cfg, "stitch_max_gap", 2) or 2)
+
+    # Index every candidate by frame so partners are found by POSITION at a shared frame.
+    # Bucketing by lifetime-mean position would not work here: the whole point is that these
+    # tracks cover different parts of the shot, so on a moving camera their means are far
+    # apart even when they are the same feature.
+    by_frame: Dict[int, List[Tuple[int, float, float]]] = {}
+    for i, c in enumerate(candidates):
+        for (f, x, y) in c["pts"]:
+            by_frame.setdefault(int(f), []).append((i, float(x), float(y)))
+
+    order = sorted(range(len(candidates)), key=lambda i: candidates[i]["score"], reverse=True)
+    merged_into: Dict[int, int] = {}          # donor idx -> primary idx
+    pts_by_idx: Dict[int, Dict[int, Tuple[float, float]]] = {
+        i: {int(f): (float(x), float(y)) for (f, x, y) in candidates[i]["pts"]}
+        for i in range(len(candidates))
+    }
+    n_merged = 0
+
+    def _velocity(pmap: Dict[int, Tuple[float, float]], f0: int, back: bool) -> Optional[Tuple[float, float]]:
+        fs = sorted(pmap)
+        if len(fs) < 2:
+            return None
+        seq = [f for f in fs if (f <= f0 if back else f >= f0)]
+        if len(seq) < 2:
+            return None
+        a, b = (seq[-2], seq[-1]) if back else (seq[0], seq[1])
+        dt = max(1, b - a)
+        return ((pmap[b][0] - pmap[a][0]) / dt, (pmap[b][1] - pmap[a][1]) / dt)
+
+    for pi in order:
+        if pi in merged_into:
+            continue
+        grew = True
+        while grew:                       # a primary may absorb several partials in turn
+            grew = False
+            prim = pts_by_idx[pi]
+            pf = sorted(prim)
+            if not pf:
+                break
+            # Candidates sharing any frame with the primary, found via the frame index.
+            seen: Dict[int, int] = {}
+            probe = pf if len(pf) <= 8 else [pf[int(round(k * (len(pf) - 1) / 7.0))] for k in range(8)]
+            for f in probe:
+                for (j, x, y) in by_frame.get(f, ()):
+                    if j == pi or j in merged_into:
+                        continue
+                    if abs(x - prim[f][0]) <= max_sep and abs(y - prim[f][1]) <= max_sep:
+                        seen[j] = seen.get(j, 0) + 1
+            # Adjacency: a track starting just after the primary ends, or ending just before
+            # it starts, never shares a frame -- so the index cannot find it. Look for those
+            # explicitly and judge them by the primary's own predicted position.
+            for j in range(len(candidates)):
+                if j == pi or j in merged_into or j in seen:
+                    continue
+                jf = sorted(pts_by_idx[j])
+                if not jf:
+                    continue
+                if 0 < jf[0] - pf[-1] <= max_gap or 0 < pf[0] - jf[-1] <= max_gap:
+                    seen[j] = 0
+
+            best_j, best_shift = None, None
+            for j in sorted(seen, key=lambda k: -seen[k]):
+                don = pts_by_idx[j]
+                shared = sorted(set(prim) & set(don))
+                new_frames = [f for f in don if f not in prim]
+                if not new_frames:
+                    continue                      # adds nothing, so nothing to gain
+                if len(shared) >= min_overlap:
+                    dx = [prim[f][0] - don[f][0] for f in shared]
+                    dy = [prim[f][1] - don[f][1] for f in shared]
+                    mx, my = st.mean(dx), st.mean(dy)
+                    sep = st.mean([math.hypot(prim[f][0] - don[f][0], prim[f][1] - don[f][1])
+                                   for f in shared])
+                    if sep > max_sep:
+                        continue
+                    # Same feature but disagreeing on how it MOVES is two features that
+                    # happen to be crossing; the residual after removing the constant offset
+                    # is what catches that.
+                    resid = st.mean([math.hypot(prim[f][0] - don[f][0] - mx,
+                                                prim[f][1] - don[f][1] - my) for f in shared])
+                    if resid > max_sep * 0.5:
+                        continue
+                    shift = (mx, my)
+                elif shared:
+                    continue                      # overlapping but too briefly to judge
+                else:
+                    # Adjacent: predict where the primary would have been on the donor's first
+                    # frame and require the donor to be there.
+                    jf = sorted(don)
+                    if jf[0] > pf[-1]:
+                        v = _velocity(prim, pf[-1], back=True)
+                        if v is None:
+                            continue
+                        dt = jf[0] - pf[-1]
+                        px = prim[pf[-1]][0] + v[0] * dt
+                        py = prim[pf[-1]][1] + v[1] * dt
+                        tgt = don[jf[0]]
+                    else:
+                        v = _velocity(prim, pf[0], back=False)
+                        if v is None:
+                            continue
+                        dt = pf[0] - jf[-1]
+                        px = prim[pf[0]][0] - v[0] * dt
+                        py = prim[pf[0]][1] - v[1] * dt
+                        tgt = don[jf[-1]]
+                    if math.hypot(px - tgt[0], py - tgt[1]) > max_sep:
+                        continue
+                    shift = (px - tgt[0], py - tgt[1])
+                best_j, best_shift = j, shift
+                break
+
+            if best_j is None:
+                continue
+            don = pts_by_idx[best_j]
+            sx, sy = best_shift
+            for f, (x, y) in don.items():
+                if f not in prim:                 # primary's own points always win
+                    prim[f] = (x + sx, y + sy)
+            merged_into[best_j] = pi
+            n_merged += 1
+            grew = True
+
+    if not n_merged:
+        return candidates
+
+    out: List[dict] = []
+    for i, c in enumerate(candidates):
+        if i in merged_into:
+            continue
+        pmap = pts_by_idx[i]
+        pts = [(f, pmap[f][0], pmap[f][1]) for f in sorted(pmap)]
+        # Re-score at the new length: the coverage term is exactly what makes a stitched
+        # track outrank the partials it replaced, and select_spread reads that score.
+        out.append({**c, "pts": pts,
+                    "mean": (st.mean([p[1] for p in pts]), st.mean([p[2] for p in pts])),
+                    "score": score_track(pts, T, diag, cfg)})
+    _log(f"  stitch: joined {n_merged} partial track(s) onto {len(out)} feature(s) "
+         f"({len(candidates)} -> {len(out)} candidates)")
+    return out
 
 
 def spacing_px(cfg, out_width: int = 0) -> int:
@@ -533,12 +720,19 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     # override the max_cut rail, deleted most of the shot. Measured on a synthetic plate whose
     # every track is accurate to 0.06px (bench/): certainty ran 0.35-0.87 with a 0.075 gap at
     # 0.79, which is 3.7x the median gap, and the gate dropped 20 of 23 tracks with nothing
-    # wrong with any of them. A real split -- the defocused-background case this exists for --
-    # puts a substantial share of the tracks on BOTH sides, because most of that frame is
-    # soft. Isolating a top sliver is the signature of noise, so require both sides to be
-    # populated before calling it a split.
+    # wrong with any of them.
+    #
+    # The test is SEPARATION, not population size. Counting tracks either side looks sensible
+    # and gets the headline case backwards: on the plate this gate exists for -- a sharp
+    # subject against a defocused background -- the GOOD cluster is the minority, so any
+    # "both sides must be big" rule throws the real split away and keeps the soft tracks.
+    # What actually distinguishes two populations from one is the gap measured against how
+    # spread out each side is on its own. A continuum has a gap smaller than its own scatter
+    # (lab02: 0.075 gap against ~0.12 within-cluster spread -> one population). A genuine
+    # focus split has a gap far larger than either side's scatter (soft 0.30 +/-0.03 versus
+    # sharp 0.85 +/-0.03 -> gap 0.5, unmistakable) and stays unmistakable when the sharp
+    # cluster is a tenth of the tracks.
     split_gap, gap_mid = 0.0, 0.0
-    min_share = 0.25
     if vals:
         a = np.array(vals, dtype=float)
         sv = np.sort(a)
@@ -546,10 +740,19 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
         # Below ~8 samples "two populations" is not a claim the numbers can support.
         if len(gaps) and len(sv) >= 8:
             gi = int(np.argmax(gaps))
-            n_below, n_above = gi + 1, len(sv) - (gi + 1)
-            if (float(gaps[gi]) >= 0.05
-                    and min(n_below, n_above) >= max(2, int(round(min_share * len(sv))))):
-                split_gap = float(gaps[gi])
+            gap = float(gaps[gi])
+            lo_side, hi_side = sv[:gi + 1], sv[gi + 1:]
+            # Scatter WITHIN each side. A single-point side has no scatter of its own, so it
+            # cannot vouch for itself -- fall back to the whole set's spacing scale instead of
+            # reading 0.0 and declaring every isolated point a population.
+            def _spread(side: np.ndarray) -> float:
+                return float(side.std()) if side.size >= 2 else float("nan")
+            s_lo, s_hi = _spread(lo_side), _spread(hi_side)
+            known = [s for s in (s_lo, s_hi) if not math.isnan(s)]
+            scatter = max(known) if known else float(np.median(gaps))
+            # Two populations only when the gap dominates the scatter inside them.
+            if gap >= 0.05 and gap >= 2.0 * max(scatter, 1e-6) and min(len(lo_side), len(hi_side)) >= 2:
+                split_gap = gap
                 gap_mid = float((sv[gi] + sv[gi + 1]) * 0.5)
 
     if rel > 0.0 and vals:
