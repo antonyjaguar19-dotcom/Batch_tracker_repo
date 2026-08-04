@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Model weights and vendored runtimes (tens of GB, fetched separately)
+pipeline/qwen/models/
+pipeline/sam3/weights/
+pipeline/tapnext-main/
+runtime/
+
+# Bot output
+out/
+_batches/
+*.log

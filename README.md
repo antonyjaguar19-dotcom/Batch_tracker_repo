@@ -153,5 +153,4 @@ Both export classic 3D Equalizer 2D-track ASCII, frame numbers aligned to the or
 | `QWEN2_MODEL_DIR` | Force a specific Qwen model folder | (auto-resolve under `pipeline/qwen/models/`) |
 | `BTR_MOTION_BACKSTOP` | `0` disables the CV motion mask | `1` |
 
-See `DECISIONS.md` for why things are the way they are, and `CLAUDE.md` for the
-internal architecture / loader rules.
+
