@@ -104,6 +104,51 @@ def motion(t: int, n: int, cx: float, cy: float) -> np.ndarray:
     return fro_c @ rot @ to_c
 
 
+def add_hazards(src: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Paint regions into the SOURCE that are genuinely hard to track, before any warping.
+
+    A bench where every track comes out good can prove a quality metric reports FALSE signal,
+    but it cannot show the metric ranks tracks correctly -- there is nothing to rank. The
+    certainty gate is a ranker, so validating it needs tracks that genuinely fail.
+
+    These are baked into the source, so they move with the plate and the single-plane ground
+    truth stays exact -- the true position of a point in a defocused region is still known to
+    the pixel, the tracker just cannot find it. Each hazard breaks localisation a different way:
+
+      defocus     no high-frequency detail -> the NCC peak is broad and its location noisy.
+                  This is the case certainty exists to catch.
+      repetitive  a regular grid of near-identical features -> the peak is real but on the
+                  WRONG rival, so the track is confidently, precisely wrong.
+      low-contrast  almost no signal above the noise floor.
+    """
+    out = src.copy()
+    hs, ws = out.shape[:2]
+    ox, oy = int((ws - width) / 2.0), int((hs - height) / 2.0)
+
+    def box(fx, fy, fw, fh):
+        x0 = ox + int(fx * width); y0 = oy + int(fy * height)
+        return x0, y0, x0 + int(fw * width), y0 + int(fh * height)
+
+    # Defocused patch, upper left of the tracked window.
+    x0, y0, x1, y1 = box(0.05, 0.05, 0.26, 0.30)
+    out[y0:y1, x0:x1] = cv2.GaussianBlur(out[y0:y1, x0:x1], (0, 0), 4.5)
+
+    # Repetitive grid, upper right: identical high-contrast dots 26px apart.
+    x0, y0, x1, y1 = box(0.62, 0.06, 0.30, 0.30)
+    patch = out[y0:y1, x0:x1]
+    patch[:] = cv2.GaussianBlur(patch, (0, 0), 2.0)          # kill the real detail first
+    for gy in range(13, patch.shape[0] - 6, 26):
+        for gx in range(13, patch.shape[1] - 6, 26):
+            cv2.circle(patch, (gx, gy), 5, (235, 235, 235), -1)
+            cv2.circle(patch, (gx, gy), 2, (25, 25, 25), -1)
+
+    # Low-contrast patch, lower middle: pulled hard toward its own mean.
+    x0, y0, x1, y1 = box(0.36, 0.66, 0.28, 0.28)
+    reg = out[y0:y1, x0:x1].astype(np.float32)
+    out[y0:y1, x0:x1] = np.clip(reg.mean() + (reg - reg.mean()) * 0.10, 0, 255).astype(np.uint8)
+    return out
+
+
 def _degrade(img: np.ndarray, t: int, step_px: float, noise: float, blur: float,
              exposure: float, rng: np.random.Generator, angle: float) -> np.ndarray:
     """Add the things that actually cause sub-pixel tracking error.
@@ -143,7 +188,7 @@ def _degrade(img: np.ndarray, t: int, step_px: float, noise: float, blur: float,
 
 def build(src_path: str, out_dir: str, frames: int, width: int, height: int,
           seed_frame: int, noise: float = 0.0, blur: float = 0.0,
-          exposure: float = 0.0) -> str:
+          exposure: float = 0.0, hazards: bool = False) -> str:
     src = _load_source(src_path, seed_frame)
     hs, ws = src.shape[:2]
     if ws < width + 200 or hs < height + 200:
@@ -152,6 +197,8 @@ def build(src_path: str, out_dir: str, frames: int, width: int, height: int,
 
     # Centre the output window in the source so the move has room on every side; every
     # output pixel then comes from real texture and no frame carries a black border.
+    if hazards:
+        src = add_hazards(src, width, height)
     ox, oy = (ws - width) / 2.0, (hs - height) / 2.0
     base = np.array([[1.0, 0.0, -ox], [0.0, 1.0, -oy], [0.0, 0.0, 1.0]], np.float64)
     cx, cy = width / 2.0, height / 2.0
@@ -189,7 +236,8 @@ def build(src_path: str, out_dir: str, frames: int, width: int, height: int,
         "width": width,
         "height": height,
         "frames": frames,
-        "degrade": {"noise": noise, "blur": blur, "exposure": exposure},
+        "degrade": {"noise": noise, "blur": blur, "exposure": exposure,
+                    "hazards": bool(hazards)},
         "note": "H[t] maps SOURCE pixel coords -> OUTPUT pixel coords for frame t (0-based). "
                 "A point seen at output q on frame s sits at H[t] @ inv(H[s]) @ q on frame t. "
                 "Coords are IMAGE space (y down); the 3DE export flips y, the scorer un-flips.",
@@ -221,12 +269,15 @@ def main() -> None:
                     help="slow gain/lift drift, 0.02 = +-2%%")
     ap.add_argument("--hard", action="store_true",
                     help="plate-like preset: --noise 3 --blur 0.6 --exposure 0.02")
+    ap.add_argument("--hazards", action="store_true",
+                    help="bake in defocus / repetitive / low-contrast regions so the shot "
+                         "contains tracks that GENUINELY fail (needed to validate a ranker)")
     a = ap.parse_args()
     if a.hard:
         a.noise, a.blur, a.exposure = 3.0, 0.6, 0.02
     os.makedirs(a.out, exist_ok=True)
     build(a.src, a.out, a.frames, a.width, a.height, a.seed_frame,
-          noise=a.noise, blur=a.blur, exposure=a.exposure)
+          noise=a.noise, blur=a.blur, exposure=a.exposure, hazards=a.hazards)
 
 
 if __name__ == "__main__":

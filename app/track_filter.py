@@ -392,6 +392,20 @@ def defragment(tracks: Dict[str, Track], cfg,
     return out
 
 
+def _rank(v) -> float:
+    """Sort key for certainty that survives NaN.
+
+    NaN means "not measured" (see certainty_gate). Python's sort is undefined with NaN in
+    the key -- comparisons are all False, so the result depends on input order. Rank unknown
+    below every real score instead: these tracks are never dropped for being unknown, so this
+    only decides where they sit when a fallback is picking "the best N".
+    """
+    if v is None:
+        return -1.0
+    f = float(v)
+    return -1.0 if math.isnan(f) else f
+
+
 def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
                       certainty: Dict[str, float], cfg,
                       log: Optional[Callable] = None) -> Tuple[Dict[str, Track], set]:
@@ -413,7 +427,7 @@ def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
     if floor <= 0 or len(kept) >= floor or len(all_tracks) <= len(kept):
         return kept, set()
     spare = [k for k in all_tracks if k not in kept]
-    spare.sort(key=lambda k: float(certainty.get(k, 0.0)), reverse=True)
+    spare.sort(key=lambda k: _rank(certainty.get(k, None)), reverse=True)
     add = spare[:max(0, floor - len(kept))]
     if not add:
         return kept, set()
@@ -495,7 +509,18 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     # of ITS OWN shot is self-calibrating -- on a uniformly sharp plate nothing is dropped,
     # while on a sharp-subject/soft-background plate the soft cluster falls away. That is
     # exactly the handheld-with-defocused-background case.
-    vals = [float(certainty.get(k, 0.0)) for k in tracks if k in certainty]
+    # A track with no certainty measurement is not a track with bad certainty. Refine reports
+    # NaN when it could not run at all (every segment "no-anchor"), and those points are kept
+    # deliberately -- raw rather than deleted -- so they are ordinary tracks that this gate has
+    # no evidence about. They are excluded from the distribution AND never dropped by it:
+    # counting them as 0.0 both condemned them and manufactured a gap wide enough to look like
+    # two populations, which is how 23 accurate tracks were dropped on bench/lab03.
+    def _known(k) -> bool:
+        v = certainty.get(k, None)
+        return v is not None and not math.isnan(float(v))
+
+    vals = [float(certainty[k]) for k in tracks if _known(k)]
+    n_unknown = sum(1 for k in tracks if not _known(k))
     thr = need
 
     # Describe the distribution once: whether it holds two populations, and where they part.
@@ -531,21 +556,44 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
         a = np.array(vals, dtype=float)
         best = float(np.percentile(a, 90))
         lo = float(np.percentile(a, 10))
-        # Only worth applying when there IS a spread to discriminate. On a uniformly sharp
-        # (or uniformly soft) plate every track scores alike, and a relative bar would then
-        # be cutting on noise rather than on a real soft cluster.
-        if float(a.max()) - float(a.min()) < 0.05:
-            _log(f"  certainty gate: spread too narrow ({lo:.2f}-{best:.2f}) to separate "
-                 f"anything -- skipped")
-            return tracks
-        # Prefer the natural gap over a percentile bar. A percentile assumes the good tracks
-        # are the majority, and on a defocused background they are the MINORITY -- most of
-        # the frame is soft, so P90 lands inside the bad cluster and the bar collapses. A gap
-        # makes no such assumption.
-        thr = max(thr, gap_mid) if split_gap > 0.0 else max(thr, rel * best)
+        # The relative bar applies ONLY when the numbers show a soft cluster to remove.
+        #
+        # Two ways they can fail to: no spread at all (a uniformly sharp or uniformly soft
+        # plate, where every track scores alike), or a spread with no clean split (a single
+        # population strung along a continuum). In both cases rel * P90 is slicing an
+        # arbitrary point off a distribution rather than separating two groups. On
+        # bench/lab02 that cut 13 of 23 tracks whose true error was 0.06px -- every one as
+        # accurate as the tracks it kept -- and certainty there correlates with true error at
+        # only -0.22, so the cut was made on noise.
+        #
+        # A narrow spread used to `return tracks` outright, which skipped the ABSOLUTE floor
+        # too. That let a uniformly defocused plate -- every track alike and every one too
+        # soft to trust -- pass the gate untouched, which is the exact case the floor exists
+        # for. Both paths now fall through to the floor, which encodes "too soft to trust"
+        # rather than "softer than its neighbours".
+        narrow = float(a.max()) - float(a.min()) < 0.05
+        if split_gap > 0.0:
+            # Prefer the natural gap over a percentile bar. A percentile assumes the good
+            # tracks are the majority, and on a defocused background they are the MINORITY --
+            # most of the frame is soft, so P90 lands inside the bad cluster and the bar
+            # collapses. A gap makes no such assumption.
+            thr = max(thr, gap_mid)
+        else:
+            why = ("spread too narrow" if narrow else "no clean split") + \
+                  f" ({lo:.2f}-{best:.2f})"
+            if need <= 0.0:
+                _log(f"  certainty gate: {why} -- one population and no absolute floor set, "
+                     f"so nothing to judge against; skipped")
+                return tracks
+            _log(f"  certainty gate: {why} -- one population; absolute floor {need:.2f} only, "
+                 f"no relative bar")
     if thr <= 0.0:
         return tracks
-    keep = {k: v for k, v in tracks.items() if float(certainty.get(k, 1.0)) >= thr}
+    keep = {k: v for k, v in tracks.items()
+            if (not _known(k)) or float(certainty[k]) >= thr}
+    if n_unknown:
+        _log(f"  certainty gate: {n_unknown} track(s) carry no certainty measurement "
+             f"(refine could not anchor) -- kept, not judged")
 
     # A large cut is fine when it is DISCRIMINATING and suspect when it is arbitrary -- and
     # size alone cannot tell those apart. A sharp subject against a mostly-defocused
@@ -561,7 +609,7 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
                  f"so the cut stands")
         else:
             n_keep = max(1, int(round((1.0 - max_cut) * len(tracks))))
-            best_ids = sorted(tracks, key=lambda k: float(certainty.get(k, 0.0)),
+            best_ids = sorted(tracks, key=lambda k: _rank(certainty.get(k, None)),
                               reverse=True)[:n_keep]
             _log(f"  certainty gate: would have cut {len(tracks) - len(keep)}/{len(tracks)} "
                  f"with no clear split in the numbers -- capped at {len(tracks) - n_keep}")
@@ -569,7 +617,7 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     need = thr
     floor = max(1, int(getattr(cfg, "quality_gate_floor", 8) or 1))
     if len(keep) < min(floor, len(tracks)):
-        best = sorted(tracks, key=lambda k: float(certainty.get(k, 0.0)), reverse=True)[:floor]
+        best = sorted(tracks, key=lambda k: _rank(certainty.get(k, None)), reverse=True)[:floor]
         _log(f"  certainty gate: only {len(keep)} track(s) cleared {need:.2f} -> relaxed, "
              f"keeping the best {len(best)} (soft plate)")
         return {k: tracks[k] for k in best}

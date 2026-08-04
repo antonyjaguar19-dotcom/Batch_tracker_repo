@@ -647,7 +647,9 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                     break                       # drifted off the feature -> stop this side
             i += direction
 
-    _CERTAINTY["v"] = float(np.median(certs)) if certs else 0.0
+    # Same distinction as in _refine_one_multi: no per-frame certainty recorded is "unknown",
+    # not "zero". 0.0 here would be read by the gate as the worst possible localisation.
+    _CERTAINTY["v"] = float(np.median(certs)) if certs else float("nan")
     return [refined[k] for k in sorted(refined.keys())], "ok"
 
 
@@ -898,7 +900,9 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
             continue          # 1-D feature: drop these points; keeping them RAW would be
                               # both jittery (coarse 256px position) and still sliding.
         if reason == "ok":
-            seg_certs.append(float(_CERTAINTY.get("v", 0.0)))
+            c = float(_CERTAINTY.get("v", float("nan")))
+            if not math.isnan(c):
+                seg_certs.append(c)
         use = ref if (ref is not None and len(ref) >= min_len) else seg
         if ref is not None:
             use = _fb_filter(use, get, cfg, edge_clamp)
@@ -924,7 +928,16 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
         pieces.append(combined)
     # Track-level certainty = the weakest refined segment, so one badly-localised stretch is
     # not averaged away by good ones.
-    _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else 0.0
+    #
+    # No refined segment at all means NOT MEASURED, which is a different statement from
+    # "measured, and it localised badly" -- and reporting it as 0.0 said the second. A track
+    # whose segments all came back "no-anchor" keeps its input points by design ("better raw
+    # than deleted"), and since moving-tile now re-tracks at native resolution before this
+    # stage, those points are good: on bench/lab03 the 23 tracks scored 0.0000 this way were
+    # accurate to 0.044px, indistinguishable from the 9 that scored 0.79-1.00. Worse, the
+    # 0.0-versus-real chasm read as a clean bimodal split, which let the certainty gate
+    # override its own max_cut rail and drop all 23. NaN says "unknown" and the gate skips it.
+    _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else float("nan")
     return [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
 
 

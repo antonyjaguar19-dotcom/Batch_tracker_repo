@@ -22,9 +22,12 @@ Does **not** measure, so never conclude these from it:
 
 - **parallax** — one plane, nothing moves relative to anything else.
 - **occlusion** — nothing passes in front of anything.
-- **bad tracks** — every track on it comes out good (0.03–0.12px), so it can prove a metric
-  reports *false* signal, but it cannot yet validate that a metric *ranks* tracks correctly.
-  A bench with genuine failures is the next thing this needs.
+- **bad tracks among the EXPORTS.** `--hazards` bakes defocused, repetitive and
+  low-contrast regions into the source, and they do their job — but the seeding and quality
+  stages reject those seeds long before export, so what actually ships is still uniformly
+  good (0.03–0.09px). That is the pipeline behaving correctly, and it means this bench can
+  prove a quality metric reports *false* signal but still cannot show it *ranks* real
+  failures correctly. Judging a ranker needs bad tracks that survive to the export.
 
 A constant offset applied to a whole track scores zero error, because ground truth is
 anchored on that track's own seed. That is a property of the scene rather than a gap: on a
@@ -80,11 +83,37 @@ Two defects in the **quality signals**, both proven against exact truth:
   both sides to hold ≥25% of the tracks. A genuine soft-background split still cuts (verified
   on a bimodal sample); the sparse-tail artefact no longer does.
 
-Neither change moved accuracy: every class scores identically before and after, as they
-should — both are diagnostic/gating, not tracking.
+Then three more in the certainty gate, all found by asking why accurate tracks were being
+condemned:
 
-**Still open:** even after the fix the relative bar (`certainty_rel` against P90) drops 13 of
-23 tracks that are accurate to 0.06px. Export count is unaffected because backfill tops it
-back up, but those tracks ship flagged `weak`, which misinforms the artist. Whether the
-relative bar should apply at all when the numbers show no split is a shipping-behaviour
-decision, and validating it needs a bench that contains genuinely bad tracks.
+- **Certainty `0.0` meant "not measured", and the gate read it as "measured, and terrible".**
+  `_refine_one_multi` reports `min(seg_certs)`, and `seg_certs` only gains an entry when a
+  segment refines with reason `"ok"`. A track whose segments all come back `"no-anchor"`
+  keeps its input points *by design* ("better raw than deleted") and scored 0.0. That
+  assumption predates `moving_tile_refine`: those points are now native-resolution
+  moving-tile positions, so they are good. On `lab03`, **23 of 32 tracks scored exactly
+  0.0000 while being accurate to 0.044px** — indistinguishable from the 9 scoring 0.79–1.00.
+  Worse, the 0.0-versus-real chasm read as a textbook bimodal split, so the gate overrode its
+  own `max_cut` rail and dropped all 23. Now `NaN` = unknown: excluded from the distribution,
+  never dropped for lacking a measurement. `lab03` went from **23 of 32 shipped flagged weak
+  to 1**.
+- **The relative bar cut a continuum.** With no clean split, `rel * P90` slices an arbitrary
+  point off one population. On `lab02` that cut 13 of 23 tracks accurate to 0.06px, where
+  certainty correlates with true error at only **−0.22** — a cut made on noise. The relative
+  bar now applies only when a split is actually present; the absolute floor always does.
+  `lab02` went from **13 weak flags to 0**.
+- **A narrow spread skipped the absolute floor.** The "spread too narrow to separate
+  anything" guard returned early, past the floor as well as the relative bar — so a uniformly
+  defocused plate, every track alike and every one too soft to trust, passed the gate
+  untouched. That is precisely the case the floor exists for. Both paths now fall through to
+  it.
+
+No change moved accuracy: every class scores identically before and after on both shots, as
+it should — all of these are diagnostic and gating, not tracking. Verified against a six-case
+matrix: a genuine soft/sharp split still cuts the soft cluster, a uniformly soft plate now
+gets cut by the floor (capped so the shot is not emptied), and unmeasured tracks are kept
+without being judged.
+
+**Still open:** the wobble metric's remaining 0.363px floor on ground truth (neighbour
+consensus is the fix, prototyped at ~0.09px), and a bench whose *exported* tracks include
+genuine failures, without which no ranker can be validated.
