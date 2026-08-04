@@ -14,3 +14,6 @@ runtime/
 out/
 _batches/
 *.log
+
+# Local rollback copies (same content is already in git history)
+backup/

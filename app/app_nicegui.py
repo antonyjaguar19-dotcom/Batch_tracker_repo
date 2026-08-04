@@ -1269,6 +1269,17 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                             "locked-off sharp one, and a batch tool cannot be tuned by hand per shot. The log names "
                             "what it measured and what it chose. Any slider you move yourself overrides it.")
 
+            sw_ptp = ui.switch("Per-track settings (experimental)",
+                               value=bool(getattr(state, "per_track_policy", False)),
+                               on_change=lambda e: setattr(state, "per_track_policy", bool(e.value)))
+            sw_ptp.tooltip("Auto-tune picks one set of numbers for the whole shot. This measures every point as it "
+                           "is seeded — is it a sharp corner, a soft blob, a line, one of fifty identical rivets — "
+                           "and gives each its own pattern size, motion model and match thresholds. A corner and a "
+                           "blob want opposite settings and until now both got the same ones. The track report "
+                           "gains a column per point saying what it was read as and what it was given, so you can "
+                           "check the calls. TAPNext backend only: SynthEyes tracks its points internally, so there "
+                           "is nothing to steer there. Off by default — turn it on and off to compare the same shot.")
+
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
             backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
