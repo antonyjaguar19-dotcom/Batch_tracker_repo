@@ -651,13 +651,35 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
     return [refined[k] for k in sorted(refined.keys())], "ok"
 
 
+def _detrend_coeffs(k: int, order: int = 2) -> np.ndarray:
+    """Savitzky-Golay smoothing kernel: least-squares polynomial fit evaluated at the centre.
+
+    A plain moving average is only exact for a CONSTANT, so any curvature in the path
+    survives it and is reported as wobble. Fitting a quadratic instead reproduces constant
+    acceleration exactly, so a smoothly accelerating camera leaves nothing behind.
+    """
+    half = k // 2
+    x = np.arange(-half, half + 1, dtype=np.float64)
+    A = np.vander(x, order + 1, increasing=True)
+    return (np.linalg.pinv(A.T @ A) @ A.T)[0]     # row 0 = value of the fit at x = 0
+
+
 def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
     """(amplitude_px, dominant_period_frames) of a track's deviation from its own smooth path.
 
     Three rounds of "the tracks wobble" have been diagnosed by eye. The PERIOD is what names
     the cause: a beat clustering at the moving-tile window length points at that stage's
-    seams, whereas a random walk has no dominant period at all. Detrending with a moving
-    average leaves the wobble; the strongest FFT bin names its beat.
+    seams, whereas a random walk has no dominant period at all. Detrending leaves the
+    wobble; the strongest FFT bin names its beat.
+
+    The detrend is a local QUADRATIC, not a moving average. A moving average is exact only
+    for constant velocity, so it leaves a residual proportional to the path's curvature and
+    reports real camera acceleration as tracking error. That was not a small effect: fed the
+    exact ground truth of a synthetic pan (bench/), the moving-average version reported
+    1.585px of wobble on tracks that are correct by construction, which is the same number it
+    reported for the bot -- the metric was measuring the plate's motion and nothing else.
+    A quadratic fit reproduces constant acceleration exactly and leaves only what genuinely
+    deviates from a smooth path.
 
     Diagnostic only -- nothing is smoothed or filtered on the basis of it.
     """
@@ -668,8 +690,10 @@ def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
     xs = np.array([p[1] for p in pts], dtype=np.float64)
     ys = np.array([p[2] for p in pts], dtype=np.float64)
 
-    k = max(3, min(9, (n // 4) | 1))          # odd moving-average window
-    ker = np.ones(k) / float(k)
+    # Window must exceed the polynomial order for the fit to smooth at all (k=3, order=2
+    # interpolates every point exactly and would report zero wobble always).
+    k = max(5, min(9, (n // 4) | 1))
+    ker = _detrend_coeffs(k, order=2)
     rx = xs - np.convolve(xs, ker, mode="same")
     ry = ys - np.convolve(ys, ker, mode="same")
     edge = k // 2                              # convolve edges are unreliable -- drop them

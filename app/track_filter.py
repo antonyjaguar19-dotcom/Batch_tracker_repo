@@ -501,14 +501,29 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     # Describe the distribution once: whether it holds two populations, and where they part.
     # This is a property of the numbers, not of which bar is switched on, so both the
     # threshold choice below and the safety rail further down read the same analysis.
+    #
+    # "Largest gap" alone does NOT establish two populations. Any sample of a continuum has a
+    # largest gap, and in the sparsely-sampled tail it is routinely several times the typical
+    # spacing -- so the test fired on ordinary spread and, because a clean split is allowed to
+    # override the max_cut rail, deleted most of the shot. Measured on a synthetic plate whose
+    # every track is accurate to 0.06px (bench/): certainty ran 0.35-0.87 with a 0.075 gap at
+    # 0.79, which is 3.7x the median gap, and the gate dropped 20 of 23 tracks with nothing
+    # wrong with any of them. A real split -- the defocused-background case this exists for --
+    # puts a substantial share of the tracks on BOTH sides, because most of that frame is
+    # soft. Isolating a top sliver is the signature of noise, so require both sides to be
+    # populated before calling it a split.
     split_gap, gap_mid = 0.0, 0.0
+    min_share = 0.25
     if vals:
         a = np.array(vals, dtype=float)
         sv = np.sort(a)
         gaps = np.diff(sv)
-        if len(gaps):
+        # Below ~8 samples "two populations" is not a claim the numbers can support.
+        if len(gaps) and len(sv) >= 8:
             gi = int(np.argmax(gaps))
-            if float(gaps[gi]) >= 0.05:
+            n_below, n_above = gi + 1, len(sv) - (gi + 1)
+            if (float(gaps[gi]) >= 0.05
+                    and min(n_below, n_above) >= max(2, int(round(min_share * len(sv))))):
                 split_gap = float(gaps[gi])
                 gap_mid = float((sv[gi] + sv[gi + 1]) * 0.5)
 
