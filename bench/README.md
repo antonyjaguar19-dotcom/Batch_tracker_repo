@@ -322,8 +322,34 @@ which is the same trap the certainty gate fell into. Track count going up is not
 Two caveats stay attached to that SH004 figure. Usable rows fell from 25 to 17 at an
 unchanged export count, so fewer tracks earned a tight reference — the win is read in the
 trustworthy band (11 rows against 12), and the raw all-rows median of 2.22 → 0.88px partly
-reflects a different denominator. And the rule says "soft plates" on the evidence of one soft
-plate and one crisp one.
+reflects a different denominator. And the rule said "soft plates" on the evidence of one soft
+plate and one crisp one — since confirmed on a second, see below.
+
+### Confirmed on a second soft plate, and the gain is not uniform
+
+SH009 (3840x2160, texture 59.1, sharp 0.018, 28% sharp area — soft by the same rule that
+fires on SH004). A/B on the trustworthy band:
+
+    band-pass OFF   median 0.35px   worst 1.27px   over 1px 3/15   64 tracks
+    band-pass ON    median 0.33px   worst 1.90px   over 1px 5/38   90 tracks
+
+Not harmful, and it exports 41% more tracks at the same accuracy — but nowhere near SH004's
+1.01 -> 0.71px. The reason is visible in the baselines: **SH009 was already good without it**
+(0.35px), while SH004 was not (1.01px). The benefit scales with how little high-frequency
+detail the plate has, which is what the mechanism predicts — there is only a low-frequency
+ramp to remove when the feature has lost its detail.
+
+So `soft` (texture < 400) is a safe trigger but a coarse one. It covers plates that behave
+very differently: SH009 at texture 59 needs no help, SH004 at 12.6 was broken without it.
+
+One honest mark against the shipped arm: with band-pass on, the ALL-ROWS worst was 21.98px
+against 4.57px off. It sits at closure 0.3-0.5 and disappears from every tight band (worst
+1.90px at closure < 0.3), so the reference is probably at fault — but it is an outlier that
+appeared on the arm that ships, and it is the thing to watch on the next soft shot.
+
+It also puts this session's numbers in proportion. Every headline here comes from SH004,
+which is the hardest plate on the box. A more typical soft plate was already at 0.35px median
+with 1 track in 32 over 3px.
 
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
