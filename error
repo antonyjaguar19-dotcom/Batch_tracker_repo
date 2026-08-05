@@ -1,15 +1,56 @@
-[12:46:33] --- Starting Step 5: Tracking ---
-[12:46:33] Tracking backend: TAPNext++
-[12:46:36] VRAM freed (before TAPNext): 0.00 -> 0.00 GB reserved
-[12:46:37] E06_037_0010_plate-bg01: tracking full-res lossless proxy sequence -> \\liv1\shows\TOW\E06_037_0010_plate-bg01\in\plates\v001\E06_037_0010_plate-bg01_proxyJPG_v0001\4608x3164_jpg
-[12:46:37] Tracking: E06_037_0010_plate-bg01 | camera | OUTSIDE
-[12:46:37] TRACK: Loading TAPNext++ (256px, streaming)...
+[15:00:34] --- Starting Step 5: Tracking ---
+[15:00:34] Tracking backend: TAPNext++
+[15:00:38] VRAM freed (before TAPNext): 0.00 -> 0.00 GB reserved
+[15:00:38] E06_037_0010_plate-bg01: tracking full-res lossless proxy sequence -> \\liv1\shows\TOW\E06_037_0010_plate-bg01\in\plates\v001\E06_037_0010_plate-bg01_proxyJPG_v0001\4608x3164_jpg
+[15:00:38] Tracking: E06_037_0010_plate-bg01 | camera | OUTSIDE
+[15:00:38] TRACK: Loading TAPNext++ (256px, streaming)...
 D:\Jefrin\batch_tracker_v001_starter\runtime\python311\Lib\site-packages\torch\_export\utils.py:394: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
   _register_pytree_node(
 D:\Jefrin\batch_tracker_v001_starter\pipeline\tapnext-main\tapnet\tapnext\tapnext_lru_modules.py:46: UserWarning: expandable_segments not supported on this platform (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\c10/cuda/CUDAAllocatorConfig.h:28.)
   torch.empty([self.width], device=device, dtype=dtype)
 D:\Jefrin\batch_tracker_v001_starter\app\tapnext_engine.py:94: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
   ckpt = torch.load(self.checkpoint, map_location="cpu")
-[12:46:43] TRACK: [1/1] Reading: E06_037_0010_plate-bg01 (scale=1.0, stream=False)
-[12:47:10] TRACK:   auto-tune: sharp=0.016 sharp_area=86% grain=1.0 texture=6.1 motion=10.3px
-[12:47:10] TRACK:   auto-tune -> min_feature_dist=16, refine_patch_px=41, min_track_certainty=0.25
+[15:00:44] TRACK: [1/1] Reading: E06_037_0010_plate-bg01 (scale=1.0, stream=False)
+[15:01:12] TRACK:   auto-tune: sharp=0.016 sharp_area=86% grain=1.0 texture=6.1 motion=10.3px
+[15:01:12] TRACK:   auto-tune -> min_feature_dist=16, refine_patch_px=41, min_track_certainty=0.25
+[15:01:13] TRACK:   VRAM probe: 12.4 B per frame-pixel measured (was assuming 50)
+[15:01:13] TRACK: [1/1] frames=101 res=4608x3164 freeVRAM=13.7GB cal=12.4B/frame-px -> chunks=4 (re-seed every ~30f)
+[15:01:13] TRACK: [1/1] Tracking in 4 chained chunks (overlap 24)...
+[15:01:22] TRACK:   seeds: dropped 23/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:24] TRACK:   seeds: dropped 26/226 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:27] TRACK:   seeds: dropped 40/240 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:30] TRACK:   seeds: dropped 27/279 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:48] TRACK:   seeds: dropped 25/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:51] TRACK:   seeds: dropped 19/227 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:54] TRACK:   seeds: dropped 33/236 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:01:57] TRACK:   seeds: dropped 30/270 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:19] TRACK:   seeds: dropped 30/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:22] TRACK:   seeds: dropped 30/229 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:25] TRACK:   seeds: dropped 26/244 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:28] TRACK:   seeds: dropped 34/269 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:51] TRACK:   seeds: dropped 23/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:54] TRACK:   seeds: dropped 26/226 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:02:57] TRACK:   seeds: dropped 29/240 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:00] TRACK:   seeds: dropped 35/268 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:29] TRACK:   seeds: dropped 29/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:32] TRACK:   seeds: dropped 29/228 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:35] TRACK:   seeds: dropped 33/243 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:38] TRACK:   seeds: dropped 34/276 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:03:57] TRACK:   seeds: dropped 36/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:00] TRACK:   seeds: dropped 30/231 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:03] TRACK:   seeds: dropped 27/246 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:06] TRACK:   seeds: dropped 37/272 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:27] TRACK:   seeds: dropped 27/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:30] TRACK:   seeds: dropped 30/228 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:33] TRACK:   seeds: dropped 28/242 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:04:36] TRACK:   seeds: dropped 23/271 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:05:01] TRACK:   seeds: dropped 21/219 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:05:04] TRACK:   seeds: dropped 23/226 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:05:07] TRACK:   seeds: dropped 27/237 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:05:10] TRACK:   seeds: dropped 28/264 edge-like point(s) (anisotropy < 0.08) - these slide along edges
+[15:08:17] TRACK:   stitch: joined 142 partial track(s) onto 5671 feature(s) (5813 -> 5671 candidates)
+[15:08:17] TRACK:   quality gate: dropped 2221 too-short (<24f), 0 low-quality (<0.35) and 0 poorly-localised (certainty <0.25, e.g. defocused) of 5671 -> 3450 worth exporting
+[15:08:17] TRACK:   spread: 60px @1920 -> 144px at this plate width (4608)
+[15:08:17] TRACK:   tracks: 6752 seeded -> 6056 past motion filter -> 5813 past mask gate -> 5813 scored (0 too short/jumpy) -> 3450 past quality bar -> 132 after spacing
+[15:08:17] TRACK: [1/1] Moving-tile native re-track at 4608x3164...
+[15:08:17] TRACK: TRACK: Moving-tile: 132 tracks, tile 256px win=16 overlap=4 (shared decode 4608x3164)
