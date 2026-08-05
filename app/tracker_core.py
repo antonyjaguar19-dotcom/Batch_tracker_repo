@@ -142,6 +142,11 @@ class RunnerConfig:
     # template, an upsampled peak, an iterated refine), not by discarding more.
     max_output_tracks: int = 600
     min_export_tracks: int = 40    # below this, top up from the best rejects and flag them
+    # Final gate on deviation from a track's own smooth path, RELATIVE to the shot's median
+    # (wobble scales with how much the camera moves, so an absolute px bar cannot travel).
+    # This is the only signal measured to rank true error on real footage; certainty manages
+    # -0.236 and `score` is +0.398, i.e. backwards. 0 = off. See track_filter.wobble_gate.
+    wobble_rel: float = 1.5
     # Holes a track may carry before it is cut into continuous runs. One or two long gaps is
     # an occluded track worth keeping whole; a dozen short ones is a marginal track that kept
     # losing lock, and it blinks on and off in the 3DE viewport. -1 = off.
@@ -1885,6 +1890,14 @@ class BatchTrackerRunner:
                         final_tracks_out, _weak_ids = _tf.backfill_to_floor(
                             final_tracks_out, _before_gate, _certs, self.cfg,
                             log=self._status, wobble=_wob)
+                        # Last, on the FINAL set: the one gate that catches a track which
+                        # deviates far more than this shot's norm. It has to see everything,
+                        # including what the top-up just added and what certainty let through
+                        # -- a 20px track on SH004 passed the certainty gate and only this
+                        # removes it. See track_filter.wobble_gate.
+                        final_tracks_out = _tf.wobble_gate(
+                            final_tracks_out, _wob, self.cfg, log=self._status)
+                        _weak_ids = {k for k in _weak_ids if k in final_tracks_out}
                         # A track that kept losing and regaining lock exports as one id full
                         # of holes, which blinks on and off in the 3DE viewport. Cut those
                         # into continuous runs; genuine occlusion gaps stay.

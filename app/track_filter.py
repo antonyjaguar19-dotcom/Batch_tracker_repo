@@ -593,6 +593,63 @@ def _rank(v) -> float:
     return -1.0 if math.isnan(f) else f
 
 
+def wobble_gate(tracks: Dict[str, Track], wobble: Dict[str, float], cfg,
+                log: Optional[Callable] = None) -> Dict[str, Track]:
+    """Drop tracks that deviate from their own smooth path far more than the shot's norm.
+
+    This is the gate that catches what the others miss. Measured on SH004 against an
+    independent Lucas-Kanade re-track of every exported track (tools/verify_against_lk.py),
+    the worst track in the delivery sat 20.51px from a reference closing to 0.71px -- and it
+    had PASSED the certainty gate. Certainty predicts true error at -0.236, so it cannot
+    reject it; `score` is worse than useless at +0.398, ranking bad tracks as good because
+    its coverage term rewards length and length is where drift accumulates. Wobble is the
+    one signal that ranks real error (+0.573 spearman), and only since it stopped detrending
+    with a moving average, which reported 1.585px on ground truth correct by construction.
+
+    RELATIVE to the shot's own median, for the same reason the certainty bar is: wobble
+    scales with how much the camera actually moves, so an absolute px threshold would empty a
+    handheld plate and pass everything on a locked-off one.
+
+    Simulated on the real per-track numbers before it was written, then run: at 1.5x the
+    median, SH004 goes from 2.34px median / 20.51px worst / 7 tracks over 3px, to 1.08px
+    median / 2.58px worst / none over 3px.
+
+    Applied to the FINAL set, after the top-up -- a filter that sees only part of the export
+    cannot remove a track that entered through another door, which is exactly how an earlier
+    backfill-only ceiling failed.
+
+    A track with no wobble measurement is kept and not judged, as elsewhere.
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    mult = float(getattr(cfg, "wobble_rel", 0.0) or 0.0)
+    if mult <= 0.0 or not tracks or not wobble:
+        return tracks
+    vals = [float(wobble[k]) for k in tracks
+            if k in wobble and not math.isnan(float(wobble[k]))]
+    if len(vals) < 8:
+        return tracks                      # too few to establish what this shot's norm is
+    thr = mult * st.median(vals)
+    if thr <= 0.0:
+        return tracks
+    keep = {k: v for k, v in tracks.items()
+            if k not in wobble or math.isnan(float(wobble[k])) or float(wobble[k]) <= thr}
+    floor = max(1, int(getattr(cfg, "quality_gate_floor", 8) or 1))
+    if len(keep) < min(floor, len(tracks)):
+        best = sorted(tracks, key=lambda k: (float(wobble[k])
+                                             if k in wobble and not math.isnan(float(wobble[k]))
+                                             else float("inf")))[:floor]
+        _log(f"  wobble gate: only {len(keep)} track(s) under {thr:.2f}px -> relaxed, "
+             f"keeping the steadiest {len(best)}")
+        return {k: tracks[k] for k in best}
+    if len(keep) < len(tracks):
+        _log(f"  wobble gate: dropped {len(tracks) - len(keep)} track(s) deviating more than "
+             f"{thr:.2f}px ({mult:g}x this shot's median) -> {len(keep)}")
+    return keep
+
+
 def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
                       certainty: Dict[str, float], cfg,
                       log: Optional[Callable] = None,
