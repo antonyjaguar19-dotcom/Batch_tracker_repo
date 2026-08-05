@@ -376,6 +376,53 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
     return out
 
 
+def identity_gate(tracks: Dict[str, Track], identity: Dict[str, float], cfg,
+                  log: Optional[Callable] = None) -> Dict[str, Track]:
+    """Drop tracks that no longer sit on the feature they started on.
+
+    `identity` is the correlation between a track's patch at its FIRST frame and at its
+    LAST. A point that slid off its feature ends up on unrelated pixels and scores near
+    zero; a point that held on scores high even when lighting and perspective have moved.
+
+    This is the only measure here that catches a SMOOTH drifter, and everything else was
+    tried first. Certainty reads the sharpness of a correlation peak, and a drifting point
+    correlates with its new surroundings perfectly well (-0.236 against real error). Score
+    rewards long unbroken tracks, which is exactly what a drifter is (+0.398 -- it ranks
+    them as the BEST tracks). Wobble measures deviation from the track's own smooth path,
+    and a drift is smooth by definition, so gating on it cut 14 of 29 tracks and left the
+    drifter untouched.
+
+    An ABSOLUTE floor, not a relative one: "does this patch still resemble that patch" means
+    the same thing on every plate, unlike certainty, which is why the certainty bar has to
+    be self-calibrating and this one does not. The default is set far below the good
+    population (0.50-0.99 on the measured shot) so it only ever removes a track that has
+    genuinely lost its feature, not one whose appearance merely changed.
+    """
+    def _log(m):
+        if log:
+            log(m)
+
+    need = float(getattr(cfg, "min_seed_identity", 0.0) or 0.0)
+    if need <= 0.0 or not tracks or not identity:
+        return tracks
+    # Unmeasured is not evidence of failure -- same rule as the certainty gate.
+    drop = [k for k, v in identity.items()
+            if k in tracks and v == v and float(v) < need]
+    if not drop:
+        return tracks
+    # Never empty a shot on this test alone. If most of the export fails, the plate changed
+    # appearance wholesale (a lighting cut, a whip) rather than every track drifting.
+    if len(drop) > 0.5 * len(tracks):
+        _log(f"  identity gate: {len(drop)}/{len(tracks)} tracks fail the seed-identity check "
+             f"(<{need:.2f}) -- too many to be drift, so the plate changed; not applied")
+        return tracks
+    keep = {k: v for k, v in tracks.items() if k not in drop}
+    worst = ", ".join(f"{k} ({identity[k]:+.2f})" for k in sorted(drop, key=lambda k: identity[k])[:3])
+    _log(f"  identity gate: dropped {len(drop)} track(s) no longer on their seeded feature "
+         f"(seed-vs-end correlation <{need:.2f}) -> {len(keep)}   worst: {worst}")
+    return keep
+
+
 def spacing_px(cfg, out_width: int = 0) -> int:
     """Effective min spacing in PLATE pixels.
 

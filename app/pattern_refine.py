@@ -1191,7 +1191,39 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         bits.append(f"(fwd-bwd<={fb:.1f}px)")
     if certainty:
         bits.append(f"certainty med={float(np.median(list(certainty.values()))):.2f}")
+    # Seed identity: does the track still sit on the thing it started on? One NCC between the
+    # patch at its first frame and the patch at its last.
+    #
+    # This exists because nothing else in the pipeline can see a SMOOTH drifter. Certainty
+    # reads the sharpness of each frame's correlation peak and a drifting point matches its
+    # surroundings perfectly well; score rewards long unbroken tracks, which a drifter is;
+    # wobble measures deviation from the track's own smooth path, and a drift IS smooth. On
+    # the shot that exposed this, the worst track in the export (20.51px from where an
+    # independent re-track put it) scored -0.055 here while every other track scored 0.50 to
+    # 0.99 -- an outlier by a wide margin, in the one measure that asks the question directly.
+    #
+    # Deliberately used as an outlier test, not a ranker: it correlates with error strongly
+    # in the tail (pearson -0.81) but orders the middle of the pack poorly (spearman -0.38),
+    # so it answers "is this still the same feature" and nothing finer.
+    identity: Dict[str, float] = {}
+    half_id = int(cfg.refine_patch_px) // 2
+    for tid, tr in out.items():
+        pts = sorted(to_img(tr), key=lambda p: p[0])
+        if len(pts) < 2:
+            continue
+        g0, g1 = prov.get(int(pts[0][0]) - 1), prov.get(int(pts[-1][0]) - 1)
+        if g0 is None or g1 is None:
+            continue
+        p0 = _extract(g0, float(pts[0][1]), float(pts[0][2]), half_id)
+        p1 = _extract(g1, float(pts[-1][1]), float(pts[-1][2]), half_id)
+        if p0 is None or p1 is None:
+            continue
+        identity[tid] = _corr(p0, p1)
+    if identity:
+        bits.append(f"identity med={float(np.median(list(identity.values()))):.2f}")
+
     # Hand the per-track certainty to the caller for selection. Stashed on the function so
     # the (tracks, info) return contract used by tracker_core is unchanged.
     refine_tracks.last_certainty = certainty
+    refine_tracks.last_identity = identity
     return out, " ".join(bits)

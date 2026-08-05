@@ -147,6 +147,14 @@ class RunnerConfig:
     # This is the only signal measured to rank true error on real footage; certainty manages
     # -0.236 and `score` is +0.398, i.e. backwards. 0 = off. See track_filter.wobble_gate.
     wobble_rel: float = 0.0
+    # Seed identity: correlation between a track's patch at its FIRST frame and its LAST.
+    # The only test here that catches a point which slid SMOOTHLY off its feature -- such a
+    # track has a sharp correlation peak every frame (certainty passes it), runs the whole
+    # shot unbroken (score ranks it top) and never jitters (wobble sees nothing). Measured on
+    # a real plate the drifter scored -0.055 while every other exported track scored 0.50 to
+    # 0.99, so this is an outlier catch, not a ranking. Absolute rather than relative: "is
+    # this the same patch" travels between plates in a way certainty does not. 0 = off.
+    min_seed_identity: float = 0.25
     # Holes a track may carry before it is cut into continuous runs. One or two long gaps is
     # an occluded track worth keeping whole; a dozen short ones is a marginal track that kept
     # losing lock, and it blinks on and off in the 3DE viewport. -1 = off.
@@ -1870,6 +1878,17 @@ class BatchTrackerRunner:
                         # Certainty is only known once refine has measured the correlation
                         # peaks, so this gate cannot live with the others before it.
                         _certs = getattr(refine_tracks, "last_certainty", {}) or {}
+                        # Identity FIRST, and on the full set -- a track that no longer sits
+                        # on the feature it started on is not a track, so it must leave the
+                        # backfill pool as well. Gating after the top-up would have achieved
+                        # nothing: the pool is snapshotted before the certainty gate, so
+                        # anything dropped here is simply re-added there. That is exactly how
+                        # the first attempt at this failed, and how the backfill ceiling
+                        # failed before it -- filtering one stage while the drifter comes
+                        # back through another.
+                        final_tracks_out = _tf.identity_gate(
+                            final_tracks_out, getattr(refine_tracks, "last_identity", {}) or {},
+                            self.cfg, log=self._status)
                         _before_gate = dict(final_tracks_out)
                         final_tracks_out = _tf.certainty_gate(
                             final_tracks_out, _certs, self.cfg, log=self._status)
