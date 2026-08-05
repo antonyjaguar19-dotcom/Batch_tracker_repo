@@ -62,6 +62,18 @@ Reference folder layout (`refs/<name>/`): `manual.txt` (hand tracks, 3DE ASCII),
 `refs.json` (`{"658": "corner", ...}`), optional `baseline_bot.txt`, `baseline.json`.
 Pairing is positional-by-proximity, not by name.
 
+```bat
+runtime\python311\python.exe tools\make_lk_reference.py --mp4 D:\Jefrin\IN\SH004.mp4 ^
+    --out refs\SH004_lk --quality 0.01 --min-dist 30 --max-closure 1.0 --n 6
+REM Builds a reference for a real plate when no hand track exists, using pyramidal
+REM Lucas-Kanade -- a different algorithm family from the bot's NCC+ECC refine, so the two
+REM do not share pixel-locking bias. Each track is run forward then all the way back; the
+REM round-trip CLOSURE bounds that reference's own precision and is recorded per track in
+REM reference.json. NOT ground truth: a fault both methods share is invisible to it, so read
+REM the closure before believing any row. Folders are named `_lk` to keep the provenance
+REM obvious next to real hand tracks.
+```
+
 Model weights, the portable interpreter, `out/`, `_batches/`, and `backup/` are
 gitignored. `CHECKPOINTS.txt` is the by-hand weight download sheet; `setup_bot.bat`
 does it automatically.
