@@ -117,3 +117,27 @@ without being judged.
 **Still open:** the wobble metric's remaining 0.363px floor on ground truth (neighbour
 consensus is the fix, prototyped at ~0.09px), and a bench whose *exported* tracks include
 genuine failures, without which no ranker can be validated.
+
+## Comparing two runs on real footage: one trap, measured
+
+Neighbour-relative wobble — each track's motion minus the median motion of its nearest
+neighbours — is the right idea for footage with no ground truth, because the neighbours
+carry the camera move and subtracting it leaves the track's own error. It is **not
+comparable between two runs whose exports differ**, and the failure is not subtle.
+
+Measured on SH004 (real plate, sharp subject on a defocused background), comparing the
+pre-change tracker against the current one:
+
+- whole-export medians said 1.66px -> 2.60px, i.e. a large regression;
+- the same 16 features present in BOTH exports said 7 got worse and 1 better;
+- but the positions of those tracks were **bit-identical between the two runs**
+  (0.000000px, over 134 and 160 frames). Nothing about them had changed.
+
+The two exports shared only 19 of 47/41 track ids, so each track was being judged against a
+*different set of neighbours* — a different consensus, hence a different residual, on an
+unchanged track. Recomputed with the shared ids as a fixed neighbour pool, the medians are
+4.70px versus 5.00px: no regression, mixed direction, within noise.
+
+So: hold the neighbour pool fixed across the runs being compared, and check whether the
+positions actually differ before believing any per-track delta. A whole-export median of
+this metric compares two different measuring sticks.
