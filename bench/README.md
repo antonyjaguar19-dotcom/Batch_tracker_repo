@@ -219,3 +219,26 @@ the same failure as the backfill ceiling and the wobble simulation: **a filter a
 stage while the bad track re-enters through another.** Three times on one task. When adding
 a gate here, the question to ask first is not "does this test work" but "what else can put
 the track back".
+
+## Where the remaining error is, and where it is not
+
+With the identity gate in, SH004 delivers a median of 2.28px against an independent
+re-track. That residual is **not** a filtering problem — every remaining lever was measured
+and none of them help:
+
+| change | median | worst | verdict |
+|---|---|---|---|
+| shipped (41px box) | **2.28px** | **8.19px** | best measured |
+| backfill quality ceiling | 2.61px | 20.51px | reverted |
+| wobble gate on | 2.76px | 20.51px | off by default |
+| pattern box 31px | 2.64px | 16.59px | not shipped |
+| pattern box 61px | 2.92px | 13.84px | not shipped |
+
+The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
+already chooses for a soft plate — so that rule is correct and does not need revisiting.
+
+What is left is sub-pixel localisation accuracy on defocused features, which no threshold
+reaches. Moving it needs algorithmic work (a better peak model, or a tracker that handles
+low-frequency features properly), not tuning. Five hypotheses were tried and measured here;
+all five were rejected on the numbers, and the measurement loop that rejected them
+(`tools/verify_against_lk.py`) is the durable result.
