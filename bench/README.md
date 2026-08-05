@@ -236,8 +236,20 @@ and none of them help:
 | template_frames 9 (from 5) | 2.29px | 8.19px | not shipped |
 | match_ambiguity_ratio 0.80 (from 0.90) | 2.38px | 8.19px | not shipped |
 | min_corner_anisotropy 0.15 (from 0.08) | 1.25px* | 4.03px* | per-shot dial, not a default |
+| edge-axis constrained refine | 1.74px* | 8.19px* | reverted |
 
 \* trustworthy band (reference closure < 0.2px), against 1.01px / 8.19px shipped.
+
+The last row is the one that hurts, because it came from a correct diagnosis. Rather than
+delete a sliding edge track, keep it and stop it sliding: decompose each refine correction
+against the edge's own axis, keep the across-edge component, and take the along-edge
+coordinate from the track's smooth path — the correlation ridge carries no information
+there. The axis measurement was verified first and is sound (structure-tensor eigenvector,
+within 2.5° on synthetic edges at every orientation; corners read anisotropy 1.0 so the
+branch never fires on them). It still measured worse, and left the 8.19px track untouched:
+that track's ANCHOR patch is not edge-like at the frame refine anchors on, even though its
+trajectory slides for 160 frames. A per-track edge constraint has to be measured over the
+track, not read off one patch. Reverted, so no unused path is left in the code.
 
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
