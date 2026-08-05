@@ -234,6 +234,7 @@ and none of them help:
 | pattern box 31px | 2.64px | 16.59px | not shipped |
 | pattern box 61px | 2.92px | 13.84px | not shipped |
 | template_frames 9 (from 5) | 2.29px | 8.19px | not shipped |
+| match_ambiguity_ratio 0.80 (from 0.90) | 2.38px | 8.19px | not shipped |
 
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
@@ -268,9 +269,17 @@ Read the tightest band that still has rows in it. The `closure < 0.1px` line is 
 the one above it (n=5, and LK closes tightest on the low-contrast features where it is also
 least accurate), which is why the bands are printed rather than reduced to one number.
 
-What is left is sub-pixel localisation on defocused features. Seven hypotheses have now
-been measured against real footage; five were rejected outright and the two that shipped
-moved the worst case a long way and the median barely. The remaining error does not respond
+What is left is sub-pixel localisation on defocused features. Nine hypotheses have now been
+measured against real footage; six were rejected outright, one was a correction to the
+measurement itself, and the two that shipped moved the worst case a long way.
+
+The last one is worth keeping because it rules a cause OUT. The worst surviving track on
+SH004 (`BWD_0037`, 8.19px against a reference closing to 0.19px) has an identity score of
+0.935 -- it ends on a patch that matches the one it started on -- which is the signature of a
+point that snapped to an identical neighbour. Tightening `match_ambiguity_ratio` from 0.90
+to 0.80 is the setting built for exactly that, and it cost 10 tracks, moved the trustworthy
+median from 1.01px to 1.54px, and left `BWD_0037` completely unchanged. So that track is not
+a look-alike snap, and the rival-peak defence is already tight enough on this footage. The remaining error does not respond
 to thresholds or to the accuracy dials, which points at the model rather than the
 configuration — TAPNext's fixed 256px stage and NCC's behaviour on low-frequency texture
 are the two candidates, and neither is reachable from a settings file.
