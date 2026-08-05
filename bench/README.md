@@ -284,6 +284,34 @@ Part of even that last figure belongs to the reference: several of those rows ha
 of 0.3–1.4px, so the tracker is not 2.4px wrong on all of them. Its tight-closure members sit
 nearer 1.2–2.4px.
 
+### The one that moved that group: band-pass before matching
+
+`TM_CCOEFF_NORMED` subtracts each patch's MEAN but leaves its low-frequency shape. On a
+defocused feature that smooth ramp is most of the signal, and it looks nearly the same
+wherever it is evaluated — so the correlation peak is broad and its position is decided by
+very little. Subtracting a Gaussian-blurred copy of the frame removes the ramp and leaves the
+mid-frequency detail that actually localises. Template and search window are filtered
+identically, so the correlation stays valid; seed identity is still measured on unfiltered
+frames so its threshold stays calibrated.
+
+On SH004 (texture 12.6), same 40 tracks exported, trustworthy reference band:
+
+    median 1.01 -> 0.71px    worst 8.19 -> 2.16px    over 1px 6/12 -> 3/11
+
+It is tied to `soft` in `shot_profile.tune()` rather than switched on everywhere. The same
+change on the crisp bench plate (texture 417) made corners slightly worse and produced an
+**11.44px mistrack against exact ground truth**, where that run's worst had been 0.09px. The
+mechanism predicts both signs: on a defocused feature the low frequencies carry no position
+information and removing them sharpens the peak; on a crisp feature they are real signal and
+removing them throws it away. Gated, the bench is byte-identical to before — every class
+equal, worst track 0.09px, 0 of 32 over 1px.
+
+Two caveats stay attached to that SH004 figure. Usable rows fell from 25 to 17 at an
+unchanged export count, so fewer tracks earned a tight reference — the win is read in the
+trustworthy band (11 rows against 12), and the raw all-rows median of 2.22 → 0.88px partly
+reflects a different denominator. And the rule says "soft plates" on the evidence of one soft
+plate and one crisp one.
+
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
 More template averaging, which the UI calls the best-value setting on a grainy plate, is
