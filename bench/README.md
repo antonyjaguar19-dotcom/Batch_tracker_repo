@@ -235,6 +235,9 @@ and none of them help:
 | pattern box 61px | 2.92px | 13.84px | not shipped |
 | template_frames 9 (from 5) | 2.29px | 8.19px | not shipped |
 | match_ambiguity_ratio 0.80 (from 0.90) | 2.38px | 8.19px | not shipped |
+| min_corner_anisotropy 0.15 (from 0.08) | 1.25px* | 4.03px* | per-shot dial, not a default |
+
+\* trustworthy band (reference closure < 0.2px), against 1.01px / 8.19px shipped.
 
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
