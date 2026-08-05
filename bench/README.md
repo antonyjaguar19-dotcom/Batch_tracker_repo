@@ -306,6 +306,19 @@ information and removing them sharpens the peak; on a crisp feature they are rea
 removing them throws it away. Gated, the bench is byte-identical to before — every class
 equal, worst track 0.09px, 0 of 32 over 1px.
 
+The sigma is bracketed, not guessed. On SH004, trustworthy band:
+
+    sigma 1.0    median 5.00px   worst 11.73px   25 tracks
+    sigma 2.0    median 0.71px   worst  2.16px   40 tracks   <- shipped
+    sigma 3.5    median 2.65px   worst  6.03px   52 tracks
+
+A sharp minimum with both sides much worse, and the two failures fail differently. At 1.0 the
+blur being subtracted is tight enough to remove the feature itself, so what is left to
+correlate against is mostly grain -- 7x the error and 15 fewer tracks survive. At 3.5 too
+little of the ramp is removed, the peak stays broad, and the run exports MORE tracks (52) of
+LOWER quality: more of them clear the certainty bar because a broad peak still scores well,
+which is the same trap the certainty gate fell into. Track count going up is not evidence.
+
 Two caveats stay attached to that SH004 figure. Usable rows fell from 25 to 17 at an
 unchanged export count, so fewer tracks earned a tight reference — the win is read in the
 trustworthy band (11 rows against 12), and the raw all-rows median of 2.22 → 0.88px partly
