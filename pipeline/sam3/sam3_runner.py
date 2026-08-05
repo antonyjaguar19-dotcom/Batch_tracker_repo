@@ -27,8 +27,13 @@ class RunnerConfig:
     weights_path: Path
     # CV motion backstop: for camera shots, also black out pixels that move
     # independently of the camera (optical-flow residual), catching movers that
-    # the VLM/heuristics missed entirely. Disable via env BTR_MOTION_BACKSTOP=0.
-    motion_backstop: bool = True
+    # the VLM/heuristics missed entirely.
+    #
+    # OFF by default. It masks anything moving independently of the camera, which
+    # includes objects the artist has deliberately taken OUT of the exclude list --
+    # so it silently overrides a decision that was made on purpose. Opt in per shot
+    # from the UI toggle, or with BTR_MOTION_BACKSTOP=1.
+    motion_backstop: bool = False
     motion_thresh: float = 1.5          # residual flow magnitude (px @ proc width)
     motion_proc_width: int = 480        # downscale width for flow compute
     motion_min_area_frac: float = 0.0008  # ignore blobs smaller than this frac of frame
@@ -638,7 +643,11 @@ def run_sam3_batch(
         # CV motion backstop applies to CAMERA shots (track outside / exclude / task=camera),
         # including no_mask_needed (Qwen missed all movers => full-white mask otherwise).
         is_camera = (task_id.lower() == "camera") or (track_mode == "track_outside_mask") or (mask_mode == "exclude")
-        motion_on = bool(cfg.motion_backstop) and is_camera and (os.environ.get("BTR_MOTION_BACKSTOP", "1") != "0")
+        # Env is an opt-IN override to match the new default: unset leaves the backstop off,
+        # BTR_MOTION_BACKSTOP=1 forces it on even when the config says otherwise. It used to
+        # be opt-out ("1" unless explicitly "0"), which would have re-enabled it everywhere.
+        _env = os.environ.get("BTR_MOTION_BACKSTOP", "").strip()
+        motion_on = is_camera and (_env == "1" or (bool(cfg.motion_backstop) and _env != "0"))
         if motion_on:
             log("  motion backstop: ON (mask pixels moving independently of camera)")
         prev_frame_path: Optional[Path] = None

@@ -647,8 +647,23 @@ def _refine_segment(pts: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
                     break                       # drifted off the feature -> stop this side
             i += direction
 
-    _CERTAINTY["v"] = float(np.median(certs)) if certs else 0.0
+    # Same distinction as in _refine_one_multi: no per-frame certainty recorded is "unknown",
+    # not "zero". 0.0 here would be read by the gate as the worst possible localisation.
+    _CERTAINTY["v"] = float(np.median(certs)) if certs else float("nan")
     return [refined[k] for k in sorted(refined.keys())], "ok"
+
+
+def _detrend_coeffs(k: int, order: int = 2) -> np.ndarray:
+    """Savitzky-Golay smoothing kernel: least-squares polynomial fit evaluated at the centre.
+
+    A plain moving average is only exact for a CONSTANT, so any curvature in the path
+    survives it and is reported as wobble. Fitting a quadratic instead reproduces constant
+    acceleration exactly, so a smoothly accelerating camera leaves nothing behind.
+    """
+    half = k // 2
+    x = np.arange(-half, half + 1, dtype=np.float64)
+    A = np.vander(x, order + 1, increasing=True)
+    return (np.linalg.pinv(A.T @ A) @ A.T)[0]     # row 0 = value of the fit at x = 0
 
 
 def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
@@ -656,8 +671,17 @@ def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
 
     Three rounds of "the tracks wobble" have been diagnosed by eye. The PERIOD is what names
     the cause: a beat clustering at the moving-tile window length points at that stage's
-    seams, whereas a random walk has no dominant period at all. Detrending with a moving
-    average leaves the wobble; the strongest FFT bin names its beat.
+    seams, whereas a random walk has no dominant period at all. Detrending leaves the
+    wobble; the strongest FFT bin names its beat.
+
+    The detrend is a local QUADRATIC, not a moving average. A moving average is exact only
+    for constant velocity, so it leaves a residual proportional to the path's curvature and
+    reports real camera acceleration as tracking error. That was not a small effect: fed the
+    exact ground truth of a synthetic pan (bench/), the moving-average version reported
+    1.585px of wobble on tracks that are correct by construction, which is the same number it
+    reported for the bot -- the metric was measuring the plate's motion and nothing else.
+    A quadratic fit reproduces constant acceleration exactly and leaves only what genuinely
+    deviates from a smooth path.
 
     Diagnostic only -- nothing is smoothed or filtered on the basis of it.
     """
@@ -668,8 +692,10 @@ def measure_wobble(track: Track, max_period: int = 64) -> Tuple[float, int]:
     xs = np.array([p[1] for p in pts], dtype=np.float64)
     ys = np.array([p[2] for p in pts], dtype=np.float64)
 
-    k = max(3, min(9, (n // 4) | 1))          # odd moving-average window
-    ker = np.ones(k) / float(k)
+    # Window must exceed the polynomial order for the fit to smooth at all (k=3, order=2
+    # interpolates every point exactly and would report zero wobble always).
+    k = max(5, min(9, (n // 4) | 1))
+    ker = _detrend_coeffs(k, order=2)
     rx = xs - np.convolve(xs, ker, mode="same")
     ry = ys - np.convolve(ys, ker, mode="same")
     edge = k // 2                              # convolve edges are unreliable -- drop them
@@ -816,6 +842,101 @@ def _refine_one(track: Track, get: Callable[[int], Optional[np.ndarray]],
     return sorted(out, key=lambda t: t[0]) or None
 
 
+def _extend_ends(piece: Track, get: Callable[[int], Optional[np.ndarray]], cfg,
+                 edge_clamp: bool, back: bool, forward: bool) -> Track:
+    """Carry a track past its first/last point while the pattern still locks.
+
+    TAPNext only starts a track where a seed entered, and only ends it where the pass ran
+    out -- neither is a statement about the feature, which is often plainly visible for
+    frames either side. This walks outward from the ends and keeps going while the ORIGINAL
+    pattern is still found where the track's own motion says it should be.
+
+    Every rule here exists to stop the walk drifting onto something else, because an
+    extension that wanders onto a passing occluder is far worse than a short track:
+
+      * STOP at the first frame that fails -- never skip a bad frame and carry on. Skipping
+        is precisely how a point walks through an occluder and reattaches on the far side,
+        and unlike mid-track refinement there is no later evidence to correct it.
+      * match the ORIGINAL anchor only, never a re-referenced patch, so the pattern cannot
+        migrate a little per frame and end up somewhere else entirely.
+      * demand `refine_ncc_reacquire` (the "this really is the same feature" bar), not the
+        looser `lost`/`hold` used mid-track.
+      * reject an ambiguous peak (match_ambiguity_ratio), which is what stops a repetitive
+        feature -- rivets, window grids -- capturing the walk.
+      * verify each new frame backwards: find the anchor again in the previous frame starting
+        from the NEW position and require it to land back where it came from.
+      * search around where the track's own velocity predicts, and cap the total distance.
+    """
+    if not bool(getattr(cfg, "refine_extend", True)) or len(piece) < 3:
+        return piece
+    cap = int(getattr(cfg, "refine_extend_max", 48) or 0)
+    if cap <= 0:
+        return piece
+    half = int(cfg.refine_patch_px) // 2
+    ambig = float(getattr(cfg, "match_ambiguity_ratio", 1.0) or 1.0)
+    need = float(getattr(cfg, "refine_ncc_reacquire", 0.75) or 0.75)
+    fb_max = float(getattr(cfg, "refine_fb_max_px", 0.0) or 0.0)
+    search = max(4, min(int(_adaptive_search(piece, cfg)), 24))
+
+    # Anchor on the piece's sharpest frame, cleaned the same way the refine pass cleans its
+    # reference -- a grainy template blunts every peak it is matched against.
+    best_i, best_c, best_patch = -1, -1.0, None
+    for i, (f, x, y) in enumerate(piece):
+        g = get(int(f) - 1)
+        if g is None:
+            continue
+        p = _extract(g, float(x), float(y), half)
+        if p is None:
+            continue
+        c = _contrast_score(p)
+        if c > best_c:
+            best_c, best_i, best_patch = c, i, p
+    if best_patch is None:
+        return piece
+    anchor = _build_template(piece, best_i, best_patch, get,
+                             half, int(getattr(cfg, "template_frames", 1) or 1), edge_clamp)
+
+    out = list(piece)
+    for do, direction in ((back, -1), (forward, 1)):
+        if not do:
+            continue
+        seq = out if direction > 0 else out[::-1]
+        # Velocity from the two outermost points, which is the only motion evidence there is
+        # beyond the end of the track.
+        (f1, x1, y1), (f0, x0, y0) = seq[-1], seq[-2]
+        dt = max(1, abs(int(f1) - int(f0)))
+        vx, vy = (x1 - x0) / dt, (y1 - y0) / dt
+        cf, cx, cy = int(f1), float(x1), float(y1)
+        added: Track = []
+        for _ in range(cap):
+            nf = cf + direction
+            if nf < 1:
+                break
+            g = get(nf - 1)
+            if g is None:
+                break                       # past the end of the clip
+            px, py = cx + vx * direction, cy + vy * direction
+            res = _ncc_match(g, anchor, px, py, search, half, edge_clamp, ambig)
+            if res is None or res[2] < need:
+                break                       # first failure ends it -- never skip and continue
+            nx, ny, _cc = res
+            if fb_max > 0.0:
+                gp = get(cf - 1)
+                if gp is None:
+                    break
+                bk = _ncc_match(gp, anchor, nx, ny, search, half, edge_clamp, ambig)
+                if bk is None or math.hypot(bk[0] - cx, bk[1] - cy) > fb_max:
+                    break                   # it does not lead back where it came from
+            added.append((nf, float(nx), float(ny)))
+            # Track the velocity as it goes, so a gentle acceleration is followed rather than
+            # fought, but keep matching the ORIGINAL anchor.
+            vx, vy = (nx - cx) * direction, (ny - cy) * direction
+            cf, cx, cy = nf, float(nx), float(ny)
+        if added:
+            out = (out + added) if direction > 0 else (added[::-1] + out)
+    return sorted(out, key=lambda p: p[0])
+
+
 def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
                       cfg, predict=None) -> List[Track]:
     """Refine one track into one or MORE verified pieces.
@@ -837,7 +958,9 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
         if out is None:
             return []
         out = _fb_filter(out, get, cfg, edge_clamp)
-        return [out] if len(out) >= min_len else []
+        if len(out) < min_len:
+            return []
+        return [_extend_ends(out, get, cfg, edge_clamp, back=True, forward=True)]
 
     # Gap-aware: split into contiguous VISIBLE segments (occlusion = frame number jump > 1),
     # refine each on its OWN reference patch, and reassemble under one id. A segment that
@@ -874,7 +997,9 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
             continue          # 1-D feature: drop these points; keeping them RAW would be
                               # both jittery (coarse 256px position) and still sliding.
         if reason == "ok":
-            seg_certs.append(float(_CERTAINTY.get("v", 0.0)))
+            c = float(_CERTAINTY.get("v", float("nan")))
+            if not math.isnan(c):
+                seg_certs.append(c)
         use = ref if (ref is not None and len(ref) >= min_len) else seg
         if ref is not None:
             use = _fb_filter(use, get, cfg, edge_clamp)
@@ -900,8 +1025,27 @@ def _refine_one_multi(track: Track, get: Callable[[int], Optional[np.ndarray]],
         pieces.append(combined)
     # Track-level certainty = the weakest refined segment, so one badly-localised stretch is
     # not averaged away by good ones.
-    _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else 0.0
-    return [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
+    #
+    # No refined segment at all means NOT MEASURED, which is a different statement from
+    # "measured, and it localised badly" -- and reporting it as 0.0 said the second. A track
+    # whose segments all came back "no-anchor" keeps its input points by design ("better raw
+    # than deleted"), and since moving-tile now re-tracks at native resolution before this
+    # stage, those points are good: on bench/lab03 the 23 tracks scored 0.0000 this way were
+    # accurate to 0.044px, indistinguishable from the 9 that scored 0.79-1.00. Worse, the
+    # 0.0-versus-real chasm read as a clean bimodal split, which let the certainty gate
+    # override its own max_cut rail and drop all 23. NaN says "unknown" and the gate skips it.
+    _CERTAINTY["v"] = float(min(seg_certs)) if seg_certs else float("nan")
+    kept = [sorted(p, key=lambda t: t[0]) for p in pieces if len(p) >= min_len]
+    # Extend only the OUTER ends of the track. The boundaries between pieces are occlusions
+    # -- that is what split them -- and walking into one is the drift this must never do; the
+    # existing re-acquisition path is what crosses a gap, on evidence.
+    if kept:
+        if len(kept) == 1:
+            kept[0] = _extend_ends(kept[0], get, cfg, edge_clamp, back=True, forward=True)
+        else:
+            kept[0] = _extend_ends(kept[0], get, cfg, edge_clamp, back=True, forward=False)
+            kept[-1] = _extend_ends(kept[-1], get, cfg, edge_clamp, back=False, forward=True)
+    return kept
 
 
 class _GrayFromBGR:
@@ -937,7 +1081,7 @@ class _GrayFromBGR:
 
 def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: int,
                   total_frames: int, cfg, status: StatusCB = None,
-                  bgr_source=None) -> Tuple[Dict[str, Track], str]:
+                  bgr_source=None, registry=None) -> Tuple[Dict[str, Track], str]:
     """NCC+affine pattern-refine already-selected tracks at native resolution.
 
     `final_tracks` frames are 1-based absolute; y may be flipped for 3DE
@@ -974,7 +1118,12 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     certainty: Dict[str, float] = {}
     trimmed = dropped = split = gapped = 0
     for name, tr in final_tracks.items():
-        pieces = _refine_one_multi(to_img(tr), prov.get, cfg, predict)
+        # The whole per-track policy arrives through this one substitution: a view of the
+        # shot config carrying this track's overrides, or the shot config ITSELF when it has
+        # none. Nothing inside _refine_segment changes -- it already reads every parameter
+        # off cfg, so handing it a different cfg is all that per-track adaptation needs.
+        tcfg = registry.view(name, cfg) if registry is not None else cfg
+        pieces = _refine_one_multi(to_img(tr), prov.get, tcfg, predict)
         cert = float(_CERTAINTY.get("v", 0.0))
         if not pieces:
             dropped += 1
@@ -992,6 +1141,8 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             # Only a piece that failed verification gets a new id; the first keeps the
             # original name so downstream naming is unchanged for the common case.
             tid = name if k == 0 else f"{name}_{chr(ord('b') + k - 1)}"
+            if registry is not None and tid != name:
+                registry.derive(name, tid)   # same feature, so it keeps the same policy
             out[tid] = to_out(piece)
             certainty[tid] = cert
 

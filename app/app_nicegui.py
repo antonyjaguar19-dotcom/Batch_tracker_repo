@@ -1187,10 +1187,14 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                 "(Locked 100 / Slow 500 / Normal 800 / Fast 2000) and ignores this slider. "
                 "The tracking log prints the count actually used and where it came from.")
 
-            sw_motion = ui.switch("CV motion backstop", value=True,
+            # Read the default off AppState rather than hardcoding it: with a literal True here
+            # the switch re-enabled the backstop on every launch no matter what the backend
+            # default said, which is the opposite of "off by default".
+            sw_motion = ui.switch("CV motion backstop",
+                                  value=bool(getattr(state, "motion_backstop", False)),
                                   on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
-            sw_motion.tooltip("Masks objects moving independently of the camera (even ones NOT in your Exclude list). "
-                              "Turn OFF if it masks things you removed from Exclude.")
+            sw_motion.tooltip("OFF by default. Masks objects moving independently of the camera, including ones "
+                              "NOT in your Exclude list — turn ON only when Qwen missed a mover.")
 
             ui.label("Mask edge dilation (px · applies at Mask time)")
             mask_dilate = ui.slider(min=0, max=30, value=int(getattr(state, "mask_dilation_px", 10)), step=1).props("label-always")
@@ -1268,6 +1272,17 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                             "to suit. A handheld plate with a defocused background needs different numbers from a "
                             "locked-off sharp one, and a batch tool cannot be tuned by hand per shot. The log names "
                             "what it measured and what it chose. Any slider you move yourself overrides it.")
+
+            sw_ptp = ui.switch("Per-track settings (experimental)",
+                               value=bool(getattr(state, "per_track_policy", False)),
+                               on_change=lambda e: setattr(state, "per_track_policy", bool(e.value)))
+            sw_ptp.tooltip("Auto-tune picks one set of numbers for the whole shot. This measures every point as it "
+                           "is seeded — is it a sharp corner, a soft blob, a line, one of fifty identical rivets — "
+                           "and gives each its own pattern size, motion model and match thresholds. A corner and a "
+                           "blob want opposite settings and until now both got the same ones. The track report "
+                           "gains a column per point saying what it was read as and what it was given, so you can "
+                           "check the calls. TAPNext backend only: SynthEyes tracks its points internally, so there "
+                           "is nothing to steer there. Off by default — turn it on and off to compare the same shot.")
 
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")

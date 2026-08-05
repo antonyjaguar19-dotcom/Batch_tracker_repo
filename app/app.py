@@ -1112,7 +1112,10 @@ class AppState:
     current_shot_name: str = ""
     log_history: List[str] = field(default_factory=list)
     filter_query: str = ""
-    motion_backstop: bool = True   # CV optical-flow masking of movers (4th backstop)
+    # CV optical-flow masking of movers (4th backstop). OFF by default: it masks anything
+    # moving independently of the camera, including objects the artist deliberately removed
+    # from Exclude, so it overrides a decision made on purpose. Opt in per shot in the UI.
+    motion_backstop: bool = False
     chunk_long_shots: bool = True  # SynthEyes: blip/peel long shots per window (avoid OOM)
     chunk_threshold: int = 1000    # frames above which SynthEyes chunks blip/peel
     reuse_existing_masks: bool = True   # if a shot already has masks in OUT, skip re-running SAM3
@@ -1150,6 +1153,31 @@ class AppState:
     # Anything the user explicitly moves is recorded in auto_tune_overrides and always wins.
     auto_tune: bool = True
     auto_tune_overrides: Dict[str, object] = field(default_factory=dict)
+    # Per-track policy: measure what each seed is sitting on (corner / blob / edge / dense)
+    # and track it with parameters chosen for that, instead of one setting for the whole
+    # shot. TAPNext backend only: SynthEyes blips and peels internally, so there is no
+    # per-point loop to steer there.
+    #
+    # OFF by default -- turned on during 2026-08 development, then turned back off when it
+    # was measured on a real soft plate instead of a synthetic sharp one.
+    #
+    # classify_seed judges cornerness against the FRAME'S OWN percentiles, which is right for
+    # ranking and wrong for sizing. On SH004 (texture 12.6, 21% of frame in focus -- a sharp
+    # subject on a fully defocused background) shot_profile correctly chose a 41px pattern
+    # box for a soft plate, and the per-track policy then labelled 34 of 47 seeds "corner"
+    # -- the top quartile of a soft distribution is still soft -- and shrank their box to
+    # 21px on 35 tracks and 25px on 12. A soft feature needs a BIGGER box to average over
+    # what little detail it has, which is what policy_for's own `blob` branch says; the
+    # relative classifier never reaches that branch on a plate where everything is soft. So
+    # the feature fought the shot-level auto-tune and lost, on exactly the shot type it was
+    # enabled to help.
+    #
+    # bench/lab03 could not have caught this: its plate measures sharp (texture 84-606), so
+    # the classification is correct there and the A/B came back neutral (every class within
+    # 0.01px). That neutrality is what the decision to enable rested on, and it did not
+    # transfer. Re-enabling needs classify_seed to respect ABSOLUTE softness -- at minimum,
+    # never shrinking the box below the shot-level value on a plate shot_profile calls soft.
+    per_track_policy: bool = False
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
@@ -2199,6 +2227,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 # Analyze, and previously used for nothing but a table cell) cross-check it.
                 auto_tune=bool(getattr(state, "auto_tune", True)),
                 auto_tune_overrides=dict(getattr(state, "auto_tune_overrides", {}) or {}),
+                per_track_policy=bool(getattr(state, "per_track_policy", False)),
                 quality_flags=list(getattr(data, "quality_flags", []) or []),
                 # Occlusion continuity + the two accuracy passes. See RunnerConfig for why
                 # each exists; all are no-ops at 0/False.

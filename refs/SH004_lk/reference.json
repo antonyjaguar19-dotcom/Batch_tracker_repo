@@ -1,0 +1,19 @@
+{
+  "source": "D:/Jefrin/IN/SH004.mp4",
+  "frames": 160,
+  "resolution": [
+    2560,
+    1440
+  ],
+  "method": "pyramidal Lucas-Kanade, forward-backward gated at 0.3px per step",
+  "independence": "gradient-based; the bot refines with NCC + ECC, so systematic biases (pixel locking) are not shared",
+  "closure_px": {
+    "ref052": 0.1498,
+    "ref069": 0.266,
+    "ref048": 0.7843,
+    "ref014": 0.9052,
+    "ref017": 0.9106
+  },
+  "max_closure_allowed": 1.0,
+  "caveat": "NOT an artist hand-track. Closure bounds precision only for drift that does not retrace itself; a fault both methods share is invisible."
+}

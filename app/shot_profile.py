@@ -185,9 +185,19 @@ def tune(profile: ShotProfile, overrides: Optional[Dict[str, object]] = None) ->
     if fast:
         out["min_feature_dist"] = max(int(out["min_feature_dist"]), 16)
 
-    # The certainty floor is the one that removes defocused tracks. Demand more of them
-    # exactly when the plate has a lot of soft area to seed into.
-    if soft or p.sharp_frac < 0.5:
+    # The certainty floor is the one that removes defocused tracks, and how hard it should
+    # push depends on how much of the frame is SOFT -- not on whether the plate as a whole
+    # reads soft. A sharp character against a fully defocused background measures crisp
+    # overall, because the subject alone lifts texture and sharpness above the `soft`
+    # thresholds; yet on a camera track that subject is masked out, so every seed lands on
+    # the soft background and the whole export wobbles. sharp_frac is the one measure that
+    # sees this (it is deliberately relative to the frame's own best tiles), so it sets the
+    # floor rather than merely tripping it.
+    if p.sharp_frac < 0.25:
+        # Most of the frame is soft: nearly every seed will land there, so demand real
+        # localisation before a track ships.
+        out["min_track_certainty"] = 0.35
+    elif soft or p.sharp_frac < 0.5:
         out["min_track_certainty"] = 0.25
     else:
         out["min_track_certainty"] = 0.12

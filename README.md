@@ -132,8 +132,9 @@ Both export classic 3D Equalizer 2D-track ASCII, frame numbers aligned to the or
 - **Four "mover" backstops** for camera solves (exclude moving subjects):
   1. VLM `moving_things`, 2. deterministic dynamic-subjects (animals/people/vehicles),
   3. scene-text heuristic, 4. **CV optical-flow** (masks pixels moving independently of
-  the camera — even objects never named). The CV layer is a UI toggle
-  (**CV motion backstop**) / env `BTR_MOTION_BACKSTOP=0`.
+  the camera — even objects never named). The CV layer is **OFF by default**, because it
+  also masks objects you deliberately removed from Exclude; opt in with the UI toggle
+  (**CV motion backstop**) or env `BTR_MOTION_BACKSTOP=1`.
 - **0-track diagnostics**: a shot that exports nothing logs which stage dropped the
   tracks (seeding / post-filter / mask gating / too-short).
 - **VRAM/RAM-safe tracking** (long / high-res shots, TAPNext++ path): tracks the shot in
@@ -151,6 +152,6 @@ Both export classic 3D Equalizer 2D-track ASCII, frame numbers aligned to the or
 | `BTR_TAPNEXT_CKPT` | TAPNext++ checkpoint `.pt` path | (auto-resolve under `pipeline/tapnext-main/checkpoints/`) |
 | `BTR_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
 | `QWEN2_MODEL_DIR` | Force a specific Qwen model folder | (auto-resolve under `pipeline/qwen/models/`) |
-| `BTR_MOTION_BACKSTOP` | `0` disables the CV motion mask | `1` |
+| `BTR_MOTION_BACKSTOP` | `1` enables the CV motion mask (off unless asked for) | `0` |
 
 
