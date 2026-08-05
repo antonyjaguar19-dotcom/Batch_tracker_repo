@@ -245,6 +245,29 @@ Two changes did survive measurement, and both attack localisation rather than se
 the **identity gate** (worst track 20.51 -> 8.19px) and the **adaptive sub-pixel fit**
 (median 2.28 -> 2.22px, and equal-or-better on every synthetic peak width).
 
+### That 2.22px is not the tracker's error
+
+It is the *disagreement between two trackers*, and it inherits whatever the LK reference got
+wrong. `verify_against_lk` calls a row usable when its closure is under half the
+disagreement, which lets a reference that is only good to 0.9px sit in the median unremarked.
+Stratifying by how tight the reference actually is:
+
+    all usable rows        n=25   median 2.22px
+    closure < 0.5px        n=20   median 1.35px
+    closure < 0.3px        n=13   median 1.25px
+    closure < 0.2px        n=12   median 1.01px   <- reference good to ~0.2px
+
+**Over half of what was being reported as tracker error was the reference's own
+imprecision.** Where the reference can be trusted the bot sits at ~1px, with the best tracks
+at 0.37-0.62px. The tool now prints this breakdown, because the single headline figure
+flattered the reference and slandered the tracker — the same class of mistake as the wobble
+metric that measured the plate, caught this time in the measuring instrument rather than in
+the pipeline.
+
+Read the tightest band that still has rows in it. The `closure < 0.1px` line is noisier than
+the one above it (n=5, and LK closes tightest on the low-contrast features where it is also
+least accurate), which is why the bands are printed rather than reduced to one number.
+
 What is left is sub-pixel localisation on defocused features. Seven hypotheses have now
 been measured against real footage; five were rejected outright and the two that shipped
 moved the worst case a long way and the median barely. The remaining error does not respond

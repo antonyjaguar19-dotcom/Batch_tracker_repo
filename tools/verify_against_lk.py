@@ -115,6 +115,22 @@ def main():
               f"p90 {t[int(0.9 * (len(t) - 1))]:.2f}px  worst {t[-1]:.2f}px")
         print(f"  over 1px: {sum(1 for v in t if v > 1.0)}/{len(t)}   "
               f"over 3px: {sum(1 for v in t if v > 3.0)}/{len(t)}")
+
+        # Stratify by how good the REFERENCE is, because the line above is not the bot's
+        # error -- it is the disagreement between two trackers, and it inherits whatever
+        # the reference got wrong. The `usable` rule allows closure up to half the
+        # disagreement, so a row with a 0.9px reference can sit in that median unremarked.
+        # On the shot this was written for, tightening the reference moved the figure from
+        # 2.22px to 1.00px: over half of what was being reported as tracker error was the
+        # reference's own imprecision. Read the tightest band that still has rows in it.
+        print("\n  by reference quality (the tightest band is the real estimate):")
+        for cut in (0.5, 0.3, 0.2, 0.1):
+            band = sorted(m for m, mx, cl, n, tot, name in rows
+                          if not math.isnan(cl) and cl < cut)
+            if len(band) >= 3:
+                print(f"    closure < {cut:.1f}px : n={len(band):3d}   median {st.median(band):5.2f}px"
+                      f"   worst {band[-1]:6.2f}px"
+                      f"   over 1px {sum(1 for v in band if v > 1.0)}/{len(band)}")
     else:
         print("\nno row had a reference tight enough to be evidence")
 
