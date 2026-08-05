@@ -1129,6 +1129,10 @@ class AppState:
     # better (multi-frame template, upsampled peak, iterated refine), not from discarding.
     track_max_output: int = 600    # TAPNext: safety ceiling on exported tracks, 0=unlimited
     min_export_tracks: int = 40    # top a thin export up from the best rejects, flagged
+    # Wobble gate: drop tracks deviating from their own smooth path by more than this
+    # multiple of the shot's OWN median. Relative because wobble scales with plate and
+    # lens; the shot is its own yardstick. 0 = off.
+    wobble_rel: float = 1.5
     max_track_gaps: int = 2        # more holes than this -> split into continuous runs
     template_frames: int = 5       # frames averaged into the reference pattern (1 = off)
     refine_iterations: int = 3     # match/polish passes per frame (1 = off)
@@ -2203,6 +2207,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 spread_scale_with_res=bool(getattr(state, "spread_scale_with_res", True)),
                 max_output_tracks=int(getattr(state, "track_max_output", 600) or 0),
                 min_export_tracks=int(getattr(state, "min_export_tracks", 40) or 0),
+                wobble_rel=float(getattr(state, "wobble_rel", 1.5) or 0.0),
                 max_track_gaps=int(getattr(state, "max_track_gaps", 2)),
                 template_frames=int(getattr(state, "template_frames", 5) or 1),
                 refine_iterations=int(getattr(state, "refine_iterations", 3) or 1),

@@ -1089,6 +1089,8 @@ ui.add_head_html("""
   .bt-card    { background: #141924; border: 1px solid rgba(255,255,255,.07);
                 border-radius: 10px; box-shadow: none; }
   .bt-card > .q-card__section { padding: 12px 14px; }
+  .bt-set { border: 1px solid rgba(255,255,255,.09); border-radius: 8px; margin-bottom: 6px; }
+  .bt-set > .q-expansion-item__container > .q-item { min-height: 38px; font-weight: 600; }
   .bt-section { font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
                 color: #8a94a6; font-weight: 600; }
   .bt-status  { font-size: 13px; color: #cbd5e1; }
@@ -1175,114 +1177,143 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
     with ui.card().classes("w-full bt-card"):
         with ui.expansion("Settings", icon="tune", value=False).classes("w-full"):
+            # Grouped into collapsible sections rather than one flat list. There are ~45
+            # controls here; as a single scroll the only way to find one was to know roughly
+            # where it lived, and several blocks had no heading at all. Sections are ordered
+            # by the pipeline itself -- analyse, mask, select, then per-backend tracking --
+            # so a setting can be found by asking which stage it belongs to.
+            #
+            # Grouping only: every control, default and binding below is unchanged, and each
+            # stays in the backend scope it was already in (moving one between the SynthEyes
+            # and TAPNext boxes would change which backend it applies to, which is a
+            # behaviour change and not what "organise the settings" asks for).
+
             # ---- Universal (both backends / AI pipeline) ----
-            ui.label("Analysis & seeding").classes("bt-section q-mt-sm")
-            ui.label("Qwen2 Sample Density")
-            qwen_fps = ui.slider(min=1, max=8, value=4).props("label-always")
-            ui.label("Seed Count (Max Tracks)")
-            seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
+            with ui.expansion("Analysis", icon="auto_awesome").classes("w-full bt-set"):
+                ui.label("Qwen2 Sample Density")
+                qwen_fps = ui.slider(min=1, max=8, value=4).props("label-always")
+                qwen_fps.tooltip("Frames per shot handed to Qwen2 when describing it. Higher = more of the "
+                                 "shot is looked at, slower Analyze.")
+
+            with ui.expansion("Seeding", icon="scatter_plot").classes("w-full bt-set"):
+                ui.label("Seed Count (Max Tracks)")
+                seed_count = ui.slider(min=100, max=3000, value=1200, step=50).props("label-always")
             seed_count.tooltip(
                 "Always used by TAPNext++. On SynthEyes it only applies when the SynthEyes "
                 "preset below is set to 'Custom' — every other preset has its own fixed count "
                 "(Locked 100 / Slow 500 / Normal 800 / Fast 2000) and ignores this slider. "
                 "The tracking log prints the count actually used and where it came from.")
 
-            # Read the default off AppState rather than hardcoding it: with a literal True here
-            # the switch re-enabled the backstop on every launch no matter what the backend
-            # default said, which is the opposite of "off by default".
-            sw_motion = ui.switch("CV motion backstop",
-                                  value=bool(getattr(state, "motion_backstop", False)),
-                                  on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
-            sw_motion.tooltip("OFF by default. Masks objects moving independently of the camera, including ones "
-                              "NOT in your Exclude list — turn ON only when Qwen missed a mover.")
+            with ui.expansion("Masking", icon="layers").classes("w-full bt-set"):
+                # Read the default off AppState rather than hardcoding it: with a literal True here
+                # the switch re-enabled the backstop on every launch no matter what the backend
+                # default said, which is the opposite of "off by default".
+                sw_motion = ui.switch("CV motion backstop",
+                                      value=bool(getattr(state, "motion_backstop", False)),
+                                      on_change=lambda e: setattr(state, "motion_backstop", bool(e.value)))
+                sw_motion.tooltip("OFF by default. Masks objects moving independently of the camera, including ones "
+                                  "NOT in your Exclude list — turn ON only when Qwen missed a mover.")
 
-            ui.label("Mask edge dilation (px · applies at Mask time)")
-            mask_dilate = ui.slider(min=0, max=30, value=int(getattr(state, "mask_dilation_px", 10)), step=1).props("label-always")
-            mask_dilate.on_value_change(lambda e: setattr(state, "mask_dilation_px", int(e.value or 0)))
-            mask_dilate.tooltip("Grows the excluded (mover) region when masks are GENERATED, so trackers stay off soft "
-                                "edges — hair, motion-blur fringe. Mirrors SynthEyes Mask ML's Mask Dilation and helps "
-                                "both backends. Only affects masks made from now on: re-run Generate masks to apply it "
-                                "to existing shots (or use the track-time margin in TAPNext++ settings instead).")
+                ui.label("Mask edge dilation (px · applies at Mask time)")
+                mask_dilate = ui.slider(min=0, max=30, value=int(getattr(state, "mask_dilation_px", 10)), step=1).props("label-always")
+                mask_dilate.on_value_change(lambda e: setattr(state, "mask_dilation_px", int(e.value or 0)))
+                mask_dilate.tooltip("Grows the excluded (mover) region when masks are GENERATED, so trackers stay off soft "
+                                    "edges — hair, motion-blur fringe. Mirrors SynthEyes Mask ML's Mask Dilation and helps "
+                                    "both backends. Only affects masks made from now on: re-run Generate masks to apply it "
+                                    "to existing shots (or use the track-time margin in TAPNext++ settings instead).")
 
             # Applies to BOTH backends: the selection runs on the finished tracks, so it
             # trims a SynthEyes export just as it does a TAPNext one. Lives here rather than
             # in the TAPNext box, which is hidden whenever SynthEyes is selected.
-            ui.separator().classes("q-my-sm")
-            ui.label("Final track selection (both backends)").classes("bt-section")
-            ui.label("Export only the best N tracks")
-            track_max = ui.number(value=int(getattr(state, "track_max_output", 120)), min=0, max=1000, precision=0
-                                  ).props("dense outlined").classes("w-full")
-            track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
-            track_max.tooltip("How many tracks reach 3DE, best-scoring first and still evenly spread. A camera "
-                              "solve wants on the order of 100 good points — exporting everything that was tracked "
-                              "just moves the cleanup onto you. 0 = export everything (old behaviour).")
+            with ui.expansion("Track selection & filters", icon="filter_alt").classes("w-full bt-set"):
+                ui.label("These decide how many tracks reach 3DE. On a typical shot the spacing "
+                         "dial in the backend section removes far more than any bar here."
+                         ).classes("bt-hint")
+                ui.label("Export only the best N tracks")
+                track_max = ui.number(value=int(getattr(state, "track_max_output", 120)), min=0, max=1000, precision=0
+                                      ).props("dense outlined").classes("w-full")
+                track_max.on_value_change(lambda e: setattr(state, "track_max_output", int(e.value or 0)))
+                track_max.tooltip("How many tracks reach 3DE, best-scoring first and still evenly spread. A camera "
+                                  "solve wants on the order of 100 good points — exporting everything that was tracked "
+                                  "just moves the cleanup onto you. 0 = export everything (old behaviour).")
 
-            ui.label("Max holes per track (-1 = allow any)")
-            gaps = ui.slider(min=-1, max=8, value=int(getattr(state, "max_track_gaps", 2)), step=1).props("label-always")
-            gaps.on_value_change(lambda e: setattr(state, "max_track_gaps", int(e.value if e.value is not None else 2)))
-            gaps.tooltip("A track that survives someone walking past it carries one long hole, which is worth "
-                         "keeping as a single track. A track with a dozen short holes is not an occluded track — "
-                         "it kept losing and regaining lock, and it blinks on and off in the 3DE viewport. Above "
-                         "this many holes the track is cut into its continuous pieces instead.")
+                ui.label("Never export fewer than")
+                min_exp = ui.number(value=int(getattr(state, "min_export_tracks", 40)), min=0, max=200, precision=0
+                                    ).props("dense outlined").classes("w-full")
+                min_exp.on_value_change(lambda e: setattr(state, "min_export_tracks", int(e.value or 0)))
+                min_exp.tooltip("If fewer tracks clear the quality bar than this, the shortfall is made up from the "
+                                "best of the rejected ones and those are marked 'weak' in the per-shot CSV. A handful "
+                                "of tracks and no explanation is not a usable delivery. 0 = only ever export what passes.")
 
-            ui.label("Never export fewer than")
-            min_exp = ui.number(value=int(getattr(state, "min_export_tracks", 40)), min=0, max=200, precision=0
-                                ).props("dense outlined").classes("w-full")
-            min_exp.on_value_change(lambda e: setattr(state, "min_export_tracks", int(e.value or 0)))
-            min_exp.tooltip("If fewer tracks clear the quality bar than this, the shortfall is made up from the "
-                            "best of the rejected ones and those are marked 'weak' in the per-shot CSV. A handful "
-                            "of tracks and no explanation is not a usable delivery. 0 = only ever export what passes.")
+                ui.label("Minimum track length (frames)")
+                min_len = ui.slider(min=0, max=120, value=int(getattr(state, "min_track_frames", 24)), step=4).props("label-always")
+                min_len.on_value_change(lambda e: setattr(state, "min_track_frames", int(e.value or 0)))
+                min_len.tooltip("Drop tracks too short to constrain a solve. Automatically scaled down on short "
+                                "shots (never more than a quarter of the shot), so a 40-frame plate still exports. "
+                                "0 = keep any length.")
 
-            ui.label("Pattern frames averaged (1 = off)")
-            tpl = ui.slider(min=1, max=11, value=int(getattr(state, "template_frames", 5)), step=1).props("label-always")
-            tpl.on_value_change(lambda e: setattr(state, "template_frames", int(e.value or 1)))
-            tpl.tooltip("Builds each point's reference pattern by averaging it over this many frames instead of "
-                        "grabbing one. Averaging cancels grain, which sharpens every match that pattern ever makes "
-                        "— so tracks get more accurate AND more of them clear the quality bar. The best-value "
-                        "setting here for grainy or handheld plates.")
+                ui.label("Quality floor (0 = off)")
+                min_score = ui.slider(min=0.0, max=0.8, value=float(getattr(state, "min_track_score", 0.35)), step=0.05).props("label-always")
+                min_score.on_value_change(lambda e: setattr(state, "min_track_score", float(e.value or 0.0)))
+                min_score.tooltip("Discard tracks scoring below this on length, smoothness and stability — judged "
+                                  "on each track's OWN path, so a fast foreground point is never punished for "
+                                  "moving unlike the background. Raise it if you are still deleting tracks by hand. "
+                                  "If the floor would empty a shot it is relaxed automatically and the best are kept.")
 
-            ui.label("Refine passes per frame (1 = off)")
-            iters = ui.slider(min=1, max=6, value=int(getattr(state, "refine_iterations", 3)), step=1).props("label-always")
-            iters.on_value_change(lambda e: setattr(state, "refine_iterations", int(e.value or 1)))
-            iters.tooltip("Repeats match → polish → re-match until the point stops moving. One pass leaves the "
-                          "answer short whenever the starting guess was poor, which is the fast-motion and "
-                          "low-contrast case. Each pass is only kept if it does not make the match worse. "
-                          "Main cost of the slower run.")
+                ui.label("Wobble gate (x shot median · 0 = off)")
+                wob_rel = ui.slider(min=0.0, max=4.0, value=float(getattr(state, "wobble_rel", 1.5)), step=0.1).props("label-always")
+                wob_rel.on_value_change(lambda e: setattr(state, "wobble_rel", float(e.value or 0.0)))
+                wob_rel.tooltip("Drops tracks that deviate from their own smooth path by more than this multiple of "
+                                "the shot's OWN median. Relative because wobble scales with plate, lens and grain, so "
+                                "the shot is its own yardstick. This is the only gate measured to catch a genuinely "
+                                "mistracked point — on a test shot it removed one sitting 20px from where an "
+                                "independent re-track put it, which every other bar had passed. Lower = stricter and "
+                                "fewer tracks; 0 = off.")
 
-            ui.label("Minimum track length (frames)")
-            min_len = ui.slider(min=0, max=120, value=int(getattr(state, "min_track_frames", 24)), step=4).props("label-always")
-            min_len.on_value_change(lambda e: setattr(state, "min_track_frames", int(e.value or 0)))
-            min_len.tooltip("Drop tracks too short to constrain a solve. Automatically scaled down on short "
-                            "shots (never more than a quarter of the shot), so a 40-frame plate still exports. "
-                            "0 = keep any length.")
+                ui.label("Max holes per track (-1 = allow any)")
+                gaps = ui.slider(min=-1, max=8, value=int(getattr(state, "max_track_gaps", 2)), step=1).props("label-always")
+                gaps.on_value_change(lambda e: setattr(state, "max_track_gaps", int(e.value if e.value is not None else 2)))
+                gaps.tooltip("A track that survives someone walking past it carries one long hole, which is worth "
+                             "keeping as a single track. A track with a dozen short holes is not an occluded track — "
+                             "it kept losing and regaining lock, and it blinks on and off in the 3DE viewport. Above "
+                             "this many holes the track is cut into its continuous pieces instead.")
 
-            ui.label("Quality floor (0 = off)")
-            min_score = ui.slider(min=0.0, max=0.8, value=float(getattr(state, "min_track_score", 0.35)), step=0.05).props("label-always")
-            min_score.on_value_change(lambda e: setattr(state, "min_track_score", float(e.value or 0.0)))
-            min_score.tooltip("Discard tracks scoring below this on length, smoothness and stability — judged "
-                              "on each track's OWN path, so a fast foreground point is never punished for "
-                              "moving unlike the background. Raise it if you are still deleting tracks by hand. "
-                              "If the floor would empty a shot it is relaxed automatically and the best are kept.")
+            with ui.expansion("Accuracy (both backends)", icon="center_focus_strong").classes("w-full bt-set"):
+                ui.label("Pattern frames averaged (1 = off)")
+                tpl = ui.slider(min=1, max=11, value=int(getattr(state, "template_frames", 5)), step=1).props("label-always")
+                tpl.on_value_change(lambda e: setattr(state, "template_frames", int(e.value or 1)))
+                tpl.tooltip("Builds each point's reference pattern by averaging it over this many frames instead of "
+                            "grabbing one. Averaging cancels grain, which sharpens every match that pattern ever makes "
+                            "— so tracks get more accurate AND more of them clear the quality bar. The best-value "
+                            "setting here for grainy or handheld plates.")
 
-            ui.separator().classes("q-my-sm")
-            sw_auto = ui.switch("Auto-tune per shot", value=bool(getattr(state, "auto_tune", True)),
-                                on_change=lambda e: setattr(state, "auto_tune", bool(e.value)))
-            sw_auto.tooltip("Reads each shot before tracking it — how sharp it is, how grainy, how much detail, "
-                            "how fast it moves — and sets the feature strength, pattern size and match thresholds "
-                            "to suit. A handheld plate with a defocused background needs different numbers from a "
-                            "locked-off sharp one, and a batch tool cannot be tuned by hand per shot. The log names "
-                            "what it measured and what it chose. Any slider you move yourself overrides it.")
+                ui.label("Refine passes per frame (1 = off)")
+                iters = ui.slider(min=1, max=6, value=int(getattr(state, "refine_iterations", 3)), step=1).props("label-always")
+                iters.on_value_change(lambda e: setattr(state, "refine_iterations", int(e.value or 1)))
+                iters.tooltip("Repeats match → polish → re-match until the point stops moving. One pass leaves the "
+                              "answer short whenever the starting guess was poor, which is the fast-motion and "
+                              "low-contrast case. Each pass is only kept if it does not make the match worse. "
+                              "Main cost of the slower run.")
 
-            sw_ptp = ui.switch("Per-track settings (experimental)",
-                               value=bool(getattr(state, "per_track_policy", False)),
-                               on_change=lambda e: setattr(state, "per_track_policy", bool(e.value)))
-            sw_ptp.tooltip("Auto-tune picks one set of numbers for the whole shot. This measures every point as it "
-                           "is seeded — is it a sharp corner, a soft blob, a line, one of fifty identical rivets — "
-                           "and gives each its own pattern size, motion model and match thresholds. A corner and a "
-                           "blob want opposite settings and until now both got the same ones. The track report "
-                           "gains a column per point saying what it was read as and what it was given, so you can "
-                           "check the calls. TAPNext backend only: SynthEyes tracks its points internally, so there "
-                           "is nothing to steer there. Off by default — turn it on and off to compare the same shot.")
+            with ui.expansion("Automation", icon="smart_toy").classes("w-full bt-set"):
+                sw_auto = ui.switch("Auto-tune per shot", value=bool(getattr(state, "auto_tune", True)),
+                                    on_change=lambda e: setattr(state, "auto_tune", bool(e.value)))
+                sw_auto.tooltip("Reads each shot before tracking it — how sharp it is, how grainy, how much detail, "
+                                "how fast it moves — and sets the feature strength, pattern size and match thresholds "
+                                "to suit. A handheld plate with a defocused background needs different numbers from a "
+                                "locked-off sharp one, and a batch tool cannot be tuned by hand per shot. The log names "
+                                "what it measured and what it chose. Any slider you move yourself overrides it.")
+
+                sw_ptp = ui.switch("Per-track settings (experimental)",
+                                   value=bool(getattr(state, "per_track_policy", False)),
+                                   on_change=lambda e: setattr(state, "per_track_policy", bool(e.value)))
+                sw_ptp.tooltip("Auto-tune picks one set of numbers for the whole shot. This measures every point as it "
+                               "is seeded — is it a sharp corner, a soft blob, a line, one of fifty identical rivets — "
+                               "and gives each its own pattern size, motion model and match thresholds. A corner and a "
+                               "blob want opposite settings and until now both got the same ones. The track report "
+                               "gains a column per point saying what it was read as and what it was given, so you can "
+                               "check the calls. TAPNext backend only: SynthEyes tracks its points internally, so there "
+                               "is nothing to steer there. Off by default — turn it on and off to compare the same shot.")
 
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
@@ -1326,201 +1357,203 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
             # ---- TAPNext++-only (shown when backend = tapnext) ----
             with ui.column().classes("w-full gap-2") as tap_box:
                 ui.label("TAPNext++ settings").classes("bt-section q-mt-sm")
-                ui.label("Grid Size")
-                grid_size = ui.slider(min=4, max=20, value=10).props("label-always")
-                ui.label("Min Seed Distance (px)")
-                seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
-                ui.label("Track chunks (0 = Auto)")
-                track_chunks = ui.number(value=0, min=0, max=16, precision=0).props("dense outlined").classes("w-full")
-                track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
-                track_chunks.tooltip("Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
-                                     "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
+                with ui.expansion("Performance & chunking", icon="memory").classes("w-full bt-set"):
+                    ui.label("Grid Size")
+                    grid_size = ui.slider(min=4, max=20, value=10).props("label-always")
+                    ui.label("Min Seed Distance (px)")
+                    seed_min_dist = ui.slider(min=0, max=50, value=12).props("label-always")
+                    ui.label("Track chunks (0 = Auto)")
+                    track_chunks = ui.number(value=0, min=0, max=16, precision=0).props("dense outlined").classes("w-full")
+                    track_chunks.on_value_change(lambda e: setattr(state, "track_chunks", int(e.value or 0)))
+                    track_chunks.tooltip("Split long/high-res shots into N overlapping chunks to avoid GPU OOM "
+                                         "(track IDs are chained across chunks). 0 = pick automatically from free VRAM.")
 
-                ui.label("Track spacing (px @1920 · density dial)")
-                track_spacing = ui.slider(min=10, max=300, value=int(getattr(state, "track_spacing_px", 60)), step=5).props("label-always")
-                track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 60)))
-                track_spacing.tooltip("Min gap between kept tracks, measured ON SCREEN at several sampled frames (not on "
-                                      "each track's average position), so tracks can't clump at the start or end of a "
-                                      "moving shot. Quoted against a 1920-wide plate and scaled up automatically — at 4K "
-                                      "a value of 60 becomes 120px — so one setting looks the same at any resolution. "
-                                      "Raise it for fewer, wider-spaced tracks.")
+                with ui.expansion("Spread & seeding", icon="grain").classes("w-full bt-set"):
+                    ui.label("Track spacing (px @1920 · density dial)")
+                    track_spacing = ui.slider(min=10, max=300, value=int(getattr(state, "track_spacing_px", 60)), step=5).props("label-always")
+                    track_spacing.on_value_change(lambda e: setattr(state, "track_spacing_px", int(e.value or 60)))
+                    track_spacing.tooltip("Min gap between kept tracks, measured ON SCREEN at several sampled frames (not on "
+                                          "each track's average position), so tracks can't clump at the start or end of a "
+                                          "moving shot. Quoted against a 1920-wide plate and scaled up automatically — at 4K "
+                                          "a value of 60 becomes 120px — so one setting looks the same at any resolution. "
+                                          "Raise it for fewer, wider-spaced tracks.")
 
-                ui.label("Mask safety margin at track time (px)")
-                mask_margin = ui.slider(min=0, max=40, value=int(getattr(state, "mask_margin_px", 8)), step=1).props("label-always")
-                mask_margin.on_value_change(lambda e: setattr(state, "mask_margin_px", int(e.value or 0)))
-                mask_margin.tooltip("Pulls seeding and mask gating IN from the matte edge by this many pixels. "
-                                    "SAM3 mattes often stop just short of hair / motion-blur fringe, and a track left in "
-                                    "that halo sticks to the character and slides. Applies to the masks you ALREADY have "
-                                    "— no re-masking needed. 0 = use the matte exactly as-is.")
+                    ui.label("Mask safety margin at track time (px)")
+                    mask_margin = ui.slider(min=0, max=40, value=int(getattr(state, "mask_margin_px", 8)), step=1).props("label-always")
+                    mask_margin.on_value_change(lambda e: setattr(state, "mask_margin_px", int(e.value or 0)))
+                    mask_margin.tooltip("Pulls seeding and mask gating IN from the matte edge by this many pixels. "
+                                        "SAM3 mattes often stop just short of hair / motion-blur fringe, and a track left in "
+                                        "that halo sticks to the character and slides. Applies to the masks you ALREADY have "
+                                        "— no re-masking needed. 0 = use the matte exactly as-is.")
 
-                ui.label("Stagger new track starts (1 = off)")
-                stagger = ui.slider(min=1, max=8, value=int(getattr(state, "seed_stagger", 4)), step=1).props("label-always")
-                stagger.on_value_change(lambda e: setattr(state, "seed_stagger", int(e.value or 1)))
-                stagger.tooltip("New tracks used to all begin on the first frame of each re-seed window, so they "
-                                "arrived in a visible clump every N frames. This splits each window's new points "
-                                "across this many entry times so they appear steadily. Also picks up detail that "
-                                "only becomes visible mid-window. Same number of tracks, spread out.")
+                    ui.label("Stagger new track starts (1 = off)")
+                    stagger = ui.slider(min=1, max=8, value=int(getattr(state, "seed_stagger", 4)), step=1).props("label-always")
+                    stagger.on_value_change(lambda e: setattr(state, "seed_stagger", int(e.value or 1)))
+                    stagger.tooltip("New tracks used to all begin on the first frame of each re-seed window, so they "
+                                    "arrived in a visible clump every N frames. This splits each window's new points "
+                                    "across this many entry times so they appear steadily. Also picks up detail that "
+                                    "only becomes visible mid-window. Same number of tracks, spread out.")
 
-                ui.label("Max tracks starting together (0 = unlimited)")
-                start_cap = ui.slider(min=0, max=60, value=int(getattr(state, "spread_max_starts_per_window", 0)), step=5).props("label-always")
-                start_cap.on_value_change(lambda e: setattr(state, "spread_max_starts_per_window", int(e.value or 0)))
-                start_cap.tooltip("Hard cap on how many tracks may begin within the same few frames — the "
-                                  "best-scoring ones win. Use it if starts still look bunched after staggering; "
-                                  "0 leaves it to the staggering alone.")
+                    ui.label("Max tracks starting together (0 = unlimited)")
+                    start_cap = ui.slider(min=0, max=60, value=int(getattr(state, "spread_max_starts_per_window", 0)), step=5).props("label-always")
+                    start_cap.on_value_change(lambda e: setattr(state, "spread_max_starts_per_window", int(e.value or 0)))
+                    start_cap.tooltip("Hard cap on how many tracks may begin within the same few frames — the "
+                                      "best-scoring ones win. Use it if starts still look bunched after staggering; "
+                                      "0 leaves it to the staggering alone.")
 
-                ui.label("Reject look-alike matches (1.0 = off)")
-                ambig = ui.slider(min=0.7, max=1.0, value=float(getattr(state, "match_ambiguity_ratio", 0.90)), step=0.02).props("label-always")
-                ambig.on_value_change(lambda e: setattr(state, "match_ambiguity_ratio", float(e.value or 1.0)))
-                ambig.tooltip("Repeating detail — bolts, rivets, window grids, tiles — gives the matcher several "
-                              "near-identical answers, and it would silently pick the one NEXT DOOR at high "
-                              "confidence. This refuses to answer when a rival is nearly as good, and the point "
-                              "holds its previous position instead. Lower = stricter.")
+                with ui.expansion("Matching", icon="join_inner").classes("w-full bt-set"):
+                    ui.label("Reject look-alike matches (1.0 = off)")
+                    ambig = ui.slider(min=0.7, max=1.0, value=float(getattr(state, "match_ambiguity_ratio", 0.90)), step=0.02).props("label-always")
+                    ambig.on_value_change(lambda e: setattr(state, "match_ambiguity_ratio", float(e.value or 1.0)))
+                    ambig.tooltip("Repeating detail — bolts, rivets, window grids, tiles — gives the matcher several "
+                                  "near-identical answers, and it would silently pick the one NEXT DOOR at high "
+                                  "confidence. This refuses to answer when a rival is nearly as good, and the point "
+                                  "holds its previous position instead. Lower = stricter.")
 
-                ui.label("Max search radius (px · fast motion)")
-                smax = ui.slider(min=24, max=128, value=int(getattr(state, "refine_search_max", 64)), step=8).props("label-always")
-                smax.on_value_change(lambda e: setattr(state, "refine_search_max", int(e.value or 24)))
-                smax.tooltip("How far the matcher may look when a point is moving fast. A fixed small radius makes "
-                             "a fast feature land outside the search box, so the match snaps to whatever is inside "
-                             "and slides. Grows only as fast as the point actually moves; slow shots keep the tight "
-                             "box. Cost rises with the SQUARE of this, so don't raise it without need.")
+                    ui.label("Max search radius (px · fast motion)")
+                    smax = ui.slider(min=24, max=128, value=int(getattr(state, "refine_search_max", 64)), step=8).props("label-always")
+                    smax.on_value_change(lambda e: setattr(state, "refine_search_max", int(e.value or 24)))
+                    smax.tooltip("How far the matcher may look when a point is moving fast. A fixed small radius makes "
+                                 "a fast feature land outside the search box, so the match snaps to whatever is inside "
+                                 "and slides. Grows only as fast as the point actually moves; slow shots keep the tight "
+                                 "box. Cost rises with the SQUARE of this, so don't raise it without need.")
 
-                ui.separator().classes("q-my-sm")
-                ui.label("Occlusion & accuracy").classes("bt-section")
-                sw_occl = ui.switch("Survive occlusion (break, then resume)",
-                                    value=bool(getattr(state, "occlusion_continuity", True)),
-                                    on_change=lambda e: setattr(state, "occlusion_continuity", bool(e.value)))
-                sw_occl.tooltip("A character crossing a point used to DELETE that track for the whole shot. "
-                                "With this on the point just goes missing for those frames and resumes after — "
-                                "3DE reads the gap natively. Turn off to restore the old drop-if-ever-covered rule.")
+                with ui.expansion("Occlusion & re-acquisition", icon="visibility_off").classes("w-full bt-set"):
+                    sw_occl = ui.switch("Survive occlusion (break, then resume)",
+                                        value=bool(getattr(state, "occlusion_continuity", True)),
+                                        on_change=lambda e: setattr(state, "occlusion_continuity", bool(e.value)))
+                    sw_occl.tooltip("A character crossing a point used to DELETE that track for the whole shot. "
+                                    "With this on the point just goes missing for those frames and resumes after — "
+                                    "3DE reads the gap natively. Turn off to restore the old drop-if-ever-covered rule.")
 
-                ui.label("Ignore brief occlusions (frames · 1 = off)")
-                occ_run = ui.slider(min=1, max=10, value=int(getattr(state, "min_occlusion_run", 3)), step=1).props("label-always")
-                occ_run.on_value_change(lambda e: setattr(state, "min_occlusion_run", int(e.value or 1)))
-                occ_run.tooltip("A point sitting on the mask edge flips in and out from sub-pixel jitter alone, "
-                                "so the track looks like it flickers on and off while its pattern never moved. "
-                                "An occlusion has to last at least this many frames to count. Raise it if you "
-                                "still see flicker around characters.")
+                    ui.label("Ignore brief occlusions (frames · 1 = off)")
+                    occ_run = ui.slider(min=1, max=10, value=int(getattr(state, "min_occlusion_run", 3)), step=1).props("label-always")
+                    occ_run.on_value_change(lambda e: setattr(state, "min_occlusion_run", int(e.value or 1)))
+                    occ_run.tooltip("A point sitting on the mask edge flips in and out from sub-pixel jitter alone, "
+                                    "so the track looks like it flickers on and off while its pattern never moved. "
+                                    "An occlusion has to last at least this many frames to count. Raise it if you "
+                                    "still see flicker around characters.")
 
-                ui.label("Lock hold strength (anti-flicker)")
-                hold = ui.slider(min=0.2, max=0.6, value=float(getattr(state, "refine_ncc_hold", 0.45)), step=0.05).props("label-always")
-                hold.on_value_change(lambda e: setattr(state, "refine_ncc_hold", float(e.value or 0.45)))
-                hold.tooltip("It takes a strong match to trust a point, but only this much to KEEP trusting it. "
-                             "Without the gap between the two, a match hovering near the cutoff drops the point "
-                             "for single frames on grainy footage. Lower = holds on longer. A frame held this "
-                             "way never becomes the new reference pattern.")
+                    ui.label("Lock hold strength (anti-flicker)")
+                    hold = ui.slider(min=0.2, max=0.6, value=float(getattr(state, "refine_ncc_hold", 0.45)), step=0.05).props("label-always")
+                    hold.on_value_change(lambda e: setattr(state, "refine_ncc_hold", float(e.value or 0.45)))
+                    hold.tooltip("It takes a strong match to trust a point, but only this much to KEEP trusting it. "
+                                 "Without the gap between the two, a match hovering near the cutoff drops the point "
+                                 "for single frames on grainy footage. Lower = holds on longer. A frame held this "
+                                 "way never becomes the new reference pattern.")
 
-                ui.label("Re-acquire window (frames · 0 = off)")
-                reacq_gap = ui.slider(min=0, max=96, value=int(getattr(state, "reacquire_max_gap", 24)), step=2).props("label-always")
-                reacq_gap.on_value_change(lambda e: setattr(state, "reacquire_max_gap", int(e.value or 0)))
-                reacq_gap.tooltip("How long to keep hunting for a point after it is lost, before giving up. "
-                                  "Covers occluders SAM3 never masked — poles, props, a hand. Where it should "
-                                  "reappear is predicted from nearby tracks, then confirmed by matching the "
-                                  "original pattern at full resolution.")
+                    ui.label("Re-acquire window (frames · 0 = off)")
+                    reacq_gap = ui.slider(min=0, max=96, value=int(getattr(state, "reacquire_max_gap", 24)), step=2).props("label-always")
+                    reacq_gap.on_value_change(lambda e: setattr(state, "reacquire_max_gap", int(e.value or 0)))
+                    reacq_gap.tooltip("How long to keep hunting for a point after it is lost, before giving up. "
+                                      "Covers occluders SAM3 never masked — poles, props, a hand. Where it should "
+                                      "reappear is predicted from nearby tracks, then confirmed by matching the "
+                                      "original pattern at full resolution.")
 
-                ui.label("Re-acquire match strength")
-                reacq_thr = ui.slider(min=0.5, max=0.95, value=float(getattr(state, "refine_ncc_reacquire", 0.75)), step=0.05).props("label-always")
-                reacq_thr.on_value_change(lambda e: setattr(state, "refine_ncc_reacquire", float(e.value or 0.75)))
-                reacq_thr.tooltip("How closely the point must match its pre-occlusion pattern to count as the SAME "
-                                  "point. Pass = one continuous track with a gap. Fail = emitted as a separate track, "
-                                  "never welded — two different features under one ID stays invisible until the solve fails.")
+                    ui.label("Re-acquire match strength")
+                    reacq_thr = ui.slider(min=0.5, max=0.95, value=float(getattr(state, "refine_ncc_reacquire", 0.75)), step=0.05).props("label-always")
+                    reacq_thr.on_value_change(lambda e: setattr(state, "refine_ncc_reacquire", float(e.value or 0.75)))
+                    reacq_thr.tooltip("How closely the point must match its pre-occlusion pattern to count as the SAME "
+                                      "point. Pass = one continuous track with a gap. Fail = emitted as a separate track, "
+                                      "never welded — two different features under one ID stays invisible until the solve fails.")
 
-                ui.label("Forward-backward tolerance (px · 0 = off)")
-                fb_tol = ui.slider(min=0.0, max=6.0, value=float(getattr(state, "refine_fb_max_px", 1.5)), step=0.5).props("label-always")
-                fb_tol.on_value_change(lambda e: setattr(state, "refine_fb_max_px", float(e.value or 0.0)))
-                fb_tol.tooltip("Re-tracks each track backwards and drops frames the return pass disagrees with — a "
-                               "correct point comes back where it started. Strongest accuracy signal available, and "
-                               "parallax-safe (never judged against overall camera motion). Roughly doubles refine time. "
-                               "Lower = stricter.")
+                    ui.label("Forward-backward tolerance (px · 0 = off)")
+                    fb_tol = ui.slider(min=0.0, max=6.0, value=float(getattr(state, "refine_fb_max_px", 1.5)), step=0.5).props("label-always")
+                    fb_tol.on_value_change(lambda e: setattr(state, "refine_fb_max_px", float(e.value or 0.0)))
+                    fb_tol.tooltip("Re-tracks each track backwards and drops frames the return pass disagrees with — a "
+                                   "correct point comes back where it started. Strongest accuracy signal available, and "
+                                   "parallax-safe (never judged against overall camera motion). Roughly doubles refine time. "
+                                   "Lower = stricter.")
 
-                ui.label("Pattern drift guard (0 = off)")
-                drift = ui.slider(min=0.0, max=0.9, value=float(getattr(state, "refine_drift_floor", 0.55)), step=0.05).props("label-always")
-                drift.on_value_change(lambda e: setattr(state, "refine_drift_floor", float(e.value or 0.0)))
-                drift.tooltip("When the tracker re-grabs its pattern mid-shot, require it to still resemble the "
-                              "ORIGINAL. Without this the pattern slowly walks off the feature over a long shot. "
-                              "Costs almost nothing. Higher = stricter.")
+                    ui.label("Pattern drift guard (0 = off)")
+                    drift = ui.slider(min=0.0, max=0.9, value=float(getattr(state, "refine_drift_floor", 0.55)), step=0.05).props("label-always")
+                    drift.on_value_change(lambda e: setattr(state, "refine_drift_floor", float(e.value or 0.0)))
+                    drift.tooltip("When the tracker re-grabs its pattern mid-shot, require it to still resemble the "
+                                  "ORIGINAL. Without this the pattern slowly walks off the feature over a long shot. "
+                                  "Costs almost nothing. Higher = stricter.")
 
-                ui.separator().classes("q-my-sm")
-                ui.label("Reject edge-like tracks (0 = off)")
-                aniso = ui.slider(min=0.0, max=0.4, value=float(getattr(state, "min_corner_anisotropy", 0.08)), step=0.01).props("label-always")
-                aniso.on_value_change(lambda e: setattr(state, "min_corner_anisotropy", float(e.value or 0.0)))
-                aniso.tooltip("Drops points sitting on a straight edge (rope, plate lines, TV-screen borders). Such a point "
-                              "can only be pinned across the edge, never along it, so it slides left/right. Higher = stricter "
-                              "(fewer, more corner-like tracks). Try 0.15 if sliding persists, 0.04 if too many tracks are lost.")
+                with ui.expansion("Advanced accuracy", icon="tune").classes("w-full bt-set"):
+                    ui.label("Reject edge-like tracks (0 = off)")
+                    aniso = ui.slider(min=0.0, max=0.4, value=float(getattr(state, "min_corner_anisotropy", 0.08)), step=0.01).props("label-always")
+                    aniso.on_value_change(lambda e: setattr(state, "min_corner_anisotropy", float(e.value or 0.0)))
+                    aniso.tooltip("Drops points sitting on a straight edge (rope, plate lines, TV-screen borders). Such a point "
+                                  "can only be pinned across the edge, never along it, so it slides left/right. Higher = stricter "
+                                  "(fewer, more corner-like tracks). Try 0.15 if sliding persists, 0.04 if too many tracks are lost.")
 
-                ui.label("Bad-track filter (plate px · 0 = off)")
-                with ui.row().classes("w-full no-wrap gap-2"):
-                    flt_jump = ui.number("Max jump", value=int(getattr(state, "filter_max_jump_px", 0) or 0),
-                                         min=0, precision=0).props("dense outlined").classes("grow")
-                    flt_jitter = ui.number("Max jitter", value=int(getattr(state, "filter_max_jitter_px", 0) or 0),
-                                           min=0, precision=0).props("dense outlined").classes("grow")
-                flt_jump.on_value_change(lambda e: setattr(state, "filter_max_jump_px", float(e.value or 0)))
-                flt_jitter.on_value_change(lambda e: setattr(state, "filter_max_jitter_px", float(e.value or 0)))
-                flt_jump.tooltip("Drops a track if ANY single-frame jump exceeds this many plate pixels "
-                                 "(teleport = mistrack). 0 = off. Try ~15 on a clean plate, tighten if needed.")
-                flt_jitter.tooltip("Drops a track whose mean frame-to-frame jitter (change in velocity) exceeds "
-                                   "this many plate pixels. Self-consistency only, so a fast SMOOTH point passes. 0 = off. Try ~3.")
+                    ui.label("Bad-track filter (plate px · 0 = off)")
+                    with ui.row().classes("w-full no-wrap gap-2"):
+                        flt_jump = ui.number("Max jump", value=int(getattr(state, "filter_max_jump_px", 0) or 0),
+                                             min=0, precision=0).props("dense outlined").classes("grow")
+                        flt_jitter = ui.number("Max jitter", value=int(getattr(state, "filter_max_jitter_px", 0) or 0),
+                                               min=0, precision=0).props("dense outlined").classes("grow")
+                    flt_jump.on_value_change(lambda e: setattr(state, "filter_max_jump_px", float(e.value or 0)))
+                    flt_jitter.on_value_change(lambda e: setattr(state, "filter_max_jitter_px", float(e.value or 0)))
+                    flt_jump.tooltip("Drops a track if ANY single-frame jump exceeds this many plate pixels "
+                                     "(teleport = mistrack). 0 = off. Try ~15 on a clean plate, tighten if needed.")
+                    flt_jitter.tooltip("Drops a track whose mean frame-to-frame jitter (change in velocity) exceeds "
+                                       "this many plate pixels. Self-consistency only, so a fast SMOOTH point passes. 0 = off. Try ~3.")
 
-                ui.label("Pattern lock strength")
-                lock = ui.slider(min=0.60, max=0.90, value=float(getattr(state, "refine_ncc_reref", 0.68)), step=0.02).props("label-always")
-                lock.on_value_change(lambda e: setattr(state, "refine_ncc_reref", float(e.value or 0.68)))
-                lock.tooltip("How stubbornly a point holds the pattern it seeded on before grabbing a fresh one. "
-                             "High values re-grab constantly, which turns it into a frame-by-frame tracker and lets "
-                             "the point wander smoothly around its own feature. Low = locked to what it started on "
-                             "(most accurate; tracks may end earlier when lighting or perspective really changes).")
+                    ui.label("Pattern lock strength")
+                    lock = ui.slider(min=0.60, max=0.90, value=float(getattr(state, "refine_ncc_reref", 0.68)), step=0.02).props("label-always")
+                    lock.on_value_change(lambda e: setattr(state, "refine_ncc_reref", float(e.value or 0.68)))
+                    lock.tooltip("How stubbornly a point holds the pattern it seeded on before grabbing a fresh one. "
+                                 "High values re-grab constantly, which turns it into a frame-by-frame tracker and lets "
+                                 "the point wander smoothly around its own feature. Low = locked to what it started on "
+                                 "(most accurate; tracks may end earlier when lighting or perspective really changes).")
 
-                ui.label("Moving-tile seam blend (frames · 0 = off)")
-                mt_ov = ui.slider(min=0, max=8, value=int(getattr(state, "mt_overlap", 4)), step=1).props("label-always")
-                mt_ov.on_value_change(lambda e: setattr(state, "mt_overlap", int(e.value or 0)))
-                mt_ov.tooltip("The native re-track works in windows. Without a blend each window handed over with a "
-                              "small step, once per window — a regular wobble you can see in centre-2D. This "
-                              "cross-fades the hand-off. Raise it if a regular beat is still visible; the tracking "
-                              "log now reports the wobble's period.")
+                    ui.label("Moving-tile seam blend (frames · 0 = off)")
+                    mt_ov = ui.slider(min=0, max=8, value=int(getattr(state, "mt_overlap", 4)), step=1).props("label-always")
+                    mt_ov.on_value_change(lambda e: setattr(state, "mt_overlap", int(e.value or 0)))
+                    mt_ov.tooltip("The native re-track works in windows. Without a blend each window handed over with a "
+                                  "small step, once per window — a regular wobble you can see in centre-2D. This "
+                                  "cross-fades the hand-off. Raise it if a regular beat is still visible; the tracking "
+                                  "log now reports the wobble's period.")
 
-                sw_ecc = ui.switch("Sub-pixel polish (ECC)", value=getattr(state, "refine_ecc_polish", True),
-                                   on_change=lambda e: setattr(state, "refine_ecc_polish", bool(e.value)))
-                sw_ecc.tooltip("Finishes each point by fitting it against the actual pixels instead of estimating "
-                               "from three correlation samples. This is what stops a track wobbling in place on a "
-                               "feature that never moved — check it in 3DE's centre-2D view zoomed in. Slightly "
-                               "slower per point.")
-                sw_png = ui.switch("Lossless tracking proxies (PNG)", value=getattr(state, "lossless_track_proxies", True),
-                                   on_change=lambda e: setattr(state, "lossless_track_proxies", bool(e.value)))
-                sw_png.tooltip("Tracks EXR plates via PNG instead of JPEG proxies. JPEG artefacts sit on a fixed "
-                               "8x8 block grid and do not move with the image, so they read as sub-pixel jitter. "
-                               "Costs several times the proxy disk in the shot cache and a slower first pass; "
-                               "analysis and masking keep JPEG either way.")
-                sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
-                                       on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
-                sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
-                                   "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
-                                   "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
-                sw_reseed = ui.switch("Re-seed tracks (fast/low-angle shots)", value=getattr(state, "reseed", True),
-                                      on_change=lambda e: setattr(state, "reseed", bool(e.value)))
-                sw_reseed.tooltip("Seed fresh features periodically across the clip (not just at frame 0) so the "
-                                  "frame stays populated when the initial points sweep out on fast/low-angle shots. Re-seeded tracks "
-                                  "pass through the same mover-gating + motion filter + spread selection, so movers/junk are still dropped.")
-                ui.label("Re-seed interval (frames)")
-                reseed_every = ui.slider(min=10, max=90, value=int(getattr(state, "reseed_every", 30)), step=5).props("label-always")
-                reseed_every.on_value_change(lambda e: setattr(state, "reseed_every", int(e.value or 30)))
-                reseed_every.tooltip("Max frames between re-seeds. Smaller = denser replenishment (better on very fast shots), more compute.")
-                sw_edge = ui.switch("Track to frame edge", value=getattr(state, "edge_track", True),
-                                    on_change=lambda e: setattr(state, "edge_track", bool(e.value)))
-                sw_edge.tooltip("Keep refining a point right up to the frame border instead of trimming it when "
-                                "the NCC search box / native tile clamps against the edge. Preserves the edge tracks that anchor "
-                                "lens distortion and solve corners.")
-                sw_gap = ui.switch("Keep disappear/reappear as one track", value=getattr(state, "gap_aware_refine", True),
-                                   on_change=lambda e: setattr(state, "gap_aware_refine", bool(e.value)))
-                sw_gap.tooltip("When a point is occluded then reappears, refine each visible segment on its own "
-                               "reference patch and keep them under ONE track id -> the reappeared frames are re-acquired and kept, "
-                               "not trimmed away by the pre-occlusion pattern.")
-                sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
-                                      on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
-                sw_refine.tooltip("After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
-                                  "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
-                                  "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
-                ui.label("Pattern box (px · odd)")
-                refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
-                refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
-                refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
+                    sw_ecc = ui.switch("Sub-pixel polish (ECC)", value=getattr(state, "refine_ecc_polish", True),
+                                       on_change=lambda e: setattr(state, "refine_ecc_polish", bool(e.value)))
+                    sw_ecc.tooltip("Finishes each point by fitting it against the actual pixels instead of estimating "
+                                   "from three correlation samples. This is what stops a track wobbling in place on a "
+                                   "feature that never moved — check it in 3DE's centre-2D view zoomed in. Slightly "
+                                   "slower per point.")
+                    sw_png = ui.switch("Lossless tracking proxies (PNG)", value=getattr(state, "lossless_track_proxies", True),
+                                       on_change=lambda e: setattr(state, "lossless_track_proxies", bool(e.value)))
+                    sw_png.tooltip("Tracks EXR plates via PNG instead of JPEG proxies. JPEG artefacts sit on a fixed "
+                                   "8x8 block grid and do not move with the image, so they read as sub-pixel jitter. "
+                                   "Costs several times the proxy disk in the shot cache and a slower first pass; "
+                                   "analysis and masking keep JPEG either way.")
+                    sw_movtile = ui.switch("Moving-tile native re-track (4K accuracy)", value=getattr(state, "moving_tile", True),
+                                           on_change=lambda e: setattr(state, "moving_tile", bool(e.value)))
+                    sw_movtile.tooltip("Before the NCC lock, re-track each selected point inside a NATIVE 256px crop that "
+                                       "follows it, so the model sees full-res pixels instead of the whole frame squashed to 256 (~15x on 4K). "
+                                       "Fixes the coarse position NCC alone can't recover. Measured 4.03px -> 1.30px vs manual on a 4K plate.")
+                    sw_reseed = ui.switch("Re-seed tracks (fast/low-angle shots)", value=getattr(state, "reseed", True),
+                                          on_change=lambda e: setattr(state, "reseed", bool(e.value)))
+                    sw_reseed.tooltip("Seed fresh features periodically across the clip (not just at frame 0) so the "
+                                      "frame stays populated when the initial points sweep out on fast/low-angle shots. Re-seeded tracks "
+                                      "pass through the same mover-gating + motion filter + spread selection, so movers/junk are still dropped.")
+                    ui.label("Re-seed interval (frames)")
+                    reseed_every = ui.slider(min=10, max=90, value=int(getattr(state, "reseed_every", 30)), step=5).props("label-always")
+                    reseed_every.on_value_change(lambda e: setattr(state, "reseed_every", int(e.value or 30)))
+                    reseed_every.tooltip("Max frames between re-seeds. Smaller = denser replenishment (better on very fast shots), more compute.")
+                    sw_edge = ui.switch("Track to frame edge", value=getattr(state, "edge_track", True),
+                                        on_change=lambda e: setattr(state, "edge_track", bool(e.value)))
+                    sw_edge.tooltip("Keep refining a point right up to the frame border instead of trimming it when "
+                                    "the NCC search box / native tile clamps against the edge. Preserves the edge tracks that anchor "
+                                    "lens distortion and solve corners.")
+                    sw_gap = ui.switch("Keep disappear/reappear as one track", value=getattr(state, "gap_aware_refine", True),
+                                       on_change=lambda e: setattr(state, "gap_aware_refine", bool(e.value)))
+                    sw_gap.tooltip("When a point is occluded then reappears, refine each visible segment on its own "
+                                   "reference patch and keep them under ONE track id -> the reappeared frames are re-acquired and kept, "
+                                   "not trimmed away by the pre-occlusion pattern.")
+                    sw_refine = ui.switch("3DE-style pattern lock (NCC/affine, full-res)", value=getattr(state, "pattern_refine", True),
+                                          on_change=lambda e: setattr(state, "pattern_refine", bool(e.value)))
+                    sw_refine.tooltip("After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
+                                      "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
+                                      "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
+                    ui.label("Pattern box (px · odd)")
+                    refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
+                    refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
+                    refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
             tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
 
 # ---------- MAIN COLUMN ----------
