@@ -251,6 +251,39 @@ that track's ANCHOR patch is not edge-like at the frame refine anchors on, even 
 trajectory slides for 160 frames. A per-track edge constraint has to be measured over the
 track, not read off one patch. Reverted, so no unused path is left in the code.
 
+### What the residual actually consists of
+
+Diagnosing one track was not enough, so every usable track was split by AXIS — mean |dx| and
+mean |dy| against its independent re-track. A one-dimensional feature disagrees in one axis
+and agrees in the other; a genuinely imprecise track disagrees in both. On SH004, 25 usable
+tracks:
+
+| group | n | median | what it is |
+|---|---|---|---|
+| sub-pixel | 7 | **0.61px** | working as intended |
+| aperture (axis ratio ≥ 3) | 5 | — | no defined position along the edge |
+| 2-D inaccurate | 13 | 2.36px | real imprecision on soft texture |
+
+The worst track is the clearest case of the middle group: mean |dx| 1.02px against mean |dy|
+8.00px, a ratio of 7.8. `FWD_0014` and `FWD_0272` are one-dimensional too (ratios 10.9 and
+5.0) but sit in the *good* rows, because the camera never moves them far along their edge and
+the slide has no room to accumulate.
+
+So the remaining error is three problems, not one:
+
+* **7 tracks (28%) are already sub-pixel.** Nothing to fix.
+* **5 tracks (20%) are aperture-limited.** Not a tracking-accuracy problem at all — the
+  feature has no position to find in one axis, and this tracker and the LK reference slide
+  along it by different amounts. Removing them is the only real answer, which is what
+  `min_corner_anisotropy` does at a cost of 7 tracks in 40.
+* **13 tracks (52%) are genuinely imprecise in both axes**, around 2.4px, on defocused
+  low-texture features. This is the only group better tracking would help, and it is the
+  group that resisted all eleven attempts.
+
+Part of even that last figure belongs to the reference: several of those rows have closures
+of 0.3–1.4px, so the tracker is not 2.4px wrong on all of them. Its tight-closure members sit
+nearer 1.2–2.4px.
+
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
 More template averaging, which the UI calls the best-value setting on a grainy plate, is
