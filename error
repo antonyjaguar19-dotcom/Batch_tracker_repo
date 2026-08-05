@@ -1,0 +1,15 @@
+[12:46:33] --- Starting Step 5: Tracking ---
+[12:46:33] Tracking backend: TAPNext++
+[12:46:36] VRAM freed (before TAPNext): 0.00 -> 0.00 GB reserved
+[12:46:37] E06_037_0010_plate-bg01: tracking full-res lossless proxy sequence -> \\liv1\shows\TOW\E06_037_0010_plate-bg01\in\plates\v001\E06_037_0010_plate-bg01_proxyJPG_v0001\4608x3164_jpg
+[12:46:37] Tracking: E06_037_0010_plate-bg01 | camera | OUTSIDE
+[12:46:37] TRACK: Loading TAPNext++ (256px, streaming)...
+D:\Jefrin\batch_tracker_v001_starter\runtime\python311\Lib\site-packages\torch\_export\utils.py:394: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _register_pytree_node(
+D:\Jefrin\batch_tracker_v001_starter\pipeline\tapnext-main\tapnet\tapnext\tapnext_lru_modules.py:46: UserWarning: expandable_segments not supported on this platform (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\c10/cuda/CUDAAllocatorConfig.h:28.)
+  torch.empty([self.width], device=device, dtype=dtype)
+D:\Jefrin\batch_tracker_v001_starter\app\tapnext_engine.py:94: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(self.checkpoint, map_location="cpu")
+[12:46:43] TRACK: [1/1] Reading: E06_037_0010_plate-bg01 (scale=1.0, stream=False)
+[12:47:10] TRACK:   auto-tune: sharp=0.016 sharp_area=86% grain=1.0 texture=6.1 motion=10.3px
+[12:47:10] TRACK:   auto-tune -> min_feature_dist=16, refine_patch_px=41, min_track_certainty=0.25
