@@ -26,6 +26,7 @@ trimming/gating afterwards.
 from __future__ import annotations
 
 import math
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -222,7 +223,15 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
     out: Dict[str, Track] = {}
     moved = 0
     shortened = 0
-    for name, tr in final_tracks.items():
+    # Progress, because this stage is the slowest thing in the pipeline and used to print
+    # nothing between its opening line and its result. Each track costs one small GPU call
+    # per ~12-frame window, so a 132-track 4.6K shot sits here for the best part of an hour
+    # with an idle-looking GPU (thousands of batch-of-1 calls, not compute) and no output at
+    # all -- indistinguishable from a hang, and reported as one.
+    _t0 = time.time()
+    _last = _t0
+    _n = len(final_tracks)
+    for _i, (name, tr) in enumerate(final_tracks.items(), 1):
         pts = sorted(tr, key=lambda t: t[0])
         frs = np.array([int(p[0]) for p in pts], dtype=int)
         xs = np.array([float(p[1]) for p in pts], dtype=float)
@@ -261,6 +270,16 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         out[name] = new_tr
         if any_moved:
             moved += 1
+
+        # Time-based, not every-Nth: track cost varies with length, so a fixed count goes
+        # quiet exactly on the slow shots that need the reassurance most.
+        now = time.time()
+        if status and (now - _last >= 15.0 or _i == _n):
+            done = now - _t0
+            eta = (done / _i) * (_n - _i)
+            status(f"Moving-tile: {_i}/{_n} tracks ({done / 60.0:.1f} min elapsed, "
+                   f"~{eta / 60.0:.1f} min left)")
+            _last = now
 
     info = f"retracked={len(out)} moved={moved}"
     if shortened:

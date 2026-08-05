@@ -23,6 +23,7 @@ ceiling because refinement happens on the full-res plate.
 from __future__ import annotations
 
 import math
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1117,7 +1118,12 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     out: Dict[str, Track] = {}
     certainty: Dict[str, float] = {}
     trimmed = dropped = split = gapped = 0
-    for name, tr in final_tracks.items():
+    # Same reason as moving-tile: this loop is per-track and slow on a big plate, and printed
+    # nothing between its opening line and its result, so a long shot looked hung.
+    _t0 = time.time()
+    _last = _t0
+    _n = len(final_tracks)
+    for _i, (name, tr) in enumerate(final_tracks.items(), 1):
         # The whole per-track policy arrives through this one substitution: a view of the
         # shot config carrying this track's overrides, or the shot config ITSELF when it has
         # none. Nothing inside _refine_segment changes -- it already reads every parameter
@@ -1145,6 +1151,14 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
                 registry.derive(name, tid)   # same feature, so it keeps the same policy
             out[tid] = to_out(piece)
             certainty[tid] = cert
+
+        now = time.time()
+        if status and (now - _last >= 15.0 or _i == _n):
+            done = now - _t0
+            eta = (done / _i) * (_n - _i)
+            status(f"Pattern-refine: {_i}/{_n} tracks ({done / 60.0:.1f} min elapsed, "
+                   f"~{eta / 60.0:.1f} min left)")
+            _last = now
 
     # Wobble report: amplitude says how bad, period says WHERE it comes from. A period
     # clustering near mt_window points at the moving-tile seams; no dominant period means a
