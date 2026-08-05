@@ -347,6 +347,22 @@ against 4.57px off. It sits at closure 0.3-0.5 and disappears from every tight b
 1.90px at closure < 0.3), so the reference is probably at fault — but it is an outlier that
 appeared on the arm that ships, and it is the thing to watch on the next soft shot.
 
+### Where SH004 finished
+
+Same axis split as before, on the shipped configuration, trustworthy references only:
+
+    total 11    sub-pixel 8 (median 0.62px)    aperture 0    2-D inaccurate 3
+
+Against the same split before any of this work -- 7 sub-pixel, 5 aperture, 13 two-dimensional
+-- the aperture group is gone from the trustworthy set and the two-dimensional group is down
+to three tracks at 1.37, 1.91 and 2.16px.
+
+The clearest single result is `BWD_0247`. It is the track this whole investigation started
+from: 20.51px, the one the identity gate had to delete because nothing could track it. With
+band-pass it measures **0.88px and needs no gate at all.** It was never a mistrack -- it was a
+correlation peak with no shape to it, and giving the matcher something to lock onto fixed the
+track rather than removing it.
+
 It also puts this session's numbers in proportion. Every headline here comes from SH004,
 which is the hardest plate on the box. A more typical soft plate was already at 0.35px median
 with 1 track in 32 over 3px.
