@@ -190,6 +190,32 @@ part a gate acts on. Two changes have now been reverted for the same reason — 
 computed over the whole export used to justify a rule that fires on a subset of it.
 
 The gate remains in the code as a slider, defaulting to **off**, because it does remove
-visible jitter when that is the complaint. What would actually catch a smooth drifter is
-what `tools/verify_against_lk.py` does: re-track independently and compare. That is far too
-slow for every track in a batch, and making it affordable is the real open problem.
+visible jitter when that is the complaint.
+
+### What did catch it: seed identity
+
+One NCC between a track's patch at its FIRST frame and at its LAST. A point that slid off
+its feature ends on unrelated pixels; a point that held on still matches even when lighting
+and perspective have moved. On SH004 the drifter scored **−0.055 while every other exported
+track scored 0.50 to 0.99** — separated by a margin no threshold has to be tuned to find.
+
+    before   median 2.34px   p90 5.44px   worst 20.51px   over 3px 7/24
+    after    median 2.28px   p90 5.19px   worst  8.19px   over 3px 6/23
+
+Worst-case error down 60% for the loss of exactly one track (41 → 40), with median and p90
+both improving. On `lab03`, where every track is good, it drops nothing and every class
+scores identically — so it is an outlier catch, not a tax on healthy footage.
+
+It is used as an outlier test, never a ranker: pearson −0.81 against measured error in the
+tail, but spearman only −0.38 through the middle. It answers "is this still the same
+feature" and nothing finer, and the floor is **absolute** (0.25) because that question means
+the same thing on every plate — unlike certainty, which is why that bar must self-calibrate
+and this one must not.
+
+The ordering is the part worth remembering. The first attempt ran it after the certainty
+gate but before `backfill_to_floor`, which draws from a pool snapshotted *earlier* — so the
+drifter was dropped and immediately re-added, and the run came out byte-identical. That is
+the same failure as the backfill ceiling and the wobble simulation: **a filter applied at one
+stage while the bad track re-enters through another.** Three times on one task. When adding
+a gate here, the question to ask first is not "does this test work" but "what else can put
+the track back".
