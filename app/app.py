@@ -1154,6 +1154,11 @@ class AppState:
     refine_ecc_polish: bool = True      # gradient sub-pixel polish after the NCC peak
     mt_overlap: int = 4                 # blend moving-tile window seams (0 = old butt-joint)
     refine_ncc_reref: float = 0.68      # how hard the point locks to its seeded pattern
+    # Band-pass sigma before pattern matching. NCC removes a patch's mean but not its
+    # low-frequency shape, so on a defocused feature the smooth ramp dominates and the
+    # correlation peak goes broad. Subtracting a blurred copy leaves the detail that
+    # localises. 0 = off.
+    refine_bandpass: float = 0.0
     # Per-shot auto-tune. A batch tool cannot be hand-tuned per shot, so the bot measures each
     # plate (sharpness, grain, texture, motion) and derives the settings below from it.
     # Anything the user explicitly moves is recorded in auto_tune_overrides and always wins.
@@ -2230,6 +2235,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 refine_ecc_polish=bool(getattr(state, "refine_ecc_polish", True)),
                 mt_overlap=int(getattr(state, "mt_overlap", 4) or 0),
                 refine_ncc_reref=float(getattr(state, "refine_ncc_reref", 0.68) or 0.68),
+                refine_bandpass=float(getattr(state, "refine_bandpass", 2.0) or 0.0),
                 # Auto-tune reads the plate; Qwen's quality_flags (already computed by
                 # Analyze, and previously used for nothing but a table cell) cross-check it.
                 auto_tune=bool(getattr(state, "auto_tune", True)),

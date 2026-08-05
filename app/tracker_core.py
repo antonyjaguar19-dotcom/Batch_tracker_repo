@@ -155,6 +155,12 @@ class RunnerConfig:
     # 0.99, so this is an outlier catch, not a ranking. Absolute rather than relative: "is
     # this the same patch" travels between plates in a way certainty does not. 0 = off.
     min_seed_identity: float = 0.25
+    # Band-pass sigma applied to the frame before pattern matching. TM_CCOEFF_NORMED removes
+    # a patch's mean but not its low-frequency shape, so on a defocused feature the smooth
+    # ramp dominates the correlation and the peak goes broad and flat. Subtracting a blurred
+    # copy leaves the mid-frequency detail that actually localises. 0 = off (match on the
+    # plate as-is). Identity is still measured on unfiltered frames.
+    refine_bandpass: float = 0.0
     # Holes a track may carry before it is cut into continuous runs. One or two long gaps is
     # an occluded track worth keeping whole; a dozen short ones is a marginal track that kept
     # losing lock, and it blinks on and off in the 3DE viewport. -1 = off.

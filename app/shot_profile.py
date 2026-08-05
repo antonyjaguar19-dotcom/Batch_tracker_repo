@@ -31,6 +31,7 @@ _DEFAULTS = {
     "refine_ncc_lost": 0.60,
     "refine_ncc_hold": 0.45,
     "min_track_certainty": 0.0,
+    "refine_bandpass": 0.0,
 }
 
 # Every tuned value is clamped, so a strange measurement can shift behaviour but never
@@ -42,6 +43,7 @@ _CLAMPS = {
     "refine_ncc_lost": (0.35, 0.75),
     "refine_ncc_hold": (0.25, 0.65),
     "min_track_certainty": (0.0, 0.60),
+    "refine_bandpass": (0.0, 4.0),
 }
 
 
@@ -169,6 +171,20 @@ def tune(profile: ShotProfile, overrides: Optional[Dict[str, object]] = None) ->
     # what little there is; a crisp plate is better served by a smaller, more local box.
     if soft:
         out["refine_patch_px"] = 41
+        # Band-pass before matching, on a soft plate ONLY. NCC removes a patch's mean but not
+        # its low-frequency shape, and on a defocused feature that smooth ramp is most of the
+        # signal -- it looks nearly the same wherever it is evaluated, so the correlation peak
+        # is broad and its position is decided by very little. Subtracting a blurred copy
+        # leaves the mid-frequency detail that actually localises. Measured on SH004
+        # (texture 12.6): the trustworthy-band median went 1.01 -> 0.71px and the worst track
+        # 8.19 -> 2.16px.
+        #
+        # Deliberately NOT applied to a crisp plate: there the low frequencies are real
+        # signal, and removing them costs accuracy. On the synthetic bench (texture 417) it
+        # made corners slightly worse and produced one 11.44px mistrack where the baseline's
+        # worst was 0.09px. Which is why this is tied to `soft` rather than switched on
+        # everywhere.
+        out["refine_bandpass"] = 2.0
     elif p.texture > 1500.0:
         out["refine_patch_px"] = 25
 

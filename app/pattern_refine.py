@@ -1168,6 +1168,39 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         prov = _GrayFromBGR(bgr_source)
     else:
         prov = _FrameGray(video_path, total_frames, host_ram_frac=float(getattr(cfg, "host_ram_frac", 0.5)))
+
+    # Optional band-pass before matching. TM_CCOEFF_NORMED removes each patch's MEAN but not
+    # its low-frequency shape, so on a defocused feature the correlation is dominated by a
+    # smooth ramp that is nearly the same wherever it is evaluated -- a broad, flat peak whose
+    # position is decided by very little. Subtracting a blurred copy removes the ramp and
+    # leaves the mid-frequency detail that actually localises. Applied to the frame, so the
+    # template and the search window are filtered identically and the correlation stays valid.
+    _bp = float(getattr(cfg, "refine_bandpass", 0.0) or 0.0)
+    if _bp > 0.0:
+        _raw_get = prov.get
+        _bp_cache: Dict[int, Optional[np.ndarray]] = {}
+        _bp_order: List[int] = []
+
+        def _bp_get(idx0: int) -> Optional[np.ndarray]:
+            hit = _bp_cache.get(idx0)
+            if hit is not None:
+                return hit
+            g = _raw_get(idx0)
+            if g is None:
+                return None
+            f = g.astype(np.float32)
+            out = f - cv2.GaussianBlur(f, (0, 0), _bp)
+            # Back to the 0-255 band the rest of the stage assumes, centred on mid-grey.
+            out = np.clip(out + 128.0, 0.0, 255.0).astype(np.uint8)
+            _bp_cache[idx0] = out
+            _bp_order.append(idx0)
+            if len(_bp_order) > 128:
+                _bp_cache.pop(_bp_order.pop(0), None)
+            return out
+
+        prov_get_filtered = _bp_get
+    else:
+        prov_get_filtered = prov.get
     if status:
         status(f"Pattern-refine: {len(final_tracks)} tracks, patch={cfg.refine_patch_px}px "
                f"search=±{cfg.refine_search_px}px motion={cfg.refine_motion} "
@@ -1191,7 +1224,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         # none. Nothing inside _refine_segment changes -- it already reads every parameter
         # off cfg, so handing it a different cfg is all that per-track adaptation needs.
         tcfg = registry.view(name, cfg) if registry is not None else cfg
-        pieces = _refine_one_multi(to_img(tr), prov.get, tcfg, predict)
+        pieces = _refine_one_multi(to_img(tr), prov_get_filtered, tcfg, predict)
         cert = float(_CERTAINTY.get("v", 0.0))
         if not pieces:
             dropped += 1
