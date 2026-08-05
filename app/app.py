@@ -1158,22 +1158,26 @@ class AppState:
     # shot. TAPNext backend only: SynthEyes blips and peels internally, so there is no
     # per-point loop to steer there.
     #
-    # ON by default. A batch tool cannot be hand-tuned per shot, and a single shot-wide
-    # setting has no right answer on the plate that prompted this: a sharp subject against a
-    # fully defocused background wants a small tight box on the subject and a large one on
-    # the background, and shot_profile can only pick one. This is the layer that resolves
-    # that -- each track derives its own settings from its own seed measurements, which is
-    # what makes one configuration fit every kind of shot without a toggle to remember.
+    # OFF by default -- turned on during 2026-08 development, then turned back off when it
+    # was measured on a real soft plate instead of a synthetic sharp one.
     #
-    # Measured on bench/lab03 (A/B, per feature class): the policy engaged on every track
-    # (pattern box 31 -> 21/25) with no accuracy regression -- every class within 0.01px --
-    # and the worst track improved 0.09 -> 0.06px. The `blob` branch it exists for, which is
-    # the defocused-background case, is NOT exercised by that bench: soft seeds are rejected
-    # long before export, so no blob reaches the scored set. So this is enabled on no
-    # regression plus the design argument, not on a measured win for soft features.
-    # Set to False to reproduce the old single-setting behaviour byte-for-byte
-    # (track_meta._TrackCfg.view returns the shot config itself when a track has no overrides).
-    per_track_policy: bool = True
+    # classify_seed judges cornerness against the FRAME'S OWN percentiles, which is right for
+    # ranking and wrong for sizing. On SH004 (texture 12.6, 21% of frame in focus -- a sharp
+    # subject on a fully defocused background) shot_profile correctly chose a 41px pattern
+    # box for a soft plate, and the per-track policy then labelled 34 of 47 seeds "corner"
+    # -- the top quartile of a soft distribution is still soft -- and shrank their box to
+    # 21px on 35 tracks and 25px on 12. A soft feature needs a BIGGER box to average over
+    # what little detail it has, which is what policy_for's own `blob` branch says; the
+    # relative classifier never reaches that branch on a plate where everything is soft. So
+    # the feature fought the shot-level auto-tune and lost, on exactly the shot type it was
+    # enabled to help.
+    #
+    # bench/lab03 could not have caught this: its plate measures sharp (texture 84-606), so
+    # the classification is correct there and the A/B came back neutral (every class within
+    # 0.01px). That neutrality is what the decision to enable rested on, and it did not
+    # transfer. Re-enabling needs classify_seed to respect ABSOLUTE softness -- at minimum,
+    # never shrinking the box below the shot-level value on a plate shot_profile calls soft.
+    per_track_policy: bool = False
     lossless_track_proxies: bool = True # PNG (not JPEG) proxies for the tracking route
     # Occlusion continuity: a mover crossing a point breaks the track instead of deleting it
     occlusion_continuity: bool = True
