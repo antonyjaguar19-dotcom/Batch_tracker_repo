@@ -141,3 +141,30 @@ unchanged track. Recomputed with the shared ids as a fixed neighbour pool, the m
 So: hold the neighbour pool fixed across the runs being compared, and check whether the
 positions actually differ before believing any per-track delta. A whole-export median of
 this metric compares two different measuring sticks.
+
+## What predicts real error, and one fix that did not work
+
+`tools/verify_against_lk.py` re-tracks every exported track independently, so on SH004 each
+of them has a measured error. Against those numbers:
+
+| predictor | pearson | spearman |
+|---|---|---|
+| `score` | **+0.398** | +0.291 |
+| `certainty` | −0.236 | −0.133 |
+| `wobble` (after the S-G fix) | +0.127 | **+0.573** |
+
+`score` is **positively** correlated with error — it ranks bad tracks as good, because its
+coverage term is weighted 0.5 and long tracks are where drift accumulates. Wobble is the
+only usable ranker, and only became usable after the moving-average detrend was replaced.
+
+That suggested capping the backfill: only pad a thin export with rejects whose wobble is
+near the tracks that passed. **Measured, it made things worse** — SH004 went from a 2.34px
+median over 24 measurable tracks to 2.61px over 10, and the export fell from 41 tracks to 13.
+
+The reason is worth keeping: the worst track on that shot, 20.51px against a reference
+closing to 0.71px, **passed the certainty gate**. It was never a backfill reject, so a
+backfill cap could not touch it, while good backfilled tracks (0.32px, 0.63px) were cut.
+Bad tracks are entering through the GATE, not through the padding, and a simulation that
+ranks the whole export cannot be used to justify a change that only filters part of it.
+The open question is a gate that would reject a 20px track, which certainty at −0.236 does
+not do.

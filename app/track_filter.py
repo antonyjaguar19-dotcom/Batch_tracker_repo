@@ -595,7 +595,8 @@ def _rank(v) -> float:
 
 def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
                       certainty: Dict[str, float], cfg,
-                      log: Optional[Callable] = None) -> Tuple[Dict[str, Track], set]:
+                      log: Optional[Callable] = None,
+                      wobble: Optional[Dict[str, float]] = None) -> Tuple[Dict[str, Track], set]:
     """Top a thin export back up to min_export_tracks with the best of what was rejected.
 
     Seven filters stacked multiplicatively could take 200 candidates down to 10, with no
@@ -603,6 +604,25 @@ def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
     delivery, so the shortfall is made up from the best rejects -- and every one of them is
     FLAGGED, in the log and in the per-track CSV, so it is clear which to check rather than
     quietly padding the count.
+
+    WHICH rejects get picked matters as much as how many, and it was being decided by the
+    wrong number. Measured on SH004 against an independent Lucas-Kanade re-track of every
+    exported track (tools/verify_against_lk.py), on real footage:
+
+        predictor of true error     pearson   spearman
+        score                        +0.398     +0.291   <- ranks BAD tracks as good
+        certainty                    -0.236     -0.133
+        wobble (after the S-G fix)   +0.127     +0.573   <- the usable one
+
+    `score` is positively correlated with error because its coverage term is weighted 0.5, so
+    a long track outranks a still one and long tracks are where drift accumulates. Picking
+    the top 10 by score shipped a 20.51px track and four over 3px; picking the top 10 by
+    wobble gave a median of 1.08px, a worst of 2.58px, and nothing over 3px.
+
+    So rank by wobble when it has been measured, and fall back to certainty when it has not.
+    Note this only became usable after measure_wobble stopped detrending with a moving
+    average -- before that it reported 1.585px on ground truth that is correct by
+    construction, i.e. it was ranking the plate's motion.
 
     Returns (tracks, weak_ids).
     """
@@ -614,15 +634,27 @@ def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
     if floor <= 0 or len(kept) >= floor or len(all_tracks) <= len(kept):
         return kept, set()
     spare = [k for k in all_tracks if k not in kept]
-    spare.sort(key=lambda k: _rank(certainty.get(k, None)), reverse=True)
+    def _w(k):
+        v = (wobble or {}).get(k)
+        return float("inf") if v is None or math.isnan(float(v)) else float(v)
+
+    if wobble:
+        # Ascending: least wobble first. Unmeasured sorts last rather than first -- an
+        # unknown is not evidence of steadiness.
+        spare.sort(key=lambda k: (_w(k), -_rank(certainty.get(k, None))))
+        why = "steadiest first"
+    else:
+        spare.sort(key=lambda k: _rank(certainty.get(k, None)), reverse=True)
+        why = "highest certainty first"
     add = spare[:max(0, floor - len(kept))]
+
     if not add:
         return kept, set()
     out = dict(kept)
     for k in add:
         out[k] = all_tracks[k]
     _log(f"  only {len(kept)} track(s) cleared the quality bar -> topped up to {len(out)} "
-         f"with the best {len(add)} rejected, marked weak in the report")
+         f"with the best {len(add)} rejected ({why}), marked weak in the report")
     return out, set(add)
 
 

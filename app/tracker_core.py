@@ -1870,9 +1870,21 @@ class BatchTrackerRunner:
                             final_tracks_out, _certs, self.cfg, log=self._status)
                         # A handful of tracks and no explanation is not a usable delivery.
                         # Top a thin export back up from the best rejects, flagged.
+                        #
+                        # Measure wobble FIRST so the top-up can rank on it. On real footage
+                        # it is the only signal here that predicts true error (spearman
+                        # +0.573, against +0.291 for score, which is actively misleading --
+                        # see backfill_to_floor). It costs one pass over tracks already in
+                        # memory, and it decides which rejects an artist has to look at.
+                        _wob = {}
+                        try:
+                            from app.pattern_refine import measure_wobble as _mw
+                            _wob = {k: _mw(v)[0] for k, v in _before_gate.items()}
+                        except Exception:
+                            _wob = {}
                         final_tracks_out, _weak_ids = _tf.backfill_to_floor(
                             final_tracks_out, _before_gate, _certs, self.cfg,
-                            log=self._status)
+                            log=self._status, wobble=_wob)
                         # A track that kept losing and regaining lock exports as one id full
                         # of holes, which blinks on and off in the 3DE viewport. Cut those
                         # into continuous runs; genuine occlusion gaps stay.
