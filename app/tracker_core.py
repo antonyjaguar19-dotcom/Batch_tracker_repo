@@ -146,7 +146,7 @@ class RunnerConfig:
     # (wobble scales with how much the camera moves, so an absolute px bar cannot travel).
     # This is the only signal measured to rank true error on real footage; certainty manages
     # -0.236 and `score` is +0.398, i.e. backwards. 0 = off. See track_filter.wobble_gate.
-    wobble_rel: float = 1.5
+    wobble_rel: float = 0.0
     # Holes a track may carry before it is cut into continuous runs. One or two long gaps is
     # an occluded track worth keeping whole; a dozen short ones is a marginal track that kept
     # losing lock, and it blinks on and off in the 3DE viewport. -1 = off.

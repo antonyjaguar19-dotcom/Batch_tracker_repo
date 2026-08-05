@@ -168,3 +168,28 @@ Bad tracks are entering through the GATE, not through the padding, and a simulat
 ranks the whole export cannot be used to justify a change that only filters part of it.
 The open question is a gate that would reject a 20px track, which certainty at −0.236 does
 not do.
+
+### The wobble gate did not answer it either
+
+Wobble ranks error better than anything else available (spearman +0.573), so the obvious
+next step was to gate on it: drop tracks deviating more than 1.5x the shot's own median.
+Simulated on the 24 measurable SH004 tracks that gave 2.34px -> 1.08px with nothing above
+3px. **Run for real it cut 14 of 29 tracks and left the worst one exactly where it was:**
+
+    median 2.76px   p90 7.65px   worst 20.51px   over 3px 5/12
+
+`BWD_0247` — the 20.51px track — survived, and it was always going to. Wobble is deviation
+from a track's OWN smooth path, and that track drifts *smoothly*: it slides off its feature
+a fraction of a pixel per frame and never jitters. Its wobble is near zero and its error is
+the largest in the shot. Wobble is structurally blind to smooth drift, which is precisely
+the failure mode that produces the worst numbers here.
+
+Rank correlation was not enough to justify a threshold. +0.573 over a whole population says
+wobble is *usually* informative; it says nothing about the tail, and the tail is the only
+part a gate acts on. Two changes have now been reverted for the same reason — a statistic
+computed over the whole export used to justify a rule that fires on a subset of it.
+
+The gate remains in the code as a slider, defaulting to **off**, because it does remove
+visible jitter when that is the complaint. What would actually catch a smooth drifter is
+what `tools/verify_against_lk.py` does: re-track independently and compare. That is far too
+slow for every track in a batch, and making it affordable is the real open problem.

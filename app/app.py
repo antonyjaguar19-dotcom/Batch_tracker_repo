@@ -1130,9 +1130,11 @@ class AppState:
     track_max_output: int = 600    # TAPNext: safety ceiling on exported tracks, 0=unlimited
     min_export_tracks: int = 40    # top a thin export up from the best rejects, flagged
     # Wobble gate: drop tracks deviating from their own smooth path by more than this
-    # multiple of the shot's OWN median. Relative because wobble scales with plate and
-    # lens; the shot is its own yardstick. 0 = off.
-    wobble_rel: float = 1.5
+    # multiple of the shot's OWN median. OFF by default -- measured on real footage it cut
+    # 14 of 29 tracks and left the worst one (20.51px) untouched, because that track drifts
+    # SMOOTHLY and wobble only sees deviation from a track's own smooth path. Kept as a
+    # slider for shots where visible jitter is the complaint. 0 = off.
+    wobble_rel: float = 0.0
     max_track_gaps: int = 2        # more holes than this -> split into continuous runs
     template_frames: int = 5       # frames averaged into the reference pattern (1 = off)
     refine_iterations: int = 3     # match/polish passes per frame (1 = off)
