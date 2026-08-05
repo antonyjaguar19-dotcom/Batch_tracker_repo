@@ -228,17 +228,31 @@ and none of them help:
 
 | change | median | worst | verdict |
 |---|---|---|---|
-| shipped (41px box) | **2.28px** | **8.19px** | best measured |
+| **shipped** (41px box, adaptive peak fit) | **2.22px** | **8.19px** | best measured |
 | backfill quality ceiling | 2.61px | 20.51px | reverted |
 | wobble gate on | 2.76px | 20.51px | off by default |
 | pattern box 31px | 2.64px | 16.59px | not shipped |
 | pattern box 61px | 2.92px | 13.84px | not shipped |
+| template_frames 9 (from 5) | 2.29px | 8.19px | not shipped |
 
 The box-size curve has a clear minimum at 41px, which is exactly what `shot_profile.tune()`
 already chooses for a soft plate — so that rule is correct and does not need revisiting.
+More template averaging, which the UI calls the best-value setting on a grainy plate, is
+also already at its best value: 9 frames moved the median the wrong way and put more tracks
+over 3px, while improving p90. Both dials are at their optimum.
 
-What is left is sub-pixel localisation accuracy on defocused features, which no threshold
-reaches. Moving it needs algorithmic work (a better peak model, or a tracker that handles
-low-frequency features properly), not tuning. Five hypotheses were tried and measured here;
-all five were rejected on the numbers, and the measurement loop that rejected them
-(`tools/verify_against_lk.py`) is the durable result.
+Two changes did survive measurement, and both attack localisation rather than selection:
+the **identity gate** (worst track 20.51 -> 8.19px) and the **adaptive sub-pixel fit**
+(median 2.28 -> 2.22px, and equal-or-better on every synthetic peak width).
+
+What is left is sub-pixel localisation on defocused features. Seven hypotheses have now
+been measured against real footage; five were rejected outright and the two that shipped
+moved the worst case a long way and the median barely. The remaining error does not respond
+to thresholds or to the accuracy dials, which points at the model rather than the
+configuration — TAPNext's fixed 256px stage and NCC's behaviour on low-frequency texture
+are the two candidates, and neither is reachable from a settings file.
+
+The durable result is the loop itself: `tools/verify_against_lk.py` re-tracks each exported
+track with a different algorithm (pyramidal LK) and reports per-track error with the
+reference's own round-trip closure beside it, so a claim can be checked in ten minutes.
+Five plausible changes would have shipped on reasoning alone without it.
