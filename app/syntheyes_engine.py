@@ -584,22 +584,38 @@ class SynthEyesEngine:
         _win32_click_button only proves the button was found and a message was posted -- not
         that SynthEyes acted on it. A click that silently doesn't register looked exactly like
         a completed op, so Peel then ran on zero blips and the shot exported 0 trackers with
-        nothing in the log to say why. This re-asserts the room + foreground and re-clicks,
-        which is the same recover-and-retry shape _blip_peel_chunked already uses.
+        nothing in the log to say why.
+
+        A retry ESCALATES rather than repeating itself. The first attempt posts the click
+        (cheap, and it leaves the mouse alone); a retry -- or any attempt where the window
+        would not come to the foreground -- uses a real mouse click instead. A posted click
+        that did not register means the window was not truly foreground, and posting it
+        again the same way is the one thing known not to help. That is what made Blip All
+        intermittently burn its second attempt.
         """
+        st = "never-started"
         for attempt in range(1, attempts + 1):
             # The panel's child controls only exist while the window is up and in the
             # Features room; a lost foreground is exactly why a click gets dropped.
             self._ensure_features_room()
-            self._bring_foreground()
+            was_front = self._bring_foreground()
             # Baseline BEFORE the click, and re-read per attempt: a retry follows an attempt
             # that may itself have produced some output.
             before = progress_fn() if progress_fn else None
-            if not self._win32_click_button(label, variants):
+
+            real = (attempt > 1) or (not was_front)
+            hwnd, rect = self._find_butt(variants) if real else (None, None)
+            if real and hwnd:
+                why = ("after a click that did not register" if attempt > 1
+                       else "because the window is not foreground")
+                self.log(f"   {label}: using a real mouse click {why}")
+                self._real_click(rect)
+            elif not self._win32_click_button(label, variants):
                 self.log(f"   Win32 '{label}' unavailable - falling back to SyPy3 dispatch")
                 if self._click_and_wait(fallback_action, label, timeout=timeout):
                     return
                 raise RuntimeError(f"{label} failed: button not found and SyPy3 dispatch failed")
+
             self.log(f"   {label} dispatched... (waiting for completion signal)")
             st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout,
                                           progress_fn=progress_fn, progress_before=before)
@@ -618,6 +634,7 @@ class SynthEyesEngine:
         raise RuntimeError(
             f"{label} never ran after {attempts} attempts (last status '{st}'). "
             f"SynthEyes ignored the panel click - the shot would have exported 0 tracks.")
+
 
     def _blip_peel_full(self, frame_count, blip_timeout, peel_timeout):
         """Single-pass: blip ALL frames, peel, clear. Fine for shots that fit in memory."""
@@ -860,15 +877,27 @@ class SynthEyesEngine:
         self._set_frame_range(shot, s0, e0)
         self.log(f"-> Adaptive chunked blip/peel done ({idx} windows); trackers accumulated.")
 
-    def _bring_foreground(self):
-        """Show + foreground the SynthEyes main window so the Features panel actually
-        paints and its blip/peel child controls get instantiated (they don't exist while
-        the window is backgrounded). Uses the alt-key trick to defeat the Win32
-        foreground lock, then gives it a moment to repaint."""
+    def _bring_foreground(self, attempts=3):
+        """Show + foreground the SynthEyes main window and CONFIRM it worked.
+
+        Returns True when SynthEyes really is the foreground window.
+
+        This matters more than it looks: the Features panel's blip/peel child controls
+        only exist while the window is up, and a PostMessage click on a window that is not
+        genuinely foreground is silently dropped -- which is exactly what produced
+        "Blip All: released at ~6.2s but NO work was ever observed" and a retry that then
+        succeeded (the retry's only real difference was foregrounding again).
+
+        The alt-key trick alone is unreliable; Windows refuses SetForegroundWindow from a
+        process that does not own the foreground. Sharing the input queue with the target
+        thread (AttachThreadInput) is what actually lifts that restriction, so it is used
+        as the fallback, and the result is verified with GetForegroundWindow rather than
+        assumed.
+        """
         tops = self._syntheyes_top_windows()
         if not tops:
-            return
-        user32 = ctypes.windll.user32
+            return False
+        user32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
 
         def _area(h):
             r = wintypes.RECT()
@@ -877,20 +906,44 @@ class SynthEyesEngine:
 
         main = max(tops, key=_area)
         SW_RESTORE = 9
-        try:
-            user32.ShowWindow(main, SW_RESTORE)
-            user32.keybd_event(0x12, 0, 0, 0)          # ALT down (unlock SetForegroundWindow)
-            user32.SetForegroundWindow(main)
-            user32.keybd_event(0x12, 0, 0x0002, 0)     # ALT up
-            user32.BringWindowToTop(main)
-        except Exception as e:
-            self.log(f"   (foreground nudge failed: {e})")
-        time.sleep(0.8)
+
+        def _is_front():
+            return int(user32.GetForegroundWindow() or 0) == int(main)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                user32.ShowWindow(main, SW_RESTORE)
+                if attempt == 1:
+                    user32.keybd_event(0x12, 0, 0, 0)          # ALT down
+                    user32.SetForegroundWindow(main)
+                    user32.keybd_event(0x12, 0, 0x0002, 0)     # ALT up
+                else:
+                    our = k32.GetCurrentThreadId()
+                    tid = user32.GetWindowThreadProcessId(main, None)
+                    attached = bool(user32.AttachThreadInput(our, tid, True)) if our != tid else False
+                    try:
+                        user32.SetForegroundWindow(main)
+                        user32.SetActiveWindow(main)
+                    finally:
+                        if attached:
+                            user32.AttachThreadInput(our, tid, False)
+                user32.BringWindowToTop(main)
+            except Exception as e:
+                self.log(f"   (foreground nudge failed: {e})")
+            time.sleep(0.8 if attempt == 1 else 0.4)
+            if _is_front():
+                break
+        ok = _is_front()
+        if not ok:
+            # Say it, because the next posted click is the thing that will quietly vanish.
+            self.log("   WARNING: SynthEyes did not come to the foreground - a panel click "
+                     "may be ignored (something else is holding the foreground)")
         try:
             self.hlev.Redraw()
         except Exception:
             pass
         time.sleep(0.4)
+        return ok
 
     def _dump_all_children(self):
         """One-time full window-tree dump (all top windows, child class -> texts) to locate
