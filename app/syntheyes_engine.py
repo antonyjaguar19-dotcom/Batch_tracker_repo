@@ -426,22 +426,64 @@ class SynthEyesEngine:
         user32.EnumWindows(EnumProc(_cb), 0)
         return (state["prog"], state["err"])
 
+    def _tracker_count(self):
+        """How many trackers the scene holds, or None if SyPy3 won't say.
+
+        This is what Peel produces, so it is the one signal that proves peel ran. Only
+        called when the op is already idle -- never mid-op, because a SyPy3 call while
+        SynthEyes is busy is what desyncs the socket on 2026.2.4679.
+        """
+        hlev = getattr(self, "hlev", None)
+        if hlev is None:
+            return None
+        for get in (lambda: len(list(hlev.Trackers())),
+                    lambda: int(hlev.NumTrackers())):
+            try:
+                return int(get())
+            except Exception:
+                continue
+        return None
+
+    def _made_progress(self, label, progress_fn, before):
+        """True when the op's own output changed, i.e. it really did run.
+
+        Measured 2026-08 on build 2026.2.4679: Blip All peaks at ~3162% CPU and raises a
+        progress dialog; Peel All peaks at ~47% and raises none, yet takes the scene from
+        0 to 120 trackers. A single CPU bar cannot cover both, so an op that reports no OS
+        signal gets asked whether it produced anything before being declared dead.
+        """
+        if progress_fn is None or before is None:
+            return False
+        after = progress_fn()
+        if after is None or after == before:
+            return False
+        self.log(f"   {label}: no CPU peak or dialog, but its output changed "
+                 f"({before} -> {after}) -> it ran")
+        return True
+
     def _wait_for_operation(self, label, min_wait=3.0, max_timeout=600.0,
-                            peak_cpu=250.0, idle_hold=1.5, start_grace=6.0):
+                            peak_cpu=250.0, idle_hold=1.5, start_grace=6.0,
+                            progress_fn=None, progress_before=None):
         """Wait for a SynthEyes long-op (blip/peel) to finish via live signals instead of a
         fixed sleep. Falls back to a fixed sleep if psutil is unavailable.
 
         Returns a STATUS STRING, not a bool, because the caller needs to tell apart the two
         very different ways this returns "not done":
 
-          "done"          the op ran and finished (CPU peaked / progress dialog seen).
+          "done"          the op ran and finished (CPU peaked, progress dialog seen, or --
+                          when neither fired -- progress_fn shows its output changed).
           "never-started" released or hit the ceiling having seen NEITHER a CPU peak nor a
-                          progress dialog. The op never actually began -- almost always a
-                          PostMessage click SynthEyes ignored (window not foreground, a modal
-                          up). This used to be indistinguishable from "done", so Peel ran on
-                          zero blips and the shot exported 0 trackers with no error anywhere.
+                          progress dialog, AND produced no output. The op never actually
+                          began -- almost always a PostMessage click SynthEyes ignored
+                          (window not foreground, a modal up). This used to be
+                          indistinguishable from "done", so Peel ran on zero blips and the
+                          shot exported 0 trackers with no error anywhere.
           "error"         a crash/OOM ('Imminent Crash') dialog appeared.
           "stopped"       the user pressed Stop.
+
+        progress_fn / progress_before are the escape hatch for a cheap op: the CPU bar is
+        tuned for the massively-parallel blip, and peel finishes far below it with no
+        dialog at all, so without this peel is reported dead every single time.
         """
         pid = self._syntheyes_pid()
         proc = None
@@ -494,6 +536,12 @@ class SynthEyesEngine:
                     # behavior stands (assume it ran). With psutil, seeing neither signal
                     # means the click never landed -- report that instead of a false "done".
                     if proc is not None and not (peaked or seen_dialog):
+                        # Neither OS signal fired. That is NOT proof the click was ignored:
+                        # a cheap single-threaded op finishes below the CPU bar and puts up
+                        # no dialog. Ask the op itself whether it produced anything before
+                        # calling it dead.
+                        if self._made_progress(label, progress_fn, progress_before):
+                            return "done"
                         self.log(f"   {label}: released at ~{el:.1f}s but NO work was ever "
                                  f"observed (no CPU peak, no progress dialog) -> the click "
                                  f"most likely did not register")
@@ -501,6 +549,8 @@ class SynthEyesEngine:
                     self.log(f"   {label}: complete at ~{el:.1f}s (dialog gone + CPU idle)")
                     return "done"
         if proc is not None and not (peaked or seen_dialog):
+            if self._made_progress(label, progress_fn, progress_before):
+                return "done"
             self.log(f"   {label}: hit {max_timeout:.0f}s ceiling having never seen the op run")
             return "never-started"
         self.log(f"   {label}: hit {max_timeout:.0f}s ceiling -> proceeding")
@@ -508,7 +558,8 @@ class SynthEyesEngine:
 
     # ------ blip/peel (single-pass + long-shot chunked) ------
 
-    def _run_panel_op(self, label, variants, fallback_action, timeout, attempts=2):
+    def _run_panel_op(self, label, variants, fallback_action, timeout, attempts=2,
+                      progress_fn=None):
         """Click a Features-panel button and WAIT for the op to really run, retrying when it
         didn't. Raises RuntimeError if it never ran.
 
@@ -523,13 +574,17 @@ class SynthEyesEngine:
             # Features room; a lost foreground is exactly why a click gets dropped.
             self._ensure_features_room()
             self._bring_foreground()
+            # Baseline BEFORE the click, and re-read per attempt: a retry follows an attempt
+            # that may itself have produced some output.
+            before = progress_fn() if progress_fn else None
             if not self._win32_click_button(label, variants):
                 self.log(f"   Win32 '{label}' unavailable - falling back to SyPy3 dispatch")
                 if self._click_and_wait(fallback_action, label, timeout=timeout):
                     return
                 raise RuntimeError(f"{label} failed: button not found and SyPy3 dispatch failed")
             self.log(f"   {label} dispatched... (waiting for completion signal)")
-            st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout)
+            st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout,
+                                          progress_fn=progress_fn, progress_before=before)
             if st == "done":
                 return
             if st == "stopped":
@@ -553,8 +608,11 @@ class SynthEyesEngine:
                            "Feature/Blips all frames", blip_timeout)
 
         self.log("-> Peel All (Win32 PostMessage)...")
+        # Peel gets a progress probe: it draws too little CPU and raises no dialog, so the
+        # OS signals alone report it dead on every shot (measured on 2026.2.4679).
         self._run_panel_op("Peel All", ["Peel all", "Peel All"],
-                           "Feature/Peel All", peel_timeout)
+                           "Feature/Peel All", peel_timeout,
+                           progress_fn=self._tracker_count)
 
         self.log("-> Clearing blips...")
         if not self._win32_click_button("Clear blips", ["Clear all blips"]):
@@ -757,9 +815,12 @@ class SynthEyesEngine:
                                  f"later windows sized to the RAM ceiling")
 
                 self.log(f"   [window {idx}] plate frames {a+1}-{b+1} ({b - a + 1}f) blipped")
+                trk_before = self._tracker_count()
                 if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
                     pst = self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
-                                                   max_timeout=max(200, int((b - a + 1) * 1.2)))
+                                                   max_timeout=max(200, int((b - a + 1) * 1.2)),
+                                                   progress_fn=self._tracker_count,
+                                                   progress_before=trk_before)
                     # Trackers ACCUMULATE across windows, so one dead peel loses only this
                     # window -- warn (so a pattern is visible in the log) rather than abort
                     # the shot, which is the caller's call once the export count is known.
@@ -1221,10 +1282,22 @@ class SynthEyesEngine:
 
         # SAM3 gating in Python (yesterday's proven method): drop mover points, truncate
         # the Demo frozen tail. Beats the fragile SynthEyes roto matte.
+        #
+        # Best-effort, like _filter_exported_tracks: a crash in the gating must not throw
+        # away a finished export. It did once -- a sampling TypeError after a clean
+        # 120-tracker export failed the shot, sent it to the TAPNext retry, and published
+        # TAPNext tracks for a shot SynthEyes had actually tracked. The export is the
+        # expensive part; keep it. The tracks are then UNGATED, which matters (mover points
+        # survive), so say so loudly rather than letting it pass as a normal run.
         if n_trk > 0 and mask_dir:
-            res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
-            if res is not None:      # (0, 0) means "gated to nothing" -- still a real result
-                n_trk = res[0]
+            try:
+                res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
+                if res is not None:  # (0, 0) means "gated to nothing" -- still a real result
+                    n_trk = res[0]
+            except Exception as e:
+                self.log(f"   WARNING: SAM3 gating failed ({e}) - keeping all {n_trk} exported "
+                         f"tracker(s) UNGATED. Points on masked movers were NOT removed; "
+                         f"check this shot before solving.")
 
         if n_trk > 0:
             if image_width is None or image_height is None:
@@ -1640,6 +1713,7 @@ class SynthEyesEngine:
         # silently does NOTHING. Counting both makes "mask did nothing" and "mask dropped
         # everything" distinguishable in the log instead of looking alike.
         span = {"matched": 0, "out_of_range": 0}
+        squeezed = []   # marker so the shape-correction is reported once, not per mask
 
         def keep_point(frame, x, y):
             # export frame is 1-based; masks are a sorted 1-based sequence
@@ -1648,9 +1722,24 @@ class SynthEyesEngine:
                 span["out_of_range"] += 1
                 return True  # no mask for this frame -> don't drop
             span["matched"] += 1
-            m = mask_cache.get(idx)
-            if m is None:
+            if idx in mask_cache:
+                m = mask_cache[idx]
+            else:
                 m = cv2.imread(masks[idx], cv2.IMREAD_GRAYSCALE)
+                # IMREAD_GRAYSCALE is *supposed* to return 2-D, and these files read back
+                # 2-D standalone -- but in a live run (SAM3 + torch already loaded in this
+                # process) one came back with a channel axis, and sampling it raised
+                # "only 0-dimensional arrays can be converted to Python scalars" AFTER a
+                # successful 120-tracker export, failing the shot to the TAPNext retry.
+                # Don't trust the flag: collapse to one channel here, once per frame.
+                if m is not None and getattr(m, "ndim", 2) > 2:
+                    if not squeezed:
+                        # Once per run, not once per frame: it is the same cause for every
+                        # mask in the folder, and a 40-line burst per task buries the log.
+                        self.log(f"   SAM3 post-filter: masks read back with shape {m.shape} "
+                                 f"(not 2-D); using their first channel")
+                        squeezed.append(1)
+                    m = m[:, :, 0]
                 mask_cache[idx] = m
             if m is None:
                 return True

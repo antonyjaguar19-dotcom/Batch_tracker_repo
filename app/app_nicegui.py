@@ -1354,11 +1354,12 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
-            backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
+            backend_sel = ui.select(["syntheyes", "tapnext", "both"], value=state.track_backend,
                                     on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")
                                     ).props("dense outlined").classes("w-full")
-            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback. "
-                                "The settings below switch to match the selected backend.")
+            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker. "
+                                "both = run SynthEyes, then TAPNext on the same shots, and publish two track files "
+                                "per shot to compare. The settings below switch to match; 'both' shows all of them.")
 
             # ---- SynthEyes-only (shown when backend = syntheyes) ----
             with ui.column().classes("w-full gap-2") as syn_box:
@@ -1389,7 +1390,9 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                        ).props("dense outlined").classes("grow")
                     ui.button(icon="folder", on_click=lambda: pick_file(tde_exe)).props("flat dense")
                 tde_exe.on_value_change(lambda e: setattr(state, "tde4_exe", e.value or ""))
-            syn_box.bind_visibility_from(backend_sel, "value", value="syntheyes")
+            # 'both' runs each engine, so each engine's settings must stay reachable.
+            syn_box.bind_visibility_from(backend_sel, "value",
+                                         backward=lambda v: v in ("syntheyes", "both"))
 
             # ---- TAPNext++-only (shown when backend = tapnext) ----
             with ui.column().classes("w-full gap-2") as tap_box:
@@ -1591,7 +1594,8 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                     refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
                     refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
                     refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
-            tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
+            tap_box.bind_visibility_from(backend_sel, "value",
+                                         backward=lambda v: v in ("tapnext", "both"))
 
 # ---------- MAIN COLUMN ----------
 with ui.column().classes("w-full gap-3 p-3"):
@@ -1608,6 +1612,15 @@ with ui.column().classes("w-full gap-3 p-3"):
             btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
                              "have to click 1/2/3 and wait between each. Existing masks are reused "
                              "(use 2 · Masks to force a regen). Stop halts between stages.")
+            # Same setting as Settings > Tracking backend, surfaced here because it is the
+            # one choice you make per RUN rather than per session. Two-way bound, so the
+            # two controls can never disagree about which engine is about to run.
+            pipe_backend = ui.select(["syntheyes", "tapnext", "both"], label="Engine"
+                                     ).props("dense outlined").classes("w-40")
+            pipe_backend.bind_value(backend_sel, "value")
+            pipe_backend.tooltip("Which tracker the Track stage uses. both = SynthEyes first, then "
+                                 "TAPNext++ on the same shots; each shot publishes two track files "
+                                 "(…__syntheyes.txt and …__tapnext.txt) so you can compare them.")
             ui.separator().props("vertical").classes("bt-vsep")
             btn_analyze = ui.button("1 · Analyze", icon="auto_awesome", on_click=start_analyze
                                     ).props("outline no-caps").classes("bt-step")

@@ -921,11 +921,21 @@ def publish_shot(work_out: str, studio_dir: str, shot: str, backend: str,
                 _log(f"published log -> {os.path.join(studio_dir, 'logs')}")
 
     # --- masks: <work>/<shot>/masks* -> <studio>/masks/
+    # A camera+object shot has TWO mask dirs (masks_camera, masks_object) whose files are
+    # named identically (mask_000001.png ...). Flattening both into one masks/ made the
+    # second overwrite the first, so the studio tree silently kept only one task's mattes.
+    # With more than one source, each keeps its own subfolder named for its task; a
+    # single-task shot still publishes flat, which is what every existing shot looks like.
     if do_mask:
-        for md in _shot_mask_dirs(work_out, shot):
-            n = _copy_tree(md, os.path.join(studio_dir, "masks"))
+        mdirs = _shot_mask_dirs(work_out, shot)
+        mask_root = os.path.join(studio_dir, "masks")
+        for md in mdirs:
+            # "masks_camera" -> "camera"; a dir named plain "masks" has no task suffix.
+            task = os.path.basename(md.rstrip("/\\"))[len("masks"):].lstrip("_-")
+            dst = os.path.join(mask_root, task) if (len(mdirs) > 1 and task) else mask_root
+            n = _copy_tree(md, dst)
             if n:
-                _log(f"published {n} mask file(s) -> {os.path.join(studio_dir, 'masks')}")
+                _log(f"published {n} mask file(s) -> {dst}")
 
     # --- analysis: guide slice for this shot + manual note -> <studio>/analysis/
     if do_analysis:
@@ -2683,22 +2693,53 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
         backend = str(getattr(state, "track_backend", "syntheyes") or "syntheyes").lower()
         if backend in ("cotracker", "cotracker3"):
             backend = "tapnext"   # legacy value -> new GPU tracker
-        if backend == "syntheyes" and SynthEyesEngine is None:
+        if backend in ("syntheyes", "both") and SynthEyesEngine is None:
             logger(f"SynthEyes backend unavailable ({SYNTHEYES_IMPORT_ERROR}); falling back to TAPNext++.")
             backend = "tapnext"
 
-        # Which backend actually produced each shot's tracks. publish_shot matches
-        # "<shot>__*__<backend>.txt", so a batch where some shots fell back to TAPNext must
-        # publish per shot -- one global backend would silently publish nothing for them.
+        # Which backend(s) actually produced each shot's tracks -> shot: [backend, ...].
+        # publish_shot matches "<shot>__*__<backend>.txt" and is called once per backend, so
+        # this must be a LIST: a batch can mix (some shots fall back to TAPNext) and "both"
+        # deliberately produces two sets for the same shot. One global backend would
+        # silently publish nothing for the odd ones out.
         backend_by_shot = {}
-        if backend == "syntheyes":
-            logger("Tracking backend: SynthEyes")
+
+        def _mark(nm, bk):
+            backend_by_shot.setdefault(nm, [])
+            if bk not in backend_by_shot[nm]:
+                backend_by_shot[nm].append(bk)
+
+        if backend in ("syntheyes", "both"):
+            logger("Tracking backend: SynthEyes" + (" (then TAPNext++ as well)" if backend == "both" else ""))
             _free_vram("before SynthEyes")  # release torch cache so SynthEyes can use the GPU
             any_ran, stopped, failed = _track_shots_syntheyes(in_root, out_root, shot_tasks_map,
                                                               state, seed_count)
             for nm, d in state.shots_data.items():
                 if getattr(d, "use", False) and nm not in failed:
-                    backend_by_shot[nm] = "syntheyes"
+                    _mark(nm, "syntheyes")
+            if backend == "both" and not stopped:
+                # Run EVERY selected shot on TAPNext too, not just the SynthEyes failures:
+                # the point of "both" is two independent sets to compare. Same deferred
+                # placement as the retry below -- SynthEyes holds the GPU until its finally.
+                logger("=== Second pass: TAPNext++ on all selected shot(s) ===")
+                if BatchTrackerRunner is None:
+                    _ensure_tracker_loaded()
+                if BatchTrackerRunner is None:
+                    logger(f"TAPNext++ unavailable, second pass skipped: {TRACKER_IMPORT_ERROR}")
+                else:
+                    _free_vram("before TAPNext pass")
+                    t_ran, t_stopped = _track_shots_tapnext(
+                        in_root, out_root, shot_tasks_map, state, grid, seed_count, seed_min_dist)
+                    _free_vram("after TAPNext pass")
+                    stopped = stopped or t_stopped
+                    if t_ran:
+                        any_ran = True
+                        for nm, d in state.shots_data.items():
+                            if getattr(d, "use", False) and _shot_track_files(out_root, nm, "tapnext"):
+                                _mark(nm, "tapnext")
+                    else:
+                        logger("TAPNext++ second pass produced no tracks.")
+                failed = {}   # 'both' already ran TAPNext everywhere; no retry to do
             # Deferred TAPNext retry. It has to run AFTER the SynthEyes pass, not inline:
             # SynthEyes holds the GPU until _track_shots_syntheyes kills it in its finally.
             if failed and not stopped:
@@ -2722,8 +2763,8 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                         # Only shots with a real TAPNext .txt publish as tapnext.
                         for nm in failed:
                             if _shot_track_files(out_root, nm, "tapnext"):
-                                backend_by_shot[nm] = "tapnext"
-                        recovered = [n for n in failed if backend_by_shot.get(n) == "tapnext"]
+                                _mark(nm, "tapnext")
+                        recovered = [n for n in failed if "tapnext" in backend_by_shot.get(n, ())]
                         logger(f"TAPNext++ retry recovered {len(recovered)}/{len(failed)} shot(s)"
                                + (f": {', '.join(sorted(recovered))}" if recovered else ""))
                     else:
@@ -2737,7 +2778,7 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
             _free_vram("after TAPNext")
             for nm, d in state.shots_data.items():
                 if getattr(d, "use", False):
-                    backend_by_shot[nm] = "tapnext"
+                    _mark(nm, "tapnext")
 
         if stopped: logger("Tracking halted.")
         elif not any_ran:
@@ -2746,12 +2787,13 @@ def worker_track(in_dir, out_dir, grid, seed_count, seed_min_dist, state: AppSta
                    "SynthEyes errored on it. Confirm the Input Folder is set and the shot is ticked.")
         else: logger("Tracking Complete.")
         if any_ran:
-            # Publish the 2D tracks to each selected shot's studio bot_tracks folder, each
-            # under the backend that actually tracked it.
+            # Publish the 2D tracks to each selected shot's studio bot_tracks folder, once
+            # per backend that actually tracked it (two files for a 'both' run).
             for nm, d in state.shots_data.items():
-                if getattr(d, "use", False) and getattr(d, "studio_dir", "") and nm in backend_by_shot:
-                    publish_shot(str(out_root), d.studio_dir, nm, backend_by_shot[nm],
-                                 scope="track", log_cb=logger)
+                if getattr(d, "use", False) and getattr(d, "studio_dir", ""):
+                    for bk in backend_by_shot.get(nm, ()):
+                        publish_shot(str(out_root), d.studio_dir, nm, bk,
+                                     scope="track", log_cb=logger)
         JOB_QUEUE.put("DONE_TRACKING")
         return not stopped
     except Exception as e:
