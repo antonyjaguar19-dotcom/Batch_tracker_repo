@@ -183,6 +183,18 @@ pass finishes**, never inline, because SynthEyes holds the GPU until its `finall
     on every shot, so peel passes a `progress_fn` (the tracker count — the thing peel
     actually produces) that is consulted only when neither OS signal fired. Don't "simplify"
     that back to one threshold.
+  - **Seed count lives in the Advanced dialog, and needs a REAL click.** The Features room
+    has no Count/Threshold/Separation control at all, so the old `ByName('Count')` was
+    invalid on every shot and the count was silently dropped. The setting that governs
+    output is `Maximum tracker count` (Advanced Feature Control, ctrl id 1266), which
+    **defaults to 120 and resets to 120 for each new scene** — that default, not the plate,
+    was capping every export at exactly 120. SyPy3 cannot see that dialog (`Popup()` is
+    invalid), `WM_SETTEXT` and posted `WM_CHAR` are ignored, and `keybd_event` commits an
+    *empty* value; the field only accepts injected input against an attached input queue.
+    The `Advanced` button itself also needs a **real mouse click** — a `PostMessage` click
+    logs success and no dialog opens (unlike blip/peel, which post fine). Measured:
+    cap 40 → 40 trackers, cap 800 → 800. Threshold/separation have no equivalent field on
+    this build and are deliberately not applied.
   - In-process (SAM3 + torch loaded) `cv2.imread(..., IMREAD_GRAYSCALE)` returns
     **`(H, W, 1)`**, not `(H, W)` — standalone it returns 2-D, so this only shows up in a
     real run. The mask sampler collapses the channel axis itself. The SAM3 post-filter is

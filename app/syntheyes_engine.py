@@ -45,6 +45,24 @@ _WM_LBUTTONUP = 0x0202
 _MK_LBUTTON = 0x0001
 
 
+# SendInput payloads, for the Advanced-dialog spinner. That control ignores WM_SETTEXT and
+# posted WM_CHAR outright, and keybd_event reached it but committed an EMPTY value, so real
+# injected input is the only thing that sets it. See _set_advanced_max_tracks.
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+
 # ============================================================
 #  SyPy3 discovery
 # ============================================================
@@ -1239,12 +1257,11 @@ class SynthEyesEngine:
                 raise RuntimeError(
                     "Could not reach the SynthEyes Features room (blip/peel buttons never "
                     "appeared). Tracking this shot would produce 0 trackers.")
+        # Applies the tracker count via the Advanced dialog; see _configure_features.
+        # (It used to be disabled here because the old implementation opened that dialog
+        # with ByID(1238).ClickAndContinue(), which desynced the SyPy3 socket. It now opens
+        # it with the same Win32 button click blip/peel use, so that hazard is gone.)
         self._configure_features(track_count, track_threshold, track_separation)
-        # NOTE (2026 debug): _set_advanced_max_tracks does ByID(1238).ClickAndContinue()
-        # on a control that no longer exists on 2026 ("Advanced dialog not found").
-        # Suspected to DESYNC the SyPy3 socket -> subsequent IsPlaying()/Popup() return
-        # bogus True -> Blip All false-hangs 400s with flat CPU. Skipping to test.
-        # self._set_advanced_max_tracks(track_count)
 
         # Blip All + Peel All via Win32 PostMessage. The SyPy3 dispatch (_click_and_wait)
         # silently no-ops on 2026.2.4679, so PostMessage the real "Butt" panel buttons and
@@ -1471,121 +1488,216 @@ class SynthEyesEngine:
         Read back where the API allows so the log states what SynthEyes actually holds.
         """
         self.log(f"   Features: count={count}, threshold={threshold}, separation={separation}")
-        try:
-            ui = self.hlev.Main()
-        except Exception as e:
-            self.log(f"   WARNING: Could not reach the Features panel to set values: {e}")
-            return
-        for name, val in [("Count", count), ("Threshold", threshold), ("Separation", separation)]:
-            try:
-                spinner = ui.ByName(name)
-                if not spinner.IsValid():
-                    self.log(f"   WARNING: Features spinner '{name}' not found - "
-                             f"{name}={val} was NOT applied (SynthEyes keeps its old value)")
-                    continue
-                spinner.SetSpnValue(val)
-                try:
-                    got = spinner.GetSpnValue()
-                except Exception:
-                    continue      # no read-back on this build; the write itself succeeded
-                if got is not None and int(got) != int(val):
-                    self.log(f"   WARNING: '{name}' read back as {got}, expected {val} - "
-                             f"SynthEyes rejected the write")
-                else:
-                    self.log(f"   OK  '{name}' = {got}")
-            except Exception as e:
-                self.log(f"   WARNING: could not set Features '{name}'={val}: {e}")
+        # There are no Count/Threshold/Separation controls in the 2026 Features room --
+        # enumerating it (2026-08) turns up only buttons and three Boxers (Camera, motion
+        # preset, camera name). ByName('Count') was therefore invalid on every shot and all
+        # three values were silently dropped, three WARNING lines at a time.
+        #
+        # The one that actually governs output is 'Maximum tracker count', which lives in
+        # the Advanced Feature Control dialog and defaults to 120 -- exactly the tracker
+        # count every export produced, i.e. this cap, not the plate, was the limit.
+        self._set_advanced_max_tracks(count)
+        # Threshold/separation have no equivalent field on this build (the dialog exposes
+        # blip size/density instead, which are not the same quantity). Say so once, at the
+        # level of a note, rather than warning per shot about a control that cannot exist.
+        if not getattr(self, "_feat_note_logged", False):
+            self._feat_note_logged = True
+            self.log(f"   note: threshold={threshold} / separation={separation} are not exposed "
+                     f"as controls on this SynthEyes build; leaving its own feature settings "
+                     f"alone. Only the tracker count is applied.")
 
     # ----- Advanced dialog (known control IDs, Win32 input) -----
     ADV_BUTTON_ID = 1238
     ADV_MAX_TRACKS_ID = 1266
 
-    def _set_advanced_max_tracks(self, max_tracks):
-        hlev = self.hlev
+    def _send_input(self, vk, scan, flags):
+        inp = _INPUT(type=1)
+        inp.ki = _KEYBDINPUT(vk, scan, flags, 0, None)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        time.sleep(0.015)
+
+    def _send_vk(self, vk, up=False):
+        self._send_input(vk, 0, 0x0002 if up else 0)
+
+    def _send_unicode(self, ch):
+        for flags in (0x0004, 0x0004 | 0x0002):      # KEYEVENTF_UNICODE [| KEYUP]
+            self._send_input(0, ord(ch), flags)
+
+    def _adv_spinner_text(self, hwnd):
+        """Read a SynthEyes Spinner. GetWindowTextW returns '' across processes for these
+        custom controls; WM_GETTEXT does answer. Note it only reflects a new value AFTER
+        the edit is committed with Enter, so read back at the end, not while typing."""
+        buf = ctypes.create_unicode_buffer(64)
+        ctypes.windll.user32.SendMessageW(ctypes.c_void_p(int(hwnd)), 0x000D, 64, buf)
+        return buf.value.strip()
+
+    def _find_butt(self, variants):
+        """(hwnd, rect) of a Features-panel button by its text, or (None, None)."""
+        norm = lambda s: "".join((s or "").lower().split())
+        wants = {norm(v) for v in variants}
+        for w in self._syntheyes_top_windows():
+            for hwnd, text, rect in self._enum_butt_buttons(w):
+                if norm(text) in wants:
+                    return hwnd, rect
+        return None, None
+
+    def _real_click(self, rect):
+        """Physically click the centre of a screen rect and put the pointer back.
+
+        PostMessage is enough for blip/peel, but NOT for 'Advanced': it reports success and
+        the dialog never opens, because a posted click on a button that is not genuinely
+        foreground is simply dropped. A real click is the same mechanism that turned out to
+        be the only thing the Advanced spinner accepts.
+        """
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        self.log(f"-> Setting Advanced Max Tracks to: {max_tracks}")
-
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
         try:
-            hlev.Main().ByID(self.ADV_BUTTON_ID).ClickAndContinue()
-            time.sleep(1.5)
-        except Exception as e:
-            self.log(f"   ERROR: Could not click Advanced button: {e}")
-            return False
-
-        dialog_hwnd = 0
-        for _ in range(10):
-            time.sleep(0.5)
-            dialog_hwnd = user32.FindWindowW(None, "Advanced Feature Control")
-            if dialog_hwnd:
-                break
-        if not dialog_hwnd:
-            self.log("   WARNING: Advanced dialog not found - skipping")
-            return False
-
-        spinner_hwnd = user32.GetDlgItem(dialog_hwnd, self.ADV_MAX_TRACKS_ID)
-        if not spinner_hwnd:
-            self.log("   WARNING: Spinner 1266 not found")
-            return False
-
-        our_tid = kernel32.GetCurrentThreadId()
-        se_tid = user32.GetWindowThreadProcessId(dialog_hwnd, None)
-        attached = False
-        if our_tid != se_tid:
-            attached = bool(user32.AttachThreadInput(our_tid, se_tid, True))
-
-        try:
-            user32.ShowWindow(dialog_hwnd, 5)
-            user32.SetForegroundWindow(dialog_hwnd)
-            time.sleep(0.3)
-            user32.SetFocus(spinner_hwnd)
-            time.sleep(0.2)
-
-            lParam = (10 << 16) | 30
-            user32.SendMessageW(spinner_hwnd, 0x0201, 1, lParam)
-            user32.SendMessageW(spinner_hwnd, 0x0202, 0, lParam)
-            time.sleep(0.2)
-
-            VK_CONTROL = 0x11
-            VK_A = 0x41
-            VK_RETURN = 0x0D
-            KEYEVENTF_KEYUP = 0x0002
-
-            def press_key(vk):
-                user32.keybd_event(vk, 0, 0, 0)
-                time.sleep(0.02)
-                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-                time.sleep(0.02)
-
-            user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.02)
-            press_key(VK_A)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
-
-            for char in str(int(max_tracks)):
-                press_key(ord(char))
-                time.sleep(0.05)
-
-            time.sleep(0.1)
-            press_key(VK_RETURN)
-            time.sleep(0.3)
-
-            ok_btn = user32.GetDlgItem(dialog_hwnd, 1)
-            if ok_btn:
-                user32.SendMessageW(ok_btn, 0x0201, 1, 0)
-                time.sleep(0.05)
-                user32.SendMessageW(ok_btn, 0x0202, 0, 0)
-                self.log(f"   OK  Set Max Tracks = {max_tracks}")
-            else:
-                press_key(VK_RETURN)
-                self.log(f"   OK  Set Max Tracks = {max_tracks} (Enter to close)")
-
-            time.sleep(0.3)
-            return True
+            cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+            user32.SetCursorPos(cx, cy)
+            time.sleep(0.15)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN
+            time.sleep(0.05)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
+            time.sleep(0.25)
         finally:
+            user32.SetCursorPos(pt.x, pt.y)
+
+    def _open_advanced_dialog(self, attempts=3):
+        """Click 'Advanced' and return the dialog HWND, or 0.
+
+        Uses a REAL click, not PostMessage. The posted click logs 'OK Win32 click' and then
+        no dialog appears -- the button needs genuine foreground input, unlike blip/peel.
+        """
+        user32 = ctypes.windll.user32
+        for attempt in range(1, attempts + 1):
+            dlg = user32.FindWindowW(None, "Advanced Feature Control")
+            if dlg:
+                return dlg
+            self._ensure_features_room()
+            self._bring_foreground()
+            time.sleep(0.4)
+            hwnd, rect = self._find_butt(["Advanced"])
+            if not hwnd:
+                self.log("   WARNING: 'Advanced' button not found on the Features panel")
+                return 0
+            self._real_click(rect)
+            for _ in range(20):
+                time.sleep(0.4)
+                dlg = user32.FindWindowW(None, "Advanced Feature Control")
+                if dlg:
+                    return dlg
+            if attempt < attempts:
+                self.log(f"   Advanced dialog did not open - retrying ({attempt + 1}/{attempts})")
+        return 0
+
+    def _type_into_spinner(self, dlg, spin, text):
+        """Click the field, select all, type, commit. Returns what it reads back.
+
+        AttachThreadInput first: without sharing the input queue, SetForegroundWindow is
+        refused by the foreground lock, SetFocus does nothing, and the injected digits go
+        to whatever really had focus -- which is how this committed an EMPTY value.
+        """
+        user32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        our = k32.GetCurrentThreadId()
+        se_tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(dlg), None)
+        attached = bool(user32.AttachThreadInput(our, se_tid, True)) if our != se_tid else False
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))   # this steals the pointer; put it back after
+        try:
+            user32.ShowWindow(ctypes.c_void_p(dlg), 5)
+            user32.SetForegroundWindow(ctypes.c_void_p(dlg))
+            time.sleep(0.35)
+            user32.SetFocus(ctypes.c_void_p(spin))
+            time.sleep(0.15)
+
+            r = wintypes.RECT()
+            user32.GetWindowRect(ctypes.c_void_p(spin), ctypes.byref(r))
+            cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+            user32.SetCursorPos(cx, cy)
+            time.sleep(0.2)
+            for _ in range(2):                      # double-click = enter edit mode
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+                time.sleep(0.12)
+            time.sleep(0.35)
+
+            self._send_vk(0x11)                                  # ctrl down
+            self._send_vk(0x41); self._send_vk(0x41, up=True)    # A
+            self._send_vk(0x11, up=True)                         # ctrl up
+            time.sleep(0.15)
+            for ch in text:
+                self._send_unicode(ch)
+            time.sleep(0.25)
+            self._send_vk(0x0D); self._send_vk(0x0D, up=True)    # Enter commits
+            time.sleep(0.6)
+            return self._adv_spinner_text(spin)
+        finally:
+            user32.SetCursorPos(pt.x, pt.y)
             if attached:
-                user32.AttachThreadInput(our_tid, se_tid, False)
+                user32.AttachThreadInput(our, se_tid, False)
+
+    def _set_advanced_max_tracks(self, max_tracks, attempts=3):
+        """Set 'Maximum tracker count' in the Advanced Feature Control dialog.
+
+        This is the setting that caps how many trackers a shot can produce. It defaults to
+        120, and 120 is exactly what every export returned regardless of the count asked
+        for, because nothing was writing it: the Features room has no such control, so the
+        old ByName('Count') lookup was invalid on every shot.
+
+        Everything cheaper was tried and does not work on build 2026.2.4679 (2026-08):
+        SyPy3 cannot see this dialog (Popup() is invalid), WM_SETTEXT returns 1 and changes
+        nothing, posted WM_CHAR is ignored, and keybd_event reached the field but committed
+        an EMPTY value. Injected input against an attached input queue is what works.
+
+        Verified by read-back, retried, and -- crucially -- restored if it cannot be set:
+        leaving the cap blank would be worse than leaving it alone.
+        """
+        user32 = ctypes.windll.user32
+        target = str(int(max_tracks))
+
+        dlg = self._open_advanced_dialog()
+        if not dlg:
+            self.log("   WARNING: Advanced Feature Control dialog did not open - tracker "
+                     "count left at its current value")
+            return False
+
+        spin = user32.GetDlgItem(ctypes.c_void_p(dlg), self.ADV_MAX_TRACKS_ID)
+        if not spin:
+            self.log(f"   WARNING: spinner {self.ADV_MAX_TRACKS_ID} (Maximum tracker count) "
+                     f"not in the dialog - tracker count left as-is")
+            user32.PostMessageW(ctypes.c_void_p(dlg), 0x0010, 0, 0)
+            return False
+
+        original = self._adv_spinner_text(spin)
+        ok = False
+        try:
+            if original == target:
+                self.log(f"   OK  Maximum tracker count already {target}")
+                return True
+            got = ""
+            for attempt in range(1, attempts + 1):
+                got = self._type_into_spinner(dlg, spin, target)
+                if got == target:
+                    self.log(f"   OK  Maximum tracker count {original or '?'} -> {got}")
+                    ok = True
+                    break
+                if attempt < attempts:
+                    self.log(f"   Maximum tracker count read back {got!r}, wanted {target} "
+                             f"- retrying ({attempt + 1}/{attempts})")
+            if not ok:
+                self.log(f"   WARNING: could not set Maximum tracker count to {target} "
+                         f"(reads {got!r}); SynthEyes will cap this shot at its own value")
+                # Never leave the field blank/garbage -- put back what was there.
+                if original and got != original:
+                    back = self._type_into_spinner(dlg, spin, original)
+                    self.log(f"   restored Maximum tracker count to {back!r}")
+        finally:
+            if user32.IsWindow(ctypes.c_void_p(dlg)):
+                user32.PostMessageW(ctypes.c_void_p(dlg), 0x0010, 0, 0)   # WM_CLOSE
+                time.sleep(0.3)
+        return ok
+
 
     def _click_and_wait(self, action_name, label, timeout=300):
         # SynthEyes 2026: two-part completion detection.
