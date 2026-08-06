@@ -187,13 +187,15 @@ pass finishes**, never inline, because SynthEyes holds the GPU until its `finall
   and SAM3 mattes are applied as a Python post-filter. SyPy3 is auto-discovered next to
   the `.exe`. No per-point loop exists here — SynthEyes blips and peels internally.
   Two measured traps (2026-08, build 2026.2.4679):
-  - **A posted click only lands if the window is genuinely foreground.** `_bring_foreground`
-    now *verifies* with `GetForegroundWindow` (the alt-key trick alone is refused by the
-    Win32 foreground lock; `AttachThreadInput` is the fallback that works) and returns a
-    bool. `_run_panel_op` escalates on that: first attempt posts the click, but a retry —
-    or any attempt where the window would not come forward — uses a **real mouse click**,
-    because re-posting is the one thing known not to help. This is what made Blip All
-    intermittently spend its second attempt.
+  - **Panel buttons need a REAL mouse click, not `PostMessage`.** A posted click makes the
+    button *repaint as pressed* and the operation never runs — it looks clicked and isn't.
+    These custom `Butt` controls read the actual cursor / mouse capture on mouse-up. Every
+    Features-panel click goes through `_click_panel_button` (foreground, then click the
+    button's real screen position; `PostMessage` only as a fallback when the rect can't be
+    resolved). Consequence: **SynthEyes tracking takes the mouse pointer** for its duration
+    (restored after each click) — that is the cost of the thing working at all, not an
+    oversight. `_bring_foreground` also verifies with `GetForegroundWindow` and falls back
+    to `AttachThreadInput`, since the alt-key trick alone is refused by the foreground lock.
   - `_wait_for_operation` decides an op ran by watching CPU and progress dialogs, but the
     two ops are nothing alike: **Blip peaks ~3162% CPU with a dialog; Peel peaks ~47% with
     none**, while taking the scene 0 → 120 trackers. The CPU bar alone reported peel dead

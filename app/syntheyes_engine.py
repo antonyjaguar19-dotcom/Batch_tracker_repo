@@ -337,6 +337,30 @@ class SynthEyesEngine:
         user32.EnumChildWindows(main_hwnd, EnumProc(_cb), 0)
         return out
 
+    def _click_panel_button(self, label, variants, settle=0.5):
+        """Click a Features-panel button for real. Returns True if a click was delivered.
+
+        PostMessage is NOT good enough for these controls. Watching the automation run, the
+        button visibly depresses and the operation never starts -- the control repaints on
+        the posted WM_LBUTTONDOWN but does not treat it as a completed click, because a
+        custom control of this kind checks the actual cursor position / mouse capture on
+        the up. The same button worked immediately when clicked by hand, and the 'Advanced'
+        button never responded to a posted click at all.
+
+        So: bring SynthEyes forward (an inactive window would otherwise swallow the first
+        click just to activate), then click the button's real screen position. The pointer
+        is put back afterwards. PostMessage stays only as a fallback for when the button's
+        rectangle cannot be resolved.
+        """
+        self._bring_foreground()
+        hwnd, rect = self._find_butt(variants)
+        if hwnd and rect:
+            self._real_click(rect, expect_hwnd=hwnd)
+            self.log(f"   OK  clicked '{label}'")
+            time.sleep(settle)
+            return True
+        return self._win32_click_button(label, variants, settle=settle)
+
     def _win32_click_button(self, label, variants, settle=0.5):
         """Click a Features-room panel button by its text via PostMessage. Returns bool.
 
@@ -581,37 +605,26 @@ class SynthEyesEngine:
         """Click a Features-panel button and WAIT for the op to really run, retrying when it
         didn't. Raises RuntimeError if it never ran.
 
-        _win32_click_button only proves the button was found and a message was posted -- not
-        that SynthEyes acted on it. A click that silently doesn't register looked exactly like
-        a completed op, so Peel then ran on zero blips and the shot exported 0 trackers with
-        nothing in the log to say why.
+        The click is a REAL mouse click (_click_panel_button). A posted click is not enough:
+        watching the automation, the button visibly depresses and nothing runs, while the
+        same button works when clicked by hand. These controls repaint on the posted
+        WM_LBUTTONDOWN but do not treat it as a completed click.
 
-        A retry ESCALATES rather than repeating itself. The first attempt posts the click
-        (cheap, and it leaves the mouse alone); a retry -- or any attempt where the window
-        would not come to the foreground -- uses a real mouse click instead. A posted click
-        that did not register means the window was not truly foreground, and posting it
-        again the same way is the one thing known not to help. That is what made Blip All
-        intermittently burn its second attempt.
+        Delivering the click still does not prove SynthEyes acted on it, so every op is
+        confirmed by _wait_for_operation and retried when it did not run -- otherwise Peel
+        runs on zero blips and the shot exports 0 trackers with nothing in the log.
         """
         st = "never-started"
         for attempt in range(1, attempts + 1):
             # The panel's child controls only exist while the window is up and in the
             # Features room; a lost foreground is exactly why a click gets dropped.
             self._ensure_features_room()
-            was_front = self._bring_foreground()
             # Baseline BEFORE the click, and re-read per attempt: a retry follows an attempt
             # that may itself have produced some output.
             before = progress_fn() if progress_fn else None
 
-            real = (attempt > 1) or (not was_front)
-            hwnd, rect = self._find_butt(variants) if real else (None, None)
-            if real and hwnd:
-                why = ("after a click that did not register" if attempt > 1
-                       else "because the window is not foreground")
-                self.log(f"   {label}: using a real mouse click {why}")
-                self._real_click(rect)
-            elif not self._win32_click_button(label, variants):
-                self.log(f"   Win32 '{label}' unavailable - falling back to SyPy3 dispatch")
+            if not self._click_panel_button(label, variants):
+                self.log(f"   '{label}' button not found - falling back to SyPy3 dispatch")
                 if self._click_and_wait(fallback_action, label, timeout=timeout):
                     return
                 raise RuntimeError(f"{label} failed: button not found and SyPy3 dispatch failed")
@@ -626,7 +639,7 @@ class SynthEyesEngine:
             if st == "error":
                 # crash/OOM dialog -> clear it and the half-built blips before retrying
                 self._dismiss_error_dialog()
-                self._win32_click_button("Clear blips", ["Clear all blips"])
+                self._click_panel_button("Clear blips", ["Clear all blips"])
                 if not self.is_alive():
                     raise RuntimeError(f"SynthEyes crashed during {label}")
             if attempt < attempts:
@@ -638,11 +651,11 @@ class SynthEyesEngine:
 
     def _blip_peel_full(self, frame_count, blip_timeout, peel_timeout):
         """Single-pass: blip ALL frames, peel, clear. Fine for shots that fit in memory."""
-        self.log("-> Blip All frames (Win32 PostMessage)...")
+        self.log("-> Blip All frames...")
         self._run_panel_op("Blip All", ["Blips all frames", "Blip all frames"],
                            "Feature/Blips all frames", blip_timeout)
 
-        self.log("-> Peel All (Win32 PostMessage)...")
+        self.log("-> Peel All...")
         # Peel gets a progress probe: it draws too little CPU and raises no dialog, so the
         # OS signals alone report it dead on every shot (measured on 2026.2.4679).
         self._run_panel_op("Peel All", ["Peel all", "Peel All"],
@@ -650,7 +663,7 @@ class SynthEyesEngine:
                            progress_fn=self._tracker_count)
 
         self.log("-> Clearing blips...")
-        if not self._win32_click_button("Clear blips", ["Clear all blips"]):
+        if not self._click_panel_button("Clear blips", ["Clear all blips"]):
             self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
 
     def _dismiss_error_dialog(self):
@@ -815,12 +828,12 @@ class SynthEyesEngine:
                     self._ensure_features_room()
                     self._bring_foreground()
                     wto = max(120, int((b - a + 1) * 0.3))
-                    if self._win32_click_button("Blips playback range",
+                    if self._click_panel_button("Blips playback range",
                                                 ["Blips playback range", "Blip playback range"]):
                         st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
                     else:
                         self.log("   'Blips playback range' not found - falling back to Blip All")
-                        self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
+                        self._click_panel_button("Blip All", ["Blips all frames", "Blip all frames"])
                         st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
                     # 'never-started' joins 'error' on the retry path: both mean this window
                     # produced nothing, and a re-click is exactly the right recovery.
@@ -829,7 +842,7 @@ class SynthEyesEngine:
                         break
                     # crash/OOM signal -> recover + shrink + retry
                     self._dismiss_error_dialog()
-                    self._win32_click_button("Clear blips", ["Clear all blips"])
+                    self._click_panel_button("Clear blips", ["Clear all blips"])
                     if not self.is_alive():
                         raise RuntimeError("SynthEyes crashed during chunked blip (OOM)")
                     shrunk = max(min_win, (b - a + 1) // 2)
@@ -851,7 +864,7 @@ class SynthEyesEngine:
 
                 self.log(f"   [window {idx}] plate frames {a+1}-{b+1} ({b - a + 1}f) blipped")
                 trk_before = self._tracker_count()
-                if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+                if self._click_panel_button("Peel All", ["Peel all", "Peel All"]):
                     pst = self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
                                                    max_timeout=max(200, int((b - a + 1) * 1.2)),
                                                    progress_fn=self._tracker_count,
@@ -862,7 +875,7 @@ class SynthEyesEngine:
                     if pst == "never-started":
                         self.log(f"   WARNING: window {idx} peel never ran - that window "
                                  f"contributed no trackers")
-                self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
+                self._click_panel_button("Clear blips", ["Clear all blips"])  # free blip memory
             finally:
                 wd.cancel()
 
@@ -1316,9 +1329,10 @@ class SynthEyesEngine:
         # it with the same Win32 button click blip/peel use, so that hazard is gone.)
         self._configure_features(track_count, track_threshold, track_separation)
 
-        # Blip All + Peel All via Win32 PostMessage. The SyPy3 dispatch (_click_and_wait)
-        # silently no-ops on 2026.2.4679, so PostMessage the real "Butt" panel buttons and
-        # wait a frame-scaled budget (there is no reliable API to poll blip completion).
+        # Blip All + Peel All by clicking the real "Butt" panel buttons. The SyPy3 dispatch
+        # (_click_and_wait) silently no-ops on 2026.2.4679, and a PostMessage click is not
+        # enough either -- the button repaints as pressed and the operation never runs -- so
+        # the pointer is genuinely moved onto the button (see _click_panel_button).
         # SyPy3 remains the fallback if the buttons can't be located.
         # Foreground the window so the Features panel paints and its blip/peel child
         # controls instantiate (they don't exist while backgrounded on 2026.2.4679).
@@ -1594,13 +1608,18 @@ class SynthEyesEngine:
                     return hwnd, rect
         return None, None
 
-    def _real_click(self, rect):
+    def _real_click(self, rect, expect_hwnd=None):
         """Physically click the centre of a screen rect and put the pointer back.
 
-        PostMessage is enough for blip/peel, but NOT for 'Advanced': it reports success and
-        the dialog never opens, because a posted click on a button that is not genuinely
-        foreground is simply dropped. A real click is the same mechanism that turned out to
-        be the only thing the Advanced spinner accepts.
+        A posted click is not a substitute: the button repaints as pressed and the operation
+        never runs, and 'Advanced' ignores a posted click completely -- both work by hand.
+        These controls read the real cursor / mouse capture, so the pointer genuinely has to
+        be over the button.
+
+        Moves first and clicks second, so the control gets its WM_MOUSEMOVE (hover) before
+        the button-down, and checks what is actually under that point: if another window is
+        covering the button the click would land somewhere else entirely, which is worth a
+        line in the log rather than a silent no-op.
         """
         user32 = ctypes.windll.user32
         pt = wintypes.POINT()
@@ -1608,9 +1627,16 @@ class SynthEyesEngine:
         try:
             cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
             user32.SetCursorPos(cx, cy)
-            time.sleep(0.15)
+            time.sleep(0.12)
+            user32.mouse_event(0x0001, 0, 0, 0, 0)   # MOUSEEVENTF_MOVE -> hover
+            time.sleep(0.08)
+            if expect_hwnd:
+                target = user32.WindowFromPoint(wintypes.POINT(cx, cy))
+                if target and int(target) != int(expect_hwnd):
+                    self.log(f"   WARNING: ({cx},{cy}) belongs to hwnd {int(target)}, not the "
+                             f"button {int(expect_hwnd)} - something is covering it")
             user32.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN
-            time.sleep(0.05)
+            time.sleep(0.08)
             user32.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
             time.sleep(0.25)
         finally:
@@ -1634,7 +1660,7 @@ class SynthEyesEngine:
             if not hwnd:
                 self.log("   WARNING: 'Advanced' button not found on the Features panel")
                 return 0
-            self._real_click(rect)
+            self._real_click(rect, expect_hwnd=hwnd)
             for _ in range(20):
                 time.sleep(0.4)
                 dlg = user32.FindWindowW(None, "Advanced Feature Control")
