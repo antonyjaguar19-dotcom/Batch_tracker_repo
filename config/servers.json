@@ -1,0 +1,12 @@
+[
+  {
+    "name": "LIV1",
+    "root": "\\\\liv1\\shows",
+    "note": "Original server. Shows live one level down, under 'shows'. Still live."
+  },
+  {
+    "name": "LIV2",
+    "root": "\\\\liv2",
+    "note": "New server (2026-08). Each show is its own top-level share on liv2, so the root is the bare server name and the show list comes from the share table, not a folder listing."
+  }
+]

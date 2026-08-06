@@ -114,6 +114,26 @@ Every tuning knob is a field on `AppState` (see `app/app.py:1108`), copied into
 
 ### Folders: local work dir vs studio tree
 Shots come from a studio share: `<shows_root>/<show>/<shot>/in/plates/<version>/`.
+
+`shows_root` is per-server and never hardcoded. The studio runs several plate servers,
+and they are not the same shape: `\\liv1\shows` holds shows one folder down, while on
+`\\liv2` **each show is its own top-level share**. Everything from `<show>` down is
+identical, so the difference is absorbed by the root string alone. Servers are listed in
+`config/servers.json` (`[{"name","root"}]`, first entry = UI default), overridable with
+`BTR_SHOWS_SERVERS=NAME=ROOT;NAME=ROOT`. Adding a server is a config edit, not code.
+
+Two things that shape must not be "cleaned up" into:
+- Studio-tree paths are built with `be.under(root, *parts)`, **not** `Path(root) / part`.
+  pathlib only recognises a UNC path once it has both a server and a share, so
+  `Path(r"\\liv2") / "ABC"` silently drops a backslash and yields a path that
+  does not exist. `under()` joins the text first, so a bare-server root still resolves.
+- `list_shows` falls back to `_list_server_shares()` (parses `net view`; pywin32 is not
+  in the embeddable runtime) when the root is a bare server, because there is no folder
+  to iterdir. An empty list there means the server did not answer — not that it is empty.
+
+Local work dir stays keyed by show name alone (`runtime/_work/<show>`) — two servers
+holding a same-named show would share masks/proxies. Accepted, not overlooked.
+
 The pipeline **computes in a local work dir** (`runtime/_work/<show>`, override `BTR_WORK`)
 so the cross-shot guide and mask-reuse logic stay intact, then `publish_shot()` copies
 finished artifacts to `<show>/<shot>/mid/cmm/bot_tracks/{*_2Dtracks__<backend>.txt,
@@ -123,7 +143,21 @@ studio tree, so badges survive a restart and read the same from any workstation.
 
 Work-dir naming the publisher depends on: `<shot>__<task>__<backend>.txt`,
 `<shot>__track.log`, `<shot>/masks*/`, `_batches/batch_<ts>/mask_guidance.json`.
-Publishing is per shot and per backend, because a batch can fall back mid-run.
+Publishing is per shot **and per backend** — `backend_by_shot` maps a shot to a *list*,
+because a batch can fall back mid-run and `track_backend="both"` deliberately produces two
+track files for the same shot. A shot with two mask dirs (`masks_camera`, `masks_object`)
+publishes them into `masks/<task>/`, not flattened into `masks/`: the files are named
+identically per task, so flattening silently kept only the last one copied.
+
+**A click in the launcher window used to freeze the whole run.** Windows consoles ship with
+QuickEdit on (`HKCU\Console\QuickEdit=1`), and a console blocks *every* write to stdout
+while text is selected — which is what one click or drag does. `logger()` ends in `print()`,
+so the worker thread stopped on its next log line, with no error and no clue; Ctrl+C or Esc
+cleared the selection and it carried on exactly where it left off. The tell is a long stall
+between two **adjacent** log lines that ends the moment you touch the window (seen in the
+wild: 51 minutes mid-`_auto_tune`). `be.disable_console_quickedit()` is called at startup in
+`app_nicegui.py` to clear the flag — don't remove it, and don't move it below anything that
+logs.
 
 ### Analyze
 `worker_analyze` → Qwen batch over downscaled (1280px) proxies → `core.bridge.build_batch_tracker_json`
@@ -138,16 +172,54 @@ threaded through the call signatures; nothing calls them. `README.md` and one Ni
 tooltip still describe a LLaMA stage — stale.
 
 ### Track
-`worker_track` picks the backend from `state.track_backend`, falls back to TAPNext++ if
-SynthEyes fails to import, and — key detail — **retries shots that produced zero tracks on
-TAPNext after the whole SynthEyes pass finishes**, never inline, because SynthEyes holds
-the GPU until its `finally`.
+`worker_track` picks the backend from `state.track_backend` (`syntheyes` | `tapnext` |
+`both`, chosen from the **Engine** dropdown on the run bar or Settings — the two controls
+are bound to one value), falls back to TAPNext++ if SynthEyes fails to import, and — key
+detail — **retries shots that produced zero tracks on TAPNext after the whole SynthEyes
+pass finishes**, never inline, because SynthEyes holds the GPU until its `finally`.
+`both` runs TAPNext over *every* selected shot as a second pass in that same deferred slot
+(and skips the retry, having already covered the failures), so each shot ends up with a
+`__syntheyes` and a `__tapnext` file to compare.
 
 - **`app/syntheyes_engine.py`** — drives an installed SynthEyes over SyPy3. On build
   2026.2.4679 SyPy3's `ClickAndWait()` dispatch silently no-ops, so blip/peel/room-switch
   run via **Win32 `PostMessage` to the real panel buttons**, export via a **Sizzle script**,
   and SAM3 mattes are applied as a Python post-filter. SyPy3 is auto-discovered next to
   the `.exe`. No per-point loop exists here — SynthEyes blips and peels internally.
+  Two measured traps (2026-08, build 2026.2.4679):
+  - **Panel buttons need a REAL mouse click, not `PostMessage`.** A posted click makes the
+    button *repaint as pressed* and the operation never runs — it looks clicked and isn't.
+    These custom `Butt` controls read the actual cursor / mouse capture on mouse-up. Every
+    Features-panel click goes through `_click_panel_button` (foreground, then click the
+    button's real screen position; `PostMessage` only as a fallback when the rect can't be
+    resolved). Consequence: **SynthEyes tracking takes the mouse pointer** for its duration
+    (restored after each click) — that is the cost of the thing working at all, not an
+    oversight. `_bring_foreground` also verifies with `GetForegroundWindow` and falls back
+    to `AttachThreadInput`, since the alt-key trick alone is refused by the foreground lock.
+  - `_wait_for_operation` decides an op ran by watching CPU and progress dialogs, but the
+    two ops are nothing alike: **Blip peaks ~3162% CPU with a dialog; Peel peaks ~47% with
+    none**, while taking the scene 0 → 120 trackers. The CPU bar alone reported peel dead
+    on every shot, so peel passes a `progress_fn` (the tracker count — the thing peel
+    actually produces) that is consulted only when neither OS signal fired. Don't "simplify"
+    that back to one threshold.
+  - **Seed count lives in the Advanced dialog, and needs a REAL click.** The Features room
+    has no Count/Threshold/Separation control at all, so the old `ByName('Count')` was
+    invalid on every shot and the count was silently dropped. The setting that governs
+    output is `Maximum tracker count` (Advanced Feature Control, ctrl id 1266), which
+    **defaults to 120 and resets to 120 for each new scene** — that default, not the plate,
+    was capping every export at exactly 120. SyPy3 cannot see that dialog (`Popup()` is
+    invalid), `WM_SETTEXT` and posted `WM_CHAR` are ignored, and `keybd_event` commits an
+    *empty* value; the field only accepts injected input against an attached input queue.
+    The `Advanced` button itself also needs a **real mouse click** — a `PostMessage` click
+    logs success and no dialog opens (unlike blip/peel, which post fine). Measured:
+    cap 40 → 40 trackers, cap 800 → 800. Threshold/separation have no equivalent field on
+    this build and are deliberately not applied.
+  - In-process (SAM3 + torch loaded) `cv2.imread(..., IMREAD_GRAYSCALE)` returns
+    **`(H, W, 1)`**, not `(H, W)` — standalone it returns 2-D, so this only shows up in a
+    real run. The mask sampler collapses the channel axis itself. The SAM3 post-filter is
+    also best-effort: a crash there must not discard a finished export (it once failed a
+    clean 120-tracker shot into the TAPNext retry), but ungated tracks keep mover points,
+    so that path logs a loud warning.
 - **`app/tracker_core.py` `BatchTrackerRunner`** — the TAPNext++ path, and where nearly all
   accuracy work lives. Order per shot: seed features (edge/anisotropy rejection, staggered
   query frames) → 4 TAPNext passes (fwd/bwd/mid) → assemble → mask gating with occlusion

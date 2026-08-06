@@ -45,6 +45,24 @@ _WM_LBUTTONUP = 0x0202
 _MK_LBUTTON = 0x0001
 
 
+# SendInput payloads, for the Advanced-dialog spinner. That control ignores WM_SETTEXT and
+# posted WM_CHAR outright, and keybd_event reached it but committed an EMPTY value, so real
+# injected input is the only thing that sets it. See _set_advanced_max_tracks.
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+
 # ============================================================
 #  SyPy3 discovery
 # ============================================================
@@ -319,6 +337,30 @@ class SynthEyesEngine:
         user32.EnumChildWindows(main_hwnd, EnumProc(_cb), 0)
         return out
 
+    def _click_panel_button(self, label, variants, settle=0.5):
+        """Click a Features-panel button for real. Returns True if a click was delivered.
+
+        PostMessage is NOT good enough for these controls. Watching the automation run, the
+        button visibly depresses and the operation never starts -- the control repaints on
+        the posted WM_LBUTTONDOWN but does not treat it as a completed click, because a
+        custom control of this kind checks the actual cursor position / mouse capture on
+        the up. The same button worked immediately when clicked by hand, and the 'Advanced'
+        button never responded to a posted click at all.
+
+        So: bring SynthEyes forward (an inactive window would otherwise swallow the first
+        click just to activate), then click the button's real screen position. The pointer
+        is put back afterwards. PostMessage stays only as a fallback for when the button's
+        rectangle cannot be resolved.
+        """
+        self._bring_foreground()
+        hwnd, rect = self._find_butt(variants)
+        if hwnd and rect:
+            self._real_click(rect, expect_hwnd=hwnd)
+            self.log(f"   OK  clicked '{label}'")
+            time.sleep(settle)
+            return True
+        return self._win32_click_button(label, variants, settle=settle)
+
     def _win32_click_button(self, label, variants, settle=0.5):
         """Click a Features-room panel button by its text via PostMessage. Returns bool.
 
@@ -426,22 +468,64 @@ class SynthEyesEngine:
         user32.EnumWindows(EnumProc(_cb), 0)
         return (state["prog"], state["err"])
 
+    def _tracker_count(self):
+        """How many trackers the scene holds, or None if SyPy3 won't say.
+
+        This is what Peel produces, so it is the one signal that proves peel ran. Only
+        called when the op is already idle -- never mid-op, because a SyPy3 call while
+        SynthEyes is busy is what desyncs the socket on 2026.2.4679.
+        """
+        hlev = getattr(self, "hlev", None)
+        if hlev is None:
+            return None
+        for get in (lambda: len(list(hlev.Trackers())),
+                    lambda: int(hlev.NumTrackers())):
+            try:
+                return int(get())
+            except Exception:
+                continue
+        return None
+
+    def _made_progress(self, label, progress_fn, before):
+        """True when the op's own output changed, i.e. it really did run.
+
+        Measured 2026-08 on build 2026.2.4679: Blip All peaks at ~3162% CPU and raises a
+        progress dialog; Peel All peaks at ~47% and raises none, yet takes the scene from
+        0 to 120 trackers. A single CPU bar cannot cover both, so an op that reports no OS
+        signal gets asked whether it produced anything before being declared dead.
+        """
+        if progress_fn is None or before is None:
+            return False
+        after = progress_fn()
+        if after is None or after == before:
+            return False
+        self.log(f"   {label}: no CPU peak or dialog, but its output changed "
+                 f"({before} -> {after}) -> it ran")
+        return True
+
     def _wait_for_operation(self, label, min_wait=3.0, max_timeout=600.0,
-                            peak_cpu=250.0, idle_hold=1.5, start_grace=6.0):
+                            peak_cpu=250.0, idle_hold=1.5, start_grace=6.0,
+                            progress_fn=None, progress_before=None):
         """Wait for a SynthEyes long-op (blip/peel) to finish via live signals instead of a
         fixed sleep. Falls back to a fixed sleep if psutil is unavailable.
 
         Returns a STATUS STRING, not a bool, because the caller needs to tell apart the two
         very different ways this returns "not done":
 
-          "done"          the op ran and finished (CPU peaked / progress dialog seen).
+          "done"          the op ran and finished (CPU peaked, progress dialog seen, or --
+                          when neither fired -- progress_fn shows its output changed).
           "never-started" released or hit the ceiling having seen NEITHER a CPU peak nor a
-                          progress dialog. The op never actually began -- almost always a
-                          PostMessage click SynthEyes ignored (window not foreground, a modal
-                          up). This used to be indistinguishable from "done", so Peel ran on
-                          zero blips and the shot exported 0 trackers with no error anywhere.
+                          progress dialog, AND produced no output. The op never actually
+                          began -- almost always a PostMessage click SynthEyes ignored
+                          (window not foreground, a modal up). This used to be
+                          indistinguishable from "done", so Peel ran on zero blips and the
+                          shot exported 0 trackers with no error anywhere.
           "error"         a crash/OOM ('Imminent Crash') dialog appeared.
           "stopped"       the user pressed Stop.
+
+        progress_fn / progress_before are the escape hatch for a cheap op: the CPU bar is
+        tuned for the massively-parallel blip, and peel finishes far below it with no
+        dialog at all, so without this peel is reported dead every single time.
         """
         pid = self._syntheyes_pid()
         proc = None
@@ -494,6 +578,12 @@ class SynthEyesEngine:
                     # behavior stands (assume it ran). With psutil, seeing neither signal
                     # means the click never landed -- report that instead of a false "done".
                     if proc is not None and not (peaked or seen_dialog):
+                        # Neither OS signal fired. That is NOT proof the click was ignored:
+                        # a cheap single-threaded op finishes below the CPU bar and puts up
+                        # no dialog. Ask the op itself whether it produced anything before
+                        # calling it dead.
+                        if self._made_progress(label, progress_fn, progress_before):
+                            return "done"
                         self.log(f"   {label}: released at ~{el:.1f}s but NO work was ever "
                                  f"observed (no CPU peak, no progress dialog) -> the click "
                                  f"most likely did not register")
@@ -501,6 +591,8 @@ class SynthEyesEngine:
                     self.log(f"   {label}: complete at ~{el:.1f}s (dialog gone + CPU idle)")
                     return "done"
         if proc is not None and not (peaked or seen_dialog):
+            if self._made_progress(label, progress_fn, progress_before):
+                return "done"
             self.log(f"   {label}: hit {max_timeout:.0f}s ceiling having never seen the op run")
             return "never-started"
         self.log(f"   {label}: hit {max_timeout:.0f}s ceiling -> proceeding")
@@ -508,28 +600,38 @@ class SynthEyesEngine:
 
     # ------ blip/peel (single-pass + long-shot chunked) ------
 
-    def _run_panel_op(self, label, variants, fallback_action, timeout, attempts=2):
+    def _run_panel_op(self, label, variants, fallback_action, timeout, attempts=2,
+                      progress_fn=None):
         """Click a Features-panel button and WAIT for the op to really run, retrying when it
         didn't. Raises RuntimeError if it never ran.
 
-        _win32_click_button only proves the button was found and a message was posted -- not
-        that SynthEyes acted on it. A click that silently doesn't register looked exactly like
-        a completed op, so Peel then ran on zero blips and the shot exported 0 trackers with
-        nothing in the log to say why. This re-asserts the room + foreground and re-clicks,
-        which is the same recover-and-retry shape _blip_peel_chunked already uses.
+        The click is a REAL mouse click (_click_panel_button). A posted click is not enough:
+        watching the automation, the button visibly depresses and nothing runs, while the
+        same button works when clicked by hand. These controls repaint on the posted
+        WM_LBUTTONDOWN but do not treat it as a completed click.
+
+        Delivering the click still does not prove SynthEyes acted on it, so every op is
+        confirmed by _wait_for_operation and retried when it did not run -- otherwise Peel
+        runs on zero blips and the shot exports 0 trackers with nothing in the log.
         """
+        st = "never-started"
         for attempt in range(1, attempts + 1):
             # The panel's child controls only exist while the window is up and in the
             # Features room; a lost foreground is exactly why a click gets dropped.
             self._ensure_features_room()
-            self._bring_foreground()
-            if not self._win32_click_button(label, variants):
-                self.log(f"   Win32 '{label}' unavailable - falling back to SyPy3 dispatch")
+            # Baseline BEFORE the click, and re-read per attempt: a retry follows an attempt
+            # that may itself have produced some output.
+            before = progress_fn() if progress_fn else None
+
+            if not self._click_panel_button(label, variants):
+                self.log(f"   '{label}' button not found - falling back to SyPy3 dispatch")
                 if self._click_and_wait(fallback_action, label, timeout=timeout):
                     return
                 raise RuntimeError(f"{label} failed: button not found and SyPy3 dispatch failed")
+
             self.log(f"   {label} dispatched... (waiting for completion signal)")
-            st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout)
+            st = self._wait_for_operation(label, min_wait=3.0, max_timeout=timeout,
+                                          progress_fn=progress_fn, progress_before=before)
             if st == "done":
                 return
             if st == "stopped":
@@ -537,7 +639,7 @@ class SynthEyesEngine:
             if st == "error":
                 # crash/OOM dialog -> clear it and the half-built blips before retrying
                 self._dismiss_error_dialog()
-                self._win32_click_button("Clear blips", ["Clear all blips"])
+                self._click_panel_button("Clear blips", ["Clear all blips"])
                 if not self.is_alive():
                     raise RuntimeError(f"SynthEyes crashed during {label}")
             if attempt < attempts:
@@ -546,18 +648,22 @@ class SynthEyesEngine:
             f"{label} never ran after {attempts} attempts (last status '{st}'). "
             f"SynthEyes ignored the panel click - the shot would have exported 0 tracks.")
 
+
     def _blip_peel_full(self, frame_count, blip_timeout, peel_timeout):
         """Single-pass: blip ALL frames, peel, clear. Fine for shots that fit in memory."""
-        self.log("-> Blip All frames (Win32 PostMessage)...")
+        self.log("-> Blip All frames...")
         self._run_panel_op("Blip All", ["Blips all frames", "Blip all frames"],
                            "Feature/Blips all frames", blip_timeout)
 
-        self.log("-> Peel All (Win32 PostMessage)...")
+        self.log("-> Peel All...")
+        # Peel gets a progress probe: it draws too little CPU and raises no dialog, so the
+        # OS signals alone report it dead on every shot (measured on 2026.2.4679).
         self._run_panel_op("Peel All", ["Peel all", "Peel All"],
-                           "Feature/Peel All", peel_timeout)
+                           "Feature/Peel All", peel_timeout,
+                           progress_fn=self._tracker_count)
 
         self.log("-> Clearing blips...")
-        if not self._win32_click_button("Clear blips", ["Clear all blips"]):
+        if not self._click_panel_button("Clear blips", ["Clear all blips"]):
             self._click_and_wait("Feature/Clear all blips", "Clear blips", timeout=10)
 
     def _dismiss_error_dialog(self):
@@ -722,12 +828,12 @@ class SynthEyesEngine:
                     self._ensure_features_room()
                     self._bring_foreground()
                     wto = max(120, int((b - a + 1) * 0.3))
-                    if self._win32_click_button("Blips playback range",
+                    if self._click_panel_button("Blips playback range",
                                                 ["Blips playback range", "Blip playback range"]):
                         st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=wto)
                     else:
                         self.log("   'Blips playback range' not found - falling back to Blip All")
-                        self._win32_click_button("Blip All", ["Blips all frames", "Blip all frames"])
+                        self._click_panel_button("Blip All", ["Blips all frames", "Blip all frames"])
                         st = self._wait_for_operation(f"Blip w{idx}", min_wait=2.0, max_timeout=blip_timeout)
                     # 'never-started' joins 'error' on the retry path: both mean this window
                     # produced nothing, and a re-click is exactly the right recovery.
@@ -736,7 +842,7 @@ class SynthEyesEngine:
                         break
                     # crash/OOM signal -> recover + shrink + retry
                     self._dismiss_error_dialog()
-                    self._win32_click_button("Clear blips", ["Clear all blips"])
+                    self._click_panel_button("Clear blips", ["Clear all blips"])
                     if not self.is_alive():
                         raise RuntimeError("SynthEyes crashed during chunked blip (OOM)")
                     shrunk = max(min_win, (b - a + 1) // 2)
@@ -757,16 +863,19 @@ class SynthEyesEngine:
                                  f"later windows sized to the RAM ceiling")
 
                 self.log(f"   [window {idx}] plate frames {a+1}-{b+1} ({b - a + 1}f) blipped")
-                if self._win32_click_button("Peel All", ["Peel all", "Peel All"]):
+                trk_before = self._tracker_count()
+                if self._click_panel_button("Peel All", ["Peel all", "Peel All"]):
                     pst = self._wait_for_operation(f"Peel w{idx}", min_wait=2.0,
-                                                   max_timeout=max(200, int((b - a + 1) * 1.2)))
+                                                   max_timeout=max(200, int((b - a + 1) * 1.2)),
+                                                   progress_fn=self._tracker_count,
+                                                   progress_before=trk_before)
                     # Trackers ACCUMULATE across windows, so one dead peel loses only this
                     # window -- warn (so a pattern is visible in the log) rather than abort
                     # the shot, which is the caller's call once the export count is known.
                     if pst == "never-started":
                         self.log(f"   WARNING: window {idx} peel never ran - that window "
                                  f"contributed no trackers")
-                self._win32_click_button("Clear blips", ["Clear all blips"])  # free blip memory
+                self._click_panel_button("Clear blips", ["Clear all blips"])  # free blip memory
             finally:
                 wd.cancel()
 
@@ -781,15 +890,27 @@ class SynthEyesEngine:
         self._set_frame_range(shot, s0, e0)
         self.log(f"-> Adaptive chunked blip/peel done ({idx} windows); trackers accumulated.")
 
-    def _bring_foreground(self):
-        """Show + foreground the SynthEyes main window so the Features panel actually
-        paints and its blip/peel child controls get instantiated (they don't exist while
-        the window is backgrounded). Uses the alt-key trick to defeat the Win32
-        foreground lock, then gives it a moment to repaint."""
+    def _bring_foreground(self, attempts=3):
+        """Show + foreground the SynthEyes main window and CONFIRM it worked.
+
+        Returns True when SynthEyes really is the foreground window.
+
+        This matters more than it looks: the Features panel's blip/peel child controls
+        only exist while the window is up, and a PostMessage click on a window that is not
+        genuinely foreground is silently dropped -- which is exactly what produced
+        "Blip All: released at ~6.2s but NO work was ever observed" and a retry that then
+        succeeded (the retry's only real difference was foregrounding again).
+
+        The alt-key trick alone is unreliable; Windows refuses SetForegroundWindow from a
+        process that does not own the foreground. Sharing the input queue with the target
+        thread (AttachThreadInput) is what actually lifts that restriction, so it is used
+        as the fallback, and the result is verified with GetForegroundWindow rather than
+        assumed.
+        """
         tops = self._syntheyes_top_windows()
         if not tops:
-            return
-        user32 = ctypes.windll.user32
+            return False
+        user32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
 
         def _area(h):
             r = wintypes.RECT()
@@ -798,20 +919,44 @@ class SynthEyesEngine:
 
         main = max(tops, key=_area)
         SW_RESTORE = 9
-        try:
-            user32.ShowWindow(main, SW_RESTORE)
-            user32.keybd_event(0x12, 0, 0, 0)          # ALT down (unlock SetForegroundWindow)
-            user32.SetForegroundWindow(main)
-            user32.keybd_event(0x12, 0, 0x0002, 0)     # ALT up
-            user32.BringWindowToTop(main)
-        except Exception as e:
-            self.log(f"   (foreground nudge failed: {e})")
-        time.sleep(0.8)
+
+        def _is_front():
+            return int(user32.GetForegroundWindow() or 0) == int(main)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                user32.ShowWindow(main, SW_RESTORE)
+                if attempt == 1:
+                    user32.keybd_event(0x12, 0, 0, 0)          # ALT down
+                    user32.SetForegroundWindow(main)
+                    user32.keybd_event(0x12, 0, 0x0002, 0)     # ALT up
+                else:
+                    our = k32.GetCurrentThreadId()
+                    tid = user32.GetWindowThreadProcessId(main, None)
+                    attached = bool(user32.AttachThreadInput(our, tid, True)) if our != tid else False
+                    try:
+                        user32.SetForegroundWindow(main)
+                        user32.SetActiveWindow(main)
+                    finally:
+                        if attached:
+                            user32.AttachThreadInput(our, tid, False)
+                user32.BringWindowToTop(main)
+            except Exception as e:
+                self.log(f"   (foreground nudge failed: {e})")
+            time.sleep(0.8 if attempt == 1 else 0.4)
+            if _is_front():
+                break
+        ok = _is_front()
+        if not ok:
+            # Say it, because the next posted click is the thing that will quietly vanish.
+            self.log("   WARNING: SynthEyes did not come to the foreground - a panel click "
+                     "may be ignored (something else is holding the foreground)")
         try:
             self.hlev.Redraw()
         except Exception:
             pass
         time.sleep(0.4)
+        return ok
 
     def _dump_all_children(self):
         """One-time full window-tree dump (all top windows, child class -> texts) to locate
@@ -1178,16 +1323,16 @@ class SynthEyesEngine:
                 raise RuntimeError(
                     "Could not reach the SynthEyes Features room (blip/peel buttons never "
                     "appeared). Tracking this shot would produce 0 trackers.")
+        # Applies the tracker count via the Advanced dialog; see _configure_features.
+        # (It used to be disabled here because the old implementation opened that dialog
+        # with ByID(1238).ClickAndContinue(), which desynced the SyPy3 socket. It now opens
+        # it with the same Win32 button click blip/peel use, so that hazard is gone.)
         self._configure_features(track_count, track_threshold, track_separation)
-        # NOTE (2026 debug): _set_advanced_max_tracks does ByID(1238).ClickAndContinue()
-        # on a control that no longer exists on 2026 ("Advanced dialog not found").
-        # Suspected to DESYNC the SyPy3 socket -> subsequent IsPlaying()/Popup() return
-        # bogus True -> Blip All false-hangs 400s with flat CPU. Skipping to test.
-        # self._set_advanced_max_tracks(track_count)
 
-        # Blip All + Peel All via Win32 PostMessage. The SyPy3 dispatch (_click_and_wait)
-        # silently no-ops on 2026.2.4679, so PostMessage the real "Butt" panel buttons and
-        # wait a frame-scaled budget (there is no reliable API to poll blip completion).
+        # Blip All + Peel All by clicking the real "Butt" panel buttons. The SyPy3 dispatch
+        # (_click_and_wait) silently no-ops on 2026.2.4679, and a PostMessage click is not
+        # enough either -- the button repaints as pressed and the operation never runs -- so
+        # the pointer is genuinely moved onto the button (see _click_panel_button).
         # SyPy3 remains the fallback if the buttons can't be located.
         # Foreground the window so the Features panel paints and its blip/peel child
         # controls instantiate (they don't exist while backgrounded on 2026.2.4679).
@@ -1221,10 +1366,22 @@ class SynthEyesEngine:
 
         # SAM3 gating in Python (yesterday's proven method): drop mover points, truncate
         # the Demo frozen tail. Beats the fragile SynthEyes roto matte.
+        #
+        # Best-effort, like _filter_exported_tracks: a crash in the gating must not throw
+        # away a finished export. It did once -- a sampling TypeError after a clean
+        # 120-tracker export failed the shot, sent it to the TAPNext retry, and published
+        # TAPNext tracks for a shot SynthEyes had actually tracked. The export is the
+        # expensive part; keep it. The tracks are then UNGATED, which matters (mover points
+        # survive), so say so loudly rather than letting it pass as a normal run.
         if n_trk > 0 and mask_dir:
-            res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
-            if res is not None:      # (0, 0) means "gated to nothing" -- still a real result
-                n_trk = res[0]
+            try:
+                res = self._apply_sam3_postfilter(out_txt_path, mask_dir)
+                if res is not None:  # (0, 0) means "gated to nothing" -- still a real result
+                    n_trk = res[0]
+            except Exception as e:
+                self.log(f"   WARNING: SAM3 gating failed ({e}) - keeping all {n_trk} exported "
+                         f"tracker(s) UNGATED. Points on masked movers were NOT removed; "
+                         f"check this shot before solving.")
 
         if n_trk > 0:
             if image_width is None or image_height is None:
@@ -1398,121 +1555,228 @@ class SynthEyesEngine:
         Read back where the API allows so the log states what SynthEyes actually holds.
         """
         self.log(f"   Features: count={count}, threshold={threshold}, separation={separation}")
-        try:
-            ui = self.hlev.Main()
-        except Exception as e:
-            self.log(f"   WARNING: Could not reach the Features panel to set values: {e}")
-            return
-        for name, val in [("Count", count), ("Threshold", threshold), ("Separation", separation)]:
-            try:
-                spinner = ui.ByName(name)
-                if not spinner.IsValid():
-                    self.log(f"   WARNING: Features spinner '{name}' not found - "
-                             f"{name}={val} was NOT applied (SynthEyes keeps its old value)")
-                    continue
-                spinner.SetSpnValue(val)
-                try:
-                    got = spinner.GetSpnValue()
-                except Exception:
-                    continue      # no read-back on this build; the write itself succeeded
-                if got is not None and int(got) != int(val):
-                    self.log(f"   WARNING: '{name}' read back as {got}, expected {val} - "
-                             f"SynthEyes rejected the write")
-                else:
-                    self.log(f"   OK  '{name}' = {got}")
-            except Exception as e:
-                self.log(f"   WARNING: could not set Features '{name}'={val}: {e}")
+        # There are no Count/Threshold/Separation controls in the 2026 Features room --
+        # enumerating it (2026-08) turns up only buttons and three Boxers (Camera, motion
+        # preset, camera name). ByName('Count') was therefore invalid on every shot and all
+        # three values were silently dropped, three WARNING lines at a time.
+        #
+        # The one that actually governs output is 'Maximum tracker count', which lives in
+        # the Advanced Feature Control dialog and defaults to 120 -- exactly the tracker
+        # count every export produced, i.e. this cap, not the plate, was the limit.
+        self._set_advanced_max_tracks(count)
+        # Threshold/separation have no equivalent field on this build (the dialog exposes
+        # blip size/density instead, which are not the same quantity). Say so once, at the
+        # level of a note, rather than warning per shot about a control that cannot exist.
+        if not getattr(self, "_feat_note_logged", False):
+            self._feat_note_logged = True
+            self.log(f"   note: threshold={threshold} / separation={separation} are not exposed "
+                     f"as controls on this SynthEyes build; leaving its own feature settings "
+                     f"alone. Only the tracker count is applied.")
 
     # ----- Advanced dialog (known control IDs, Win32 input) -----
     ADV_BUTTON_ID = 1238
     ADV_MAX_TRACKS_ID = 1266
 
-    def _set_advanced_max_tracks(self, max_tracks):
-        hlev = self.hlev
+    def _send_input(self, vk, scan, flags):
+        inp = _INPUT(type=1)
+        inp.ki = _KEYBDINPUT(vk, scan, flags, 0, None)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        time.sleep(0.015)
+
+    def _send_vk(self, vk, up=False):
+        self._send_input(vk, 0, 0x0002 if up else 0)
+
+    def _send_unicode(self, ch):
+        for flags in (0x0004, 0x0004 | 0x0002):      # KEYEVENTF_UNICODE [| KEYUP]
+            self._send_input(0, ord(ch), flags)
+
+    def _adv_spinner_text(self, hwnd):
+        """Read a SynthEyes Spinner. GetWindowTextW returns '' across processes for these
+        custom controls; WM_GETTEXT does answer. Note it only reflects a new value AFTER
+        the edit is committed with Enter, so read back at the end, not while typing."""
+        buf = ctypes.create_unicode_buffer(64)
+        ctypes.windll.user32.SendMessageW(ctypes.c_void_p(int(hwnd)), 0x000D, 64, buf)
+        return buf.value.strip()
+
+    def _find_butt(self, variants):
+        """(hwnd, rect) of a Features-panel button by its text, or (None, None)."""
+        norm = lambda s: "".join((s or "").lower().split())
+        wants = {norm(v) for v in variants}
+        for w in self._syntheyes_top_windows():
+            for hwnd, text, rect in self._enum_butt_buttons(w):
+                if norm(text) in wants:
+                    return hwnd, rect
+        return None, None
+
+    def _real_click(self, rect, expect_hwnd=None):
+        """Physically click the centre of a screen rect and put the pointer back.
+
+        A posted click is not a substitute: the button repaints as pressed and the operation
+        never runs, and 'Advanced' ignores a posted click completely -- both work by hand.
+        These controls read the real cursor / mouse capture, so the pointer genuinely has to
+        be over the button.
+
+        Moves first and clicks second, so the control gets its WM_MOUSEMOVE (hover) before
+        the button-down, and checks what is actually under that point: if another window is
+        covering the button the click would land somewhere else entirely, which is worth a
+        line in the log rather than a silent no-op.
+        """
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        self.log(f"-> Setting Advanced Max Tracks to: {max_tracks}")
-
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
         try:
-            hlev.Main().ByID(self.ADV_BUTTON_ID).ClickAndContinue()
-            time.sleep(1.5)
-        except Exception as e:
-            self.log(f"   ERROR: Could not click Advanced button: {e}")
-            return False
-
-        dialog_hwnd = 0
-        for _ in range(10):
-            time.sleep(0.5)
-            dialog_hwnd = user32.FindWindowW(None, "Advanced Feature Control")
-            if dialog_hwnd:
-                break
-        if not dialog_hwnd:
-            self.log("   WARNING: Advanced dialog not found - skipping")
-            return False
-
-        spinner_hwnd = user32.GetDlgItem(dialog_hwnd, self.ADV_MAX_TRACKS_ID)
-        if not spinner_hwnd:
-            self.log("   WARNING: Spinner 1266 not found")
-            return False
-
-        our_tid = kernel32.GetCurrentThreadId()
-        se_tid = user32.GetWindowThreadProcessId(dialog_hwnd, None)
-        attached = False
-        if our_tid != se_tid:
-            attached = bool(user32.AttachThreadInput(our_tid, se_tid, True))
-
-        try:
-            user32.ShowWindow(dialog_hwnd, 5)
-            user32.SetForegroundWindow(dialog_hwnd)
-            time.sleep(0.3)
-            user32.SetFocus(spinner_hwnd)
-            time.sleep(0.2)
-
-            lParam = (10 << 16) | 30
-            user32.SendMessageW(spinner_hwnd, 0x0201, 1, lParam)
-            user32.SendMessageW(spinner_hwnd, 0x0202, 0, lParam)
-            time.sleep(0.2)
-
-            VK_CONTROL = 0x11
-            VK_A = 0x41
-            VK_RETURN = 0x0D
-            KEYEVENTF_KEYUP = 0x0002
-
-            def press_key(vk):
-                user32.keybd_event(vk, 0, 0, 0)
-                time.sleep(0.02)
-                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-                time.sleep(0.02)
-
-            user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.02)
-            press_key(VK_A)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.1)
-
-            for char in str(int(max_tracks)):
-                press_key(ord(char))
-                time.sleep(0.05)
-
-            time.sleep(0.1)
-            press_key(VK_RETURN)
-            time.sleep(0.3)
-
-            ok_btn = user32.GetDlgItem(dialog_hwnd, 1)
-            if ok_btn:
-                user32.SendMessageW(ok_btn, 0x0201, 1, 0)
-                time.sleep(0.05)
-                user32.SendMessageW(ok_btn, 0x0202, 0, 0)
-                self.log(f"   OK  Set Max Tracks = {max_tracks}")
-            else:
-                press_key(VK_RETURN)
-                self.log(f"   OK  Set Max Tracks = {max_tracks} (Enter to close)")
-
-            time.sleep(0.3)
-            return True
+            cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+            user32.SetCursorPos(cx, cy)
+            time.sleep(0.12)
+            user32.mouse_event(0x0001, 0, 0, 0, 0)   # MOUSEEVENTF_MOVE -> hover
+            time.sleep(0.08)
+            if expect_hwnd:
+                target = user32.WindowFromPoint(wintypes.POINT(cx, cy))
+                if target and int(target) != int(expect_hwnd):
+                    self.log(f"   WARNING: ({cx},{cy}) belongs to hwnd {int(target)}, not the "
+                             f"button {int(expect_hwnd)} - something is covering it")
+            user32.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN
+            time.sleep(0.08)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
+            time.sleep(0.25)
         finally:
+            user32.SetCursorPos(pt.x, pt.y)
+
+    def _open_advanced_dialog(self, attempts=3):
+        """Click 'Advanced' and return the dialog HWND, or 0.
+
+        Uses a REAL click, not PostMessage. The posted click logs 'OK Win32 click' and then
+        no dialog appears -- the button needs genuine foreground input, unlike blip/peel.
+        """
+        user32 = ctypes.windll.user32
+        for attempt in range(1, attempts + 1):
+            dlg = user32.FindWindowW(None, "Advanced Feature Control")
+            if dlg:
+                return dlg
+            self._ensure_features_room()
+            self._bring_foreground()
+            time.sleep(0.4)
+            hwnd, rect = self._find_butt(["Advanced"])
+            if not hwnd:
+                self.log("   WARNING: 'Advanced' button not found on the Features panel")
+                return 0
+            self._real_click(rect, expect_hwnd=hwnd)
+            for _ in range(20):
+                time.sleep(0.4)
+                dlg = user32.FindWindowW(None, "Advanced Feature Control")
+                if dlg:
+                    return dlg
+            if attempt < attempts:
+                self.log(f"   Advanced dialog did not open - retrying ({attempt + 1}/{attempts})")
+        return 0
+
+    def _type_into_spinner(self, dlg, spin, text):
+        """Click the field, select all, type, commit. Returns what it reads back.
+
+        AttachThreadInput first: without sharing the input queue, SetForegroundWindow is
+        refused by the foreground lock, SetFocus does nothing, and the injected digits go
+        to whatever really had focus -- which is how this committed an EMPTY value.
+        """
+        user32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        our = k32.GetCurrentThreadId()
+        se_tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(dlg), None)
+        attached = bool(user32.AttachThreadInput(our, se_tid, True)) if our != se_tid else False
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))   # this steals the pointer; put it back after
+        try:
+            user32.ShowWindow(ctypes.c_void_p(dlg), 5)
+            user32.SetForegroundWindow(ctypes.c_void_p(dlg))
+            time.sleep(0.35)
+            user32.SetFocus(ctypes.c_void_p(spin))
+            time.sleep(0.15)
+
+            r = wintypes.RECT()
+            user32.GetWindowRect(ctypes.c_void_p(spin), ctypes.byref(r))
+            cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+            user32.SetCursorPos(cx, cy)
+            time.sleep(0.2)
+            for _ in range(2):                      # double-click = enter edit mode
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+                time.sleep(0.12)
+            time.sleep(0.35)
+
+            self._send_vk(0x11)                                  # ctrl down
+            self._send_vk(0x41); self._send_vk(0x41, up=True)    # A
+            self._send_vk(0x11, up=True)                         # ctrl up
+            time.sleep(0.15)
+            for ch in text:
+                self._send_unicode(ch)
+            time.sleep(0.25)
+            self._send_vk(0x0D); self._send_vk(0x0D, up=True)    # Enter commits
+            time.sleep(0.6)
+            return self._adv_spinner_text(spin)
+        finally:
+            user32.SetCursorPos(pt.x, pt.y)
             if attached:
-                user32.AttachThreadInput(our_tid, se_tid, False)
+                user32.AttachThreadInput(our, se_tid, False)
+
+    def _set_advanced_max_tracks(self, max_tracks, attempts=3):
+        """Set 'Maximum tracker count' in the Advanced Feature Control dialog.
+
+        This is the setting that caps how many trackers a shot can produce. It defaults to
+        120, and 120 is exactly what every export returned regardless of the count asked
+        for, because nothing was writing it: the Features room has no such control, so the
+        old ByName('Count') lookup was invalid on every shot.
+
+        Everything cheaper was tried and does not work on build 2026.2.4679 (2026-08):
+        SyPy3 cannot see this dialog (Popup() is invalid), WM_SETTEXT returns 1 and changes
+        nothing, posted WM_CHAR is ignored, and keybd_event reached the field but committed
+        an EMPTY value. Injected input against an attached input queue is what works.
+
+        Verified by read-back, retried, and -- crucially -- restored if it cannot be set:
+        leaving the cap blank would be worse than leaving it alone.
+        """
+        user32 = ctypes.windll.user32
+        target = str(int(max_tracks))
+
+        dlg = self._open_advanced_dialog()
+        if not dlg:
+            self.log("   WARNING: Advanced Feature Control dialog did not open - tracker "
+                     "count left at its current value")
+            return False
+
+        spin = user32.GetDlgItem(ctypes.c_void_p(dlg), self.ADV_MAX_TRACKS_ID)
+        if not spin:
+            self.log(f"   WARNING: spinner {self.ADV_MAX_TRACKS_ID} (Maximum tracker count) "
+                     f"not in the dialog - tracker count left as-is")
+            user32.PostMessageW(ctypes.c_void_p(dlg), 0x0010, 0, 0)
+            return False
+
+        original = self._adv_spinner_text(spin)
+        ok = False
+        try:
+            if original == target:
+                self.log(f"   OK  Maximum tracker count already {target}")
+                return True
+            got = ""
+            for attempt in range(1, attempts + 1):
+                got = self._type_into_spinner(dlg, spin, target)
+                if got == target:
+                    self.log(f"   OK  Maximum tracker count {original or '?'} -> {got}")
+                    ok = True
+                    break
+                if attempt < attempts:
+                    self.log(f"   Maximum tracker count read back {got!r}, wanted {target} "
+                             f"- retrying ({attempt + 1}/{attempts})")
+            if not ok:
+                self.log(f"   WARNING: could not set Maximum tracker count to {target} "
+                         f"(reads {got!r}); SynthEyes will cap this shot at its own value")
+                # Never leave the field blank/garbage -- put back what was there.
+                if original and got != original:
+                    back = self._type_into_spinner(dlg, spin, original)
+                    self.log(f"   restored Maximum tracker count to {back!r}")
+        finally:
+            if user32.IsWindow(ctypes.c_void_p(dlg)):
+                user32.PostMessageW(ctypes.c_void_p(dlg), 0x0010, 0, 0)   # WM_CLOSE
+                time.sleep(0.3)
+        return ok
+
 
     def _click_and_wait(self, action_name, label, timeout=300):
         # SynthEyes 2026: two-part completion detection.
@@ -1640,6 +1904,7 @@ class SynthEyesEngine:
         # silently does NOTHING. Counting both makes "mask did nothing" and "mask dropped
         # everything" distinguishable in the log instead of looking alike.
         span = {"matched": 0, "out_of_range": 0}
+        squeezed = []   # marker so the shape-correction is reported once, not per mask
 
         def keep_point(frame, x, y):
             # export frame is 1-based; masks are a sorted 1-based sequence
@@ -1648,9 +1913,24 @@ class SynthEyesEngine:
                 span["out_of_range"] += 1
                 return True  # no mask for this frame -> don't drop
             span["matched"] += 1
-            m = mask_cache.get(idx)
-            if m is None:
+            if idx in mask_cache:
+                m = mask_cache[idx]
+            else:
                 m = cv2.imread(masks[idx], cv2.IMREAD_GRAYSCALE)
+                # IMREAD_GRAYSCALE is *supposed* to return 2-D, and these files read back
+                # 2-D standalone -- but in a live run (SAM3 + torch already loaded in this
+                # process) one came back with a channel axis, and sampling it raised
+                # "only 0-dimensional arrays can be converted to Python scalars" AFTER a
+                # successful 120-tracker export, failing the shot to the TAPNext retry.
+                # Don't trust the flag: collapse to one channel here, once per frame.
+                if m is not None and getattr(m, "ndim", 2) > 2:
+                    if not squeezed:
+                        # Once per run, not once per frame: it is the same cause for every
+                        # mask in the folder, and a 40-line burst per task buries the log.
+                        self.log(f"   SAM3 post-filter: masks read back with shape {m.shape} "
+                                 f"(not 2-D); using their first channel")
+                        squeezed.append(1)
+                    m = m[:, :, 0]
                 mask_cache[idx] = m
             if m is None:
                 return True

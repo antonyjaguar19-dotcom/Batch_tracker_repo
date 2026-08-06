@@ -33,6 +33,12 @@ be = importlib.util.module_from_spec(_spec)
 sys.modules["btr_backend"] = be
 _spec.loader.exec_module(be)  # builds no UI: app.py only launches under __main__
 
+# Before anything can log: a click in the launcher console selects text, and a console with
+# QuickEdit on blocks every write while a selection exists -- which freezes the worker on
+# its next log line with no error and no clue. See be.disable_console_quickedit.
+if be.disable_console_quickedit():
+    print("Console QuickEdit disabled (a click in this window can no longer pause the run).")
+
 from nicegui import ui, run, app as nicegui_app  # noqa: E402
 
 
@@ -567,8 +573,35 @@ async def load_shows():
     root = shows_root.value
     shows = await run.io_bound(be.list_shows, root)
     show_sel.set_options(shows)
+    if not shows and be.is_bare_server_root(root):
+        # Bare-server root (liv2): the shows ARE the shares, so an empty list means the
+        # server did not answer, not that it holds no shows. Say which, so nobody hunts
+        # for a missing 'shows' folder that was never supposed to exist.
+        ui.notify(f"{root} did not answer — check the server is reachable "
+                  f"(net view {root}) and that you are logged in to it.",
+                  type="warning", timeout=8000)
+        return
     ui.notify(f"{len(shows)} show(s) under {root}" if shows else f"No shows under {root}",
               type="info" if shows else "warning")
+
+
+# Configured plate servers (config/servers.json, env BTR_SHOWS_SERVERS). Read once at
+# startup; the Shows Root box stays editable, so an unlisted server still works today
+# and only needs a config entry to become a permanent dropdown choice.
+SERVERS = be.load_servers()
+
+async def on_server_change(e):
+    """Switch plate server: point Shows Root at the new root, drop the stale show/shot
+    lists (they belong to the old server), then rescan."""
+    root = be.server_root_for(e.value)
+    if not root or root == shows_root.value:
+        return
+    shows_root.set_value(root)
+    state.shots_data = {}
+    state.log_history = []
+    show_sel.set_options([], value=None)
+    refresh_table()
+    await load_shows()
 
 
 _scan_token = {"n": 0}
@@ -1132,8 +1165,18 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
     with ui.card().classes("w-full bt-card"):
         ui.label("Project").classes("bt-section")
         # ---- Studio network plate fetch: <shows_root>/<show>/<shot>/in/plates/<version> ----
+        # Server picker fills Shows Root from config/servers.json; the box below stays
+        # free text, so a server that is not in the config yet can still be typed/browsed
+        # to without waiting for a config edit.
+        server_sel = ui.select([s["name"] for s in SERVERS],
+                               value=SERVERS[0]["name"] if SERVERS else None,
+                               label="Server", on_change=on_server_change
+                               ).props("dense outlined").classes("w-full")
+        server_sel.tooltip("Studio plate servers, from config/servers.json. Add a server there "
+                           "(name + root) and it appears here — no code change.")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            shows_root = ui.input("Shows Root", value=r"\\liv1\shows",
+            shows_root = ui.input("Shows Root",
+                                  value=SERVERS[0]["root"] if SERVERS else r"\\liv1\shows",
                                   placeholder=r"\\liv1\shows").props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(shows_root)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
@@ -1317,11 +1360,12 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
             ui.separator().classes("q-my-sm")
             ui.label("Tracking backend").classes("bt-section")
-            backend_sel = ui.select(["syntheyes", "tapnext"], value=state.track_backend,
+            backend_sel = ui.select(["syntheyes", "tapnext", "both"], value=state.track_backend,
                                     on_change=lambda e: setattr(state, "track_backend", e.value or "syntheyes")
                                     ).props("dense outlined").classes("w-full")
-            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker fallback. "
-                                "The settings below switch to match the selected backend.")
+            backend_sel.tooltip("SynthEyes = drive SynthEyes over SyPy3 (default). TAPNext++ = Apache-2.0 GPU tracker. "
+                                "both = run SynthEyes, then TAPNext on the same shots, and publish two track files "
+                                "per shot to compare. The settings below switch to match; 'both' shows all of them.")
 
             # ---- SynthEyes-only (shown when backend = syntheyes) ----
             with ui.column().classes("w-full gap-2") as syn_box:
@@ -1352,7 +1396,9 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                        ).props("dense outlined").classes("grow")
                     ui.button(icon="folder", on_click=lambda: pick_file(tde_exe)).props("flat dense")
                 tde_exe.on_value_change(lambda e: setattr(state, "tde4_exe", e.value or ""))
-            syn_box.bind_visibility_from(backend_sel, "value", value="syntheyes")
+            # 'both' runs each engine, so each engine's settings must stay reachable.
+            syn_box.bind_visibility_from(backend_sel, "value",
+                                         backward=lambda v: v in ("syntheyes", "both"))
 
             # ---- TAPNext++-only (shown when backend = tapnext) ----
             with ui.column().classes("w-full gap-2") as tap_box:
@@ -1554,7 +1600,8 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                     refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
                     refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
                     refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
-            tap_box.bind_visibility_from(backend_sel, "value", value="tapnext")
+            tap_box.bind_visibility_from(backend_sel, "value",
+                                         backward=lambda v: v in ("tapnext", "both"))
 
 # ---------- MAIN COLUMN ----------
 with ui.column().classes("w-full gap-3 p-3"):
@@ -1571,6 +1618,15 @@ with ui.column().classes("w-full gap-3 p-3"):
             btn_pipe.tooltip("Runs all three stages back-to-back on the ticked shots, so you don't "
                              "have to click 1/2/3 and wait between each. Existing masks are reused "
                              "(use 2 · Masks to force a regen). Stop halts between stages.")
+            # Same setting as Settings > Tracking backend, surfaced here because it is the
+            # one choice you make per RUN rather than per session. Two-way bound, so the
+            # two controls can never disagree about which engine is about to run.
+            pipe_backend = ui.select(["syntheyes", "tapnext", "both"], label="Engine"
+                                     ).props("dense outlined").classes("w-40")
+            pipe_backend.bind_value(backend_sel, "value")
+            pipe_backend.tooltip("Which tracker the Track stage uses. both = SynthEyes first, then "
+                                 "TAPNext++ on the same shots; each shot publishes two track files "
+                                 "(…__syntheyes.txt and …__tapnext.txt) so you can compare them.")
             ui.separator().props("vertical").classes("bt-vsep")
             btn_analyze = ui.button("1 · Analyze", icon="auto_awesome", on_click=start_analyze
                                     ).props("outline no-caps").classes("bt-step")
