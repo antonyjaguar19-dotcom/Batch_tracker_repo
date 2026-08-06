@@ -409,10 +409,158 @@ def list_shots(in_root: str) -> List[str]:
     return sorted(list(set(files)))
 
 # -----------------------------------------------------------------------------
+# Studio plate servers.
+# The studio runs more than one plate server and will add more. Every path helper
+# below already takes shows_root as its first argument, so a new server needs NO
+# code change — only a new entry in config/servers.json:
+#     [{"name": "LIV1", "root": "\\\\liv1\\shows"},
+#      {"name": "LIV2", "root": "\\\\liv2"}]
+# The first entry is the default selection in the UI.
+#
+# The two live servers are not the same depth — liv1 keeps its shows one level down
+# under 'shows', liv2 holds them at the share root. That difference is absorbed
+# entirely by the root string; everything under <root>/<show>/<shot>/ is identical.
+#
+# Env override BTR_SHOWS_SERVERS beats the file, for a workstation that needs a
+# one-off root (semicolon-separated NAME=ROOT pairs, ROOT alone also accepted):
+#     set BTR_SHOWS_SERVERS=LIV2=\\liv2;TEST=D:\fake_studio
+# -----------------------------------------------------------------------------
+SERVERS_FILE = _HERE / "config" / "servers.json"
+
+# Used only when config/servers.json is missing or unreadable, so a fresh checkout
+# and a broken config both still reach the two real servers.
+_FALLBACK_SERVERS: List[Dict[str, str]] = [
+    {"name": "LIV1", "root": r"\\liv1\shows"},
+    {"name": "LIV2", "root": r"\\liv2"},
+]
+
+def _clean_servers(items) -> List[Dict[str, str]]:
+    """Keep well-formed {name, root} entries, in order, first-wins on duplicate root.
+    A malformed entry is dropped rather than raising — one bad line in the config must
+    not stop the app from reaching the other servers."""
+    out, seen = [], set()
+    for it in (items or []):
+        if isinstance(it, str):
+            root, name = it.strip(), ""
+        elif isinstance(it, dict):
+            root, name = str(it.get("root", "")).strip(), str(it.get("name", "")).strip()
+        else:
+            continue
+        root = root.rstrip("/\\") if len(root.rstrip("/\\")) > 2 else root
+        if not root or root.lower() in seen:
+            continue
+        seen.add(root.lower())
+        out.append({"name": name or root, "root": root})
+    return out
+
+def load_servers() -> List[Dict[str, str]]:
+    """Configured plate servers, in display order. Never raises and never returns
+    empty — falls back to the built-in list so the Shows Root box is always usable."""
+    env = os.environ.get("BTR_SHOWS_SERVERS", "").strip()
+    if env:
+        items = []
+        for part in env.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            # NAME=ROOT, but a bare UNC/drive root is fine too. Split on the FIRST '='
+            # only, and only when the left side is not itself a path (guards 'D:\x').
+            name, sep, root = part.partition("=")
+            items.append({"name": name, "root": root} if sep and "\\" not in name and "/" not in name
+                         else {"name": "", "root": part})
+        items = _clean_servers(items)
+        if items:
+            return items
+    try:
+        with open(SERVERS_FILE, "r", encoding="utf-8") as f:
+            items = _clean_servers(json.load(f))
+        if items:
+            return items
+    except Exception:
+        pass
+    return list(_FALLBACK_SERVERS)
+
+def server_root_for(name: str) -> str:
+    """Root path for a server name (case-insensitive). '' when unknown."""
+    if not name:
+        return ""
+    for s in load_servers():
+        if s["name"].lower() == name.strip().lower():
+            return s["root"]
+    return ""
+
+def under(root: str, *parts: str) -> Path:
+    """Join under a shows root and return a Path.
+
+    NOT the same as Path(root) / part. pathlib only recognises a UNC path once it has
+    BOTH a server and a share, so Path(r'\\\\liv2') parses as a plain rooted path and
+    Path(r'\\\\liv2') / 'ABC' silently yields '\\liv2\\ABC' — one backslash short, and a
+    path that does not exist. os.path.join concatenates the text first, so a root that
+    is only a server name still produces a real UNC once the show is appended.
+    Every studio-tree helper goes through here so the join is right for any root shape.
+    """
+    return Path(os.path.join(root, *[p for p in parts if p]))
+
+def is_bare_server_root(root: str) -> bool:
+    """True for a root like \\\\liv2 — a server with no share. On liv2 each SHOW is its
+    own top-level share, so the root has nothing below it to iterdir; the show list has
+    to come from the server's share table instead (see _list_server_shares). Per-shot
+    paths built from such a root are fine once the show name is appended, because that
+    appended name IS the share."""
+    r = (root or "").replace("/", "\\")
+    return r.startswith("\\\\") and "\\" not in r[2:].rstrip("\\")
+
+# Shares that are never a show: admin/hidden shares end in '$', and these are the
+# standard service shares a Windows file server exposes alongside real content.
+_NON_SHOW_SHARES = {"ipc$", "print$", "netlogon", "sysvol", "users", "admin$"}
+
+def _list_server_shares(root: str, timeout: float = 20.0) -> List[str]:
+    """Share names on a bare server root (\\\\liv2), which is how the new server stores
+    shows — one share per show, no parent folder to list.
+
+    Uses `net view`, the only share enumerator available here (pywin32 is not in the
+    embeddable runtime). Splits on runs of 2+ spaces rather than single whitespace so a
+    share name containing a space survives. Returns [] on any failure — an unreachable
+    server must leave the dropdown empty, not raise into the UI thread."""
+    import subprocess
+    server = (root or "").replace("/", "\\").rstrip("\\")
+    if not server.startswith("\\\\"):
+        return []
+    try:
+        # CREATE_NO_WINDOW: the app runs windowed, and a console flashing on every
+        # refresh looks like a crash.
+        proc = subprocess.run(["net", "view", server, "/all"],
+                              capture_output=True, text=True, timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    names, started = [], False
+    for line in (proc.stdout or "").splitlines():
+        if set(line.strip()) == {"-"}:       # header underline, any locale
+            started = True
+            continue
+        if not started:
+            continue
+        if not line.strip():
+            continue
+        name = re.split(r"\s{2,}", line.strip())[0].strip()
+        # Trailing status line ("The command completed successfully.") has no columns
+        # and never names a share; a real share name has no sentence spacing.
+        if not name or name.endswith(".") or name.lower() in _NON_SHOW_SHARES:
+            continue
+        if name.endswith("$"):
+            continue
+        names.append(name)
+    return sorted(set(names))
+
+# -----------------------------------------------------------------------------
 # Studio network plate structure:
 #   <shows_root>/<show>/<shot>/in/plates/<version>/<plate.exr | .jpg | .jpeg>
 # The show dropdown scans <shows_root>; each shot exposes its own version list
 # (folders vNNN under in/plates), defaulting to the highest = latest.
+# shows_root is whichever server is selected — see load_servers() above.
 # -----------------------------------------------------------------------------
 _VER_RE = re.compile(r"^[vV](\d+)$")
 
@@ -439,10 +587,19 @@ def _iter_subdir_names(path: Path):
             continue  # admin-only / unreadable folder — skip, keep scanning
 
 def list_shows(shows_root: str) -> List[str]:
-    """Immediate subfolders of the shows root (each one is a show)."""
-    if not shows_root or not os.path.exists(shows_root):
+    """Shows under a root. Normally the root's immediate subfolders (liv1:
+    \\\\liv1\\shows\\<show>). When the root is a bare server (liv2: \\\\liv2\\<show>, where
+    each show is its own share) there is no folder to list, so the shares are
+    enumerated instead — same result, different source."""
+    if not shows_root:
         return []
-    return sorted(_iter_subdir_names(Path(shows_root)))
+    if os.path.exists(shows_root):
+        names = sorted(_iter_subdir_names(Path(shows_root)))
+        if names:
+            return names
+    if is_bare_server_root(shows_root):
+        return _list_server_shares(shows_root)
+    return []
 
 def list_shots_for_show(shows_root: str, show: str) -> List[str]:
     """Shot folders under <shows_root>/<show>, excluding studio pipeline dirs and any
@@ -450,7 +607,7 @@ def list_shots_for_show(shows_root: str, show: str) -> List[str]:
     just because one sibling folder is locked."""
     if not shows_root or not show:
         return []
-    base = Path(shows_root) / show
+    base = under(shows_root, show)
     if not base.exists():
         return []
     return sorted(n for n in _iter_subdir_names(base)
@@ -461,7 +618,7 @@ def list_shot_versions(shows_root: str, show: str, shot: str) -> List[str]:
     e.g. ['v001','v002','v010'] — the last (highest) is the latest."""
     if not (shows_root and show and shot):
         return []
-    plates = Path(shows_root) / show / shot / "in" / "plates"
+    plates = under(shows_root, show, shot, "in", "plates")
     if not plates.exists():
         return []
     vers = [n for n in _iter_subdir_names(plates) if _VER_RE.match(n)]
@@ -676,7 +833,7 @@ def shot_bot_tracks_dir(shows_root: str, show: str, shot: str) -> str:
     """Publish target for a shot: <shows_root>/<show>/<shot>/mid/cmm/bot_tracks."""
     if not (shows_root and show and shot):
         return ""
-    return str(Path(shows_root) / show / shot / "mid" / "cmm" / "bot_tracks")
+    return str(under(shows_root, show, shot, "mid", "cmm", "bot_tracks"))
 
 def shot_cache_dir(studio_dir: str, work_out: str = "", shot: str = "") -> str:
     """Persistent per-shot cache for bot-made JPG proxies + mp4 renders, kept in the
@@ -802,7 +959,7 @@ def resolve_plate_dir(shows_root: str, show: str, shot: str, version: str) -> st
     """Absolute frames dir: <shows_root>/<show>/<shot>/in/plates/<version>."""
     if not (shows_root and show and shot and version):
         return ""
-    return str(Path(shows_root) / show / shot / "in" / "plates" / version)
+    return str(under(shows_root, show, shot, "in", "plates", version))
 
 
 _EXR_EXTS = {".exr"}

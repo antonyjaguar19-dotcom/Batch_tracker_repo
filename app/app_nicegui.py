@@ -567,8 +567,35 @@ async def load_shows():
     root = shows_root.value
     shows = await run.io_bound(be.list_shows, root)
     show_sel.set_options(shows)
+    if not shows and be.is_bare_server_root(root):
+        # Bare-server root (liv2): the shows ARE the shares, so an empty list means the
+        # server did not answer, not that it holds no shows. Say which, so nobody hunts
+        # for a missing 'shows' folder that was never supposed to exist.
+        ui.notify(f"{root} did not answer — check the server is reachable "
+                  f"(net view {root}) and that you are logged in to it.",
+                  type="warning", timeout=8000)
+        return
     ui.notify(f"{len(shows)} show(s) under {root}" if shows else f"No shows under {root}",
               type="info" if shows else "warning")
+
+
+# Configured plate servers (config/servers.json, env BTR_SHOWS_SERVERS). Read once at
+# startup; the Shows Root box stays editable, so an unlisted server still works today
+# and only needs a config entry to become a permanent dropdown choice.
+SERVERS = be.load_servers()
+
+async def on_server_change(e):
+    """Switch plate server: point Shows Root at the new root, drop the stale show/shot
+    lists (they belong to the old server), then rescan."""
+    root = be.server_root_for(e.value)
+    if not root or root == shows_root.value:
+        return
+    shows_root.set_value(root)
+    state.shots_data = {}
+    state.log_history = []
+    show_sel.set_options([], value=None)
+    refresh_table()
+    await load_shows()
 
 
 _scan_token = {"n": 0}
@@ -1132,8 +1159,18 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
     with ui.card().classes("w-full bt-card"):
         ui.label("Project").classes("bt-section")
         # ---- Studio network plate fetch: <shows_root>/<show>/<shot>/in/plates/<version> ----
+        # Server picker fills Shows Root from config/servers.json; the box below stays
+        # free text, so a server that is not in the config yet can still be typed/browsed
+        # to without waiting for a config edit.
+        server_sel = ui.select([s["name"] for s in SERVERS],
+                               value=SERVERS[0]["name"] if SERVERS else None,
+                               label="Server", on_change=on_server_change
+                               ).props("dense outlined").classes("w-full")
+        server_sel.tooltip("Studio plate servers, from config/servers.json. Add a server there "
+                           "(name + root) and it appears here — no code change.")
         with ui.row().classes("w-full no-wrap items-end gap-1"):
-            shows_root = ui.input("Shows Root", value=r"\\liv1\shows",
+            shows_root = ui.input("Shows Root",
+                                  value=SERVERS[0]["root"] if SERVERS else r"\\liv1\shows",
                                   placeholder=r"\\liv1\shows").props("dense outlined").classes("grow")
             ui.button(icon="folder", on_click=lambda: pick_folder(shows_root)).props("flat dense")
         with ui.row().classes("w-full no-wrap items-end gap-1"):

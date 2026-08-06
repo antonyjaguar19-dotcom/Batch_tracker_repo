@@ -114,6 +114,26 @@ Every tuning knob is a field on `AppState` (see `app/app.py:1108`), copied into
 
 ### Folders: local work dir vs studio tree
 Shots come from a studio share: `<shows_root>/<show>/<shot>/in/plates/<version>/`.
+
+`shows_root` is per-server and never hardcoded. The studio runs several plate servers,
+and they are not the same shape: `\\liv1\shows` holds shows one folder down, while on
+`\\liv2` **each show is its own top-level share**. Everything from `<show>` down is
+identical, so the difference is absorbed by the root string alone. Servers are listed in
+`config/servers.json` (`[{"name","root"}]`, first entry = UI default), overridable with
+`BTR_SHOWS_SERVERS=NAME=ROOT;NAME=ROOT`. Adding a server is a config edit, not code.
+
+Two things that shape must not be "cleaned up" into:
+- Studio-tree paths are built with `be.under(root, *parts)`, **not** `Path(root) / part`.
+  pathlib only recognises a UNC path once it has both a server and a share, so
+  `Path(r"\\liv2") / "ABC"` silently drops a backslash and yields a path that
+  does not exist. `under()` joins the text first, so a bare-server root still resolves.
+- `list_shows` falls back to `_list_server_shares()` (parses `net view`; pywin32 is not
+  in the embeddable runtime) when the root is a bare server, because there is no folder
+  to iterdir. An empty list there means the server did not answer — not that it is empty.
+
+Local work dir stays keyed by show name alone (`runtime/_work/<show>`) — two servers
+holding a same-named show would share masks/proxies. Accepted, not overlooked.
+
 The pipeline **computes in a local work dir** (`runtime/_work/<show>`, override `BTR_WORK`)
 so the cross-shot guide and mask-reuse logic stay intact, then `publish_shot()` copies
 finished artifacts to `<show>/<shot>/mid/cmm/bot_tracks/{*_2Dtracks__<backend>.txt,
