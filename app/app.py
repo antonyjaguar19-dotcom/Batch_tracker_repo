@@ -1398,6 +1398,42 @@ LAST_PROGRESS = ""
 LAST_PROGRESS_FRAC = None   # 0..1 for a determinate bar; None = indeterminate (unknown total)
 STOP_EVENT = threading.Event()
 
+def disable_console_quickedit() -> bool:
+    """Stop a stray click in the launcher window from freezing the whole run.
+
+    Windows consoles ship with QuickEdit ON (HKCU\\Console\\QuickEdit=1). While text is
+    selected -- which is what a single click or drag in the window does -- the console
+    BLOCKS every write to stdout. logger() ends in print(), so the worker thread stops on
+    its next log line and the app looks hung with no error anywhere. Pressing Ctrl+C or Esc
+    clears the selection and everything resumes exactly where it left off, which is the
+    give-away: a long stall between two ADJACENT log lines that ends the moment the window
+    is touched.
+
+    Observed on a real batch: 51 minutes between the two halves of one auto-tune log, then
+    another stall, both cleared by Ctrl+C.
+
+    Clearing ENABLE_QUICK_EDIT_MODE removes the hazard (the window can still be scrolled;
+    selecting text needs the Edit menu / Ctrl+Shift+drag). Best-effort: no console (pythonw,
+    a service, a redirected pipe) simply means nothing to do.
+    """
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        if not h or h == ctypes.c_void_p(-1).value:
+            return False
+        mode = ctypes.c_uint()
+        if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return False                   # not a console (redirected) -- nothing to disable
+        ENABLE_QUICK_EDIT, ENABLE_EXTENDED = 0x0040, 0x0080
+        if not (mode.value & ENABLE_QUICK_EDIT):
+            return True                    # already safe
+        new = (mode.value & ~ENABLE_QUICK_EDIT) | ENABLE_EXTENDED
+        return bool(k32.SetConsoleMode(h, new))
+    except Exception:
+        return False
+
+
 def _set_progress(msg: str, done=None, total=None):
     """Progress text + (optionally) a real fraction for the UI bar. Callers that know a
     done/total pass both; those that don't leave the fraction None -> indeterminate bar."""

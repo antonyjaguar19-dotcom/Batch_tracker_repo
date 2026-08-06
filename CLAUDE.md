@@ -149,6 +149,16 @@ track files for the same shot. A shot with two mask dirs (`masks_camera`, `masks
 publishes them into `masks/<task>/`, not flattened into `masks/`: the files are named
 identically per task, so flattening silently kept only the last one copied.
 
+**A click in the launcher window used to freeze the whole run.** Windows consoles ship with
+QuickEdit on (`HKCU\Console\QuickEdit=1`), and a console blocks *every* write to stdout
+while text is selected — which is what one click or drag does. `logger()` ends in `print()`,
+so the worker thread stopped on its next log line, with no error and no clue; Ctrl+C or Esc
+cleared the selection and it carried on exactly where it left off. The tell is a long stall
+between two **adjacent** log lines that ends the moment you touch the window (seen in the
+wild: 51 minutes mid-`_auto_tune`). `be.disable_console_quickedit()` is called at startup in
+`app_nicegui.py` to clear the flag — don't remove it, and don't move it below anything that
+logs.
+
 ### Analyze
 `worker_analyze` → Qwen batch over downscaled (1280px) proxies → `core.bridge.build_batch_tracker_json`
 merges Qwen signals, client requirements (`requirements` file + UI-typed

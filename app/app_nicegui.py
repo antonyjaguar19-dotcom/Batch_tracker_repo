@@ -33,6 +33,12 @@ be = importlib.util.module_from_spec(_spec)
 sys.modules["btr_backend"] = be
 _spec.loader.exec_module(be)  # builds no UI: app.py only launches under __main__
 
+# Before anything can log: a click in the launcher console selects text, and a console with
+# QuickEdit on blocks every write while a selection exists -- which freezes the worker on
+# its next log line with no error and no clue. See be.disable_console_quickedit.
+if be.disable_console_quickedit():
+    print("Console QuickEdit disabled (a click in this window can no longer pause the run).")
+
 from nicegui import ui, run, app as nicegui_app  # noqa: E402
 
 
