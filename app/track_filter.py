@@ -843,10 +843,119 @@ def backfill_to_floor(kept: Dict[str, Track], all_tracks: Dict[str, Track],
     return out, set(add)
 
 
+def geometric_residuals(tracks: Dict[str, Track], width: int, height: int,
+                        pairs: int = 24, min_pts: int = 12,
+                        log: Optional[Callable] = None) -> Dict[str, float]:
+    """Per-track mean Sampson distance against a RANSAC fundamental matrix. DIAGNOSTIC ONLY.
+
+    Everything else in this file judges a track by its OWN trajectory, deliberately, so that
+    a foreground point moving with parallax is not punished for disagreeing with the plate.
+    The cost of that choice is that nothing here can see a track which is smooth, well
+    localised, and simply wrong -- and `wobble_rel` is 0.0 in shipping config precisely
+    because the one candidate predictor of that turned out to rank backwards on real footage.
+
+    A fundamental matrix fitted by RANSAC over a frame pair is the standard tool from SfM
+    front-ends, and a track that consistently sits off the epipolar lines every other track
+    agrees on is a strong outlier signal. Two reasons it is written to the report and NOT
+    used as a gate:
+
+      * a point on a genuinely moving object is off-epipolar and CORRECT. Gating on this
+        would delete exactly the object tracks the mask stage worked to keep.
+      * epipolar geometry is what the solve downstream is trying to recover. Filtering the
+        input on an estimate of the answer biases the answer.
+
+    Degenerate cases are reported as NaN rather than as a small number: on a pure rotation or
+    a planar scene F is not determined, and a fit to it would produce confident nonsense.
+    Pairs whose RANSAC inlier ratio is under half are dropped for the same reason.
+
+    Returns {track_id: mean Sampson distance in px}, NaN where not measurable.
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception:
+        return {}
+    by_frame: Dict[int, List[Tuple[str, float, float]]] = {}
+    for tid, pts in tracks.items():
+        for (f, x, y) in pts:
+            by_frame.setdefault(int(f), []).append((tid, float(x), float(y)))
+    frames = sorted(f for f, v in by_frame.items() if len(v) >= min_pts)
+    if len(frames) < 4:
+        return {}
+    diag = math.hypot(float(width or 0), float(height or 0)) or 1000.0
+
+    # Spread the pairs over the shot and over several baselines: a short baseline gives a
+    # weakly-determined F, a long one loses the tracks that do not span it.
+    span = frames[-1] - frames[0]
+    gaps = [g for g in (max(2, span // 20), max(4, span // 8), max(8, span // 3)) if g > 0]
+    want = [(f, f + g) for g in gaps
+            for f in frames[::max(1, len(frames) // max(1, pairs // len(gaps)))]]
+
+    acc: Dict[str, List[float]] = {}
+    used = degenerate = 0
+    for fa, fb in want:
+        A, B = by_frame.get(fa), by_frame.get(fb)
+        if not A or not B:
+            continue
+        db = {t: (x, y) for t, x, y in B}
+        ids = [t for t, _x, _y in A if t in db]
+        if len(ids) < min_pts:
+            continue
+        pa = np.array([[x, y] for t, x, y in A if t in db], dtype=np.float64)
+        pb = np.array([db[t] for t in ids], dtype=np.float64)
+        thr = diag * 0.002
+        F, mask = cv2.findFundamentalMat(pa, pb, cv2.FM_RANSAC,
+                                         ransacReprojThreshold=thr,
+                                         confidence=0.99, maxIters=2000)
+        if F is None or F.shape != (3, 3) or mask is None:
+            degenerate += 1
+            continue
+        f_in = float(mask.sum()) / len(ids)
+        if f_in < 0.5:
+            degenerate += 1          # no consensus: the pair does not determine an F
+            continue
+        # DEGENERACY. On a plane or under pure rotation every correspondence satisfies a
+        # HOMOGRAPHY, and a homography-consistent set satisfies a whole family of fundamental
+        # matrices -- so findFundamentalMat returns one with a high inlier ratio and near-zero
+        # residuals for everything. Measured on constructed scenes: a planar scene and a
+        # rotation-only camera both came back with all 160 tracks at 0.00px, i.e. the column
+        # would report perfect geometry on a locked-off pan, which is ordinary matchmove
+        # footage. Comparing against a homography fitted at the same threshold is the standard
+        # test: if H explains the pair about as well as F does, F carries no information here.
+        Hm, hmask = cv2.findHomography(pa, pb, cv2.RANSAC, thr, maxIters=2000, confidence=0.99)
+        if Hm is not None and hmask is not None:
+            if float(hmask.sum()) / len(ids) >= 0.90 * f_in:
+                degenerate += 1
+                continue
+        ha = np.hstack([pa, np.ones((len(pa), 1))])
+        hb = np.hstack([pb, np.ones((len(pb), 1))])
+        Fx = ha @ F.T                       # F x   for each correspondence
+        Ftx = hb @ F                        # F^T x'
+        num = np.sum(hb * Fx, axis=1) ** 2
+        den = Fx[:, 0] ** 2 + Fx[:, 1] ** 2 + Ftx[:, 0] ** 2 + Ftx[:, 1] ** 2
+        d = np.sqrt(num / np.maximum(den, 1e-12))
+        used += 1
+        for t, v in zip(ids, d.tolist()):
+            acc.setdefault(t, []).append(float(v))
+
+    if used < 3:
+        if log:
+            log(f"  geo residual: not measurable ({used} usable frame pair(s), "
+                f"{degenerate} degenerate) -- planar or pure-rotation shot")
+        return {}
+    out = {t: float(st.mean(v)) for t, v in acc.items() if v}
+    if log and out:
+        vals = sorted(out.values())
+        log(f"  geo residual (diagnostic): median {vals[len(vals) // 2]:.2f}px, "
+            f"worst {vals[-1]:.2f}px over {used} frame pair(s); not gated")
+    return out
+
+
 def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, float],
                       T: int, width: int, height: int, cfg,
                       wobble_fn: Optional[Callable] = None,
-                      weak: Optional[set] = None, registry=None) -> str:
+                      weak: Optional[set] = None, registry=None,
+                      geo: Optional[Dict[str, float]] = None) -> str:
     """Write a per-track CSV: length, score, certainty, wobble amplitude and period.
 
     Several rounds of tracking fixes have been judged by eye on real footage and by
@@ -861,8 +970,13 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
         # file by column index keeps working.
         extra = ["kind", "patch_px", "motion", "sam_obj", "depth_class", "risk",
                  "escalation", "geo_residual"] if registry is not None else []
+        # geo_residual is already the last of the registry columns, so when the registry is
+        # off it is appended to the base row instead -- either way it is the final column and
+        # no existing index shifts.
+        base_geo = geo is not None and not extra
         rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y,weak"
-                + ("," + ",".join(extra) if extra else "")]
+                + ("," + ",".join(extra) if extra else "")
+                + (",geo_residual" if base_geo else "")]
         for tid, pts in sorted(tracks.items()):
             p = sorted(pts, key=lambda q: q[0])
             if not p:
@@ -879,6 +993,9 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
             if extra:
                 m = registry.row(tid)
                 row += "," + ",".join(str(m.get(c, "")) for c in extra)
+            elif base_geo:
+                g = float((geo or {}).get(tid, float("nan")))
+                row += "," + ("" if g != g else f"{g:.3f}")   # blank, not 0, when unmeasured
             rows.append(row)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:

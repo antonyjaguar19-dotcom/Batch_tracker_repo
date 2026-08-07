@@ -1960,11 +1960,24 @@ class BatchTrackerRunner:
                             self.cfg.output_dir,
                             f"{shot}{('__' + self.cfg.output_tag.strip()) if (self.cfg.output_tag or '').strip() else ''}"
                             f"__trackreport.csv")
+                        # Epipolar agreement, measured once for the whole shot. This is the
+                        # only number here that looks ACROSS tracks; everything else is
+                        # deliberately self-referential so parallax is not punished, which is
+                        # also why this one is reported and never gated -- a point on a real
+                        # mover is off-epipolar and correct. See geometric_residuals.
+                        _geo = _tf.geometric_residuals(final_tracks_out, W0, H0,
+                                                       log=self._status)
+                        if _geo and self.registry.enabled:
+                            for _tid, _v in _geo.items():
+                                _m = self.registry.get(_tid)
+                                if _m is not None:
+                                    _m.geo_residual = float(_v)
                         got = _tf.dump_track_report(
                             rep, final_tracks_out, getattr(_rt, "last_certainty", {}) or {},
                             T, W0, H0, self.cfg, wobble_fn=measure_wobble,
                             weak=locals().get("_weak_ids") or set(),
-                            registry=(self.registry if self.registry.enabled else None))
+                            registry=(self.registry if self.registry.enabled else None),
+                            geo=(_geo or None))
                         if got:
                             self._status(f"[{i}/{len(vids)}] Track report -> {os.path.basename(got)}")
                         # Full records beside the CSV: the CSV is for reading, this is for
