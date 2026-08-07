@@ -414,14 +414,19 @@ def on_clear_mem(row):
     """Per-shot clear: pick which of Analysis / Masks / Tracks to remove, then delete them
     from BOTH the local work dir and the shot's own studio folder.
 
+    TEMP DIAGNOSTIC (remove once the dead-click report is resolved): prints what actually
+    arrives from the Vue slot. Silence here means the emit never reached Python.
+
     The studio copies are what make the badges read 'done' (here and on any other
     workstation), so clearing a badge has to remove them too. Scopes are independent
     because masks are the expensive stage — redoing a track shouldn't cost a SAM3 re-run.
     """
+    print(f"[clearmem] event arrived: type={type(row).__name__} value={row!r}")
     if isinstance(row, list):
         row = row[0] if row else None
     name = (row or {}).get("name") if isinstance(row, dict) else None
     if not name or name not in state.shots_data:
+        print(f"[clearmem] REJECTED: name={name!r} known={name in state.shots_data if name else False}")
         return
     d = state.shots_data[name]
     has_a, has_m, has_t = _is_analyzed(d), _is_masked(d), _is_tracked(d)
@@ -2102,12 +2107,18 @@ with ui.column().classes("w-full gap-3 p-3"):
                 table.on("rowClick", on_row_click)
                 # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
                 # editor via rowClick; emits the row up to the Python handler.
+                # The click lives on a NATIVE <span>, not on the q-btn. `@click.stop` on a
+                # Quasar component binds to its custom `click` emit, where the .stop modifier
+                # is not the plain DOM one -- on a real element both the handler and .stop
+                # behave unambiguously.
                 table.add_slot("body-cell-clear", r'''
                   <q-td :props="props" auto-width>
-                    <q-btn dense flat round color="grey-6" icon="delete_outline"
-                           @click.stop="() => $parent.$emit('clearmem', props.row)">
-                      <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
-                    </q-btn>
+                    <span @click.stop="$parent.$emit('clearmem', props.row)"
+                          style="display:inline-flex;cursor:pointer">
+                      <q-btn dense flat round color="grey-5" icon="delete_outline">
+                        <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
+                      </q-btn>
+                    </span>
                   </q-td>
                 ''')
                 table.on("clearmem", lambda e: on_clear_mem(e.args))
