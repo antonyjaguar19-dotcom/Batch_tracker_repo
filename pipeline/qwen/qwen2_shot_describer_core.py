@@ -577,6 +577,11 @@ class QwenShotDescriber:
         # Optional progress sink (set by the runner). Without it the long VLM
         # stages are silent and a slow box looks frozen — so log every step.
         self.log = None
+        # Raw transcript of the CURRENT shot's passes, reset per shot in
+        # _describe_from_frames and read back by the runner. Bound here as well so
+        # _generate always has something to append to, whatever the entry point.
+        self._raw_passes: List[Dict] = []
+        self._cam_stats: Dict = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Never hit the network
@@ -683,7 +688,24 @@ class QwenShotDescriber:
         if "e" in err:
             raise err["e"]
         self._emit(f"    · {tag}: done in {time.time() - t0:.1f}s ({nchunks} chunks)")
-        return "".join(pieces).strip()
+        text = "".join(pieces).strip()
+        # Keep the RAW reply. Every caller parses this return value inline and throws the
+        # rest away -- scene keeps 2 sentences, things keeps a CSV list, matchmove keeps the
+        # JSON it could extract -- so without this the model's actual words never survive the
+        # expression that consumed them, and a failed parse leaves no evidence at all.
+        # Best-effort by design: capture must never be able to fail a describe.
+        try:
+            self._raw_passes.append({
+                "tag": tag,
+                "prompt": prompt,
+                "text": text,
+                "secs": round(time.time() - t0, 1),
+                "chunks": nchunks,
+                "images": len(images),
+            })
+        except Exception:
+            pass
+        return text
 
     def _frame_budget(self) -> int:
         # Frame count nudges with the FPS slider but stays within the VLM sweet spot
@@ -707,12 +729,28 @@ class QwenShotDescriber:
         return self._describe_from_frames(frames_bgr, cv_frames, client_requirement)
 
     def _describe_from_frames(self, frames_bgr, cv_frames, client_requirement: Optional[str] = None) -> Dict:
+        # Per-shot, so shot N never inherits shot N-1's transcript.
+        self._raw_passes: List[Dict] = []
+        self._cam_stats: Dict = {}
         self._emit(f"  - {len(frames_bgr)} VLM frame(s) sampled; classifying camera motion…")
         images = [_pil_from_bgr(f, max_side=self.cfg.max_side) for f in frames_bgr]
 
         cam_src = cv_frames if len(cv_frames) >= 2 else frames_bgr
         mags, vecs, scales = _estimate_global_motion(cam_src, scale=self.cfg.cv_scale)
         cam_label = _classify_camera(mags, vecs, scales, self.cfg)
+        # The label alone hides how close a call it was; keep the measurements behind it.
+        try:
+            import numpy as _np
+            _m = _np.asarray(mags, dtype=float)
+            if _m.size:
+                self._cam_stats = {
+                    "label": cam_label,
+                    "median_px": round(float(_np.median(_m)), 3),
+                    "p95_px": round(float(_np.percentile(_m, 95)), 3),
+                    "frames": int(len(cam_src)),
+                }
+        except Exception:
+            pass
         self._emit(f"  - camera: {cam_label}. Running VLM (3 passes)…")
 
         scene_prompt = (

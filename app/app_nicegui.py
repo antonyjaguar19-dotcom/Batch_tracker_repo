@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 # Enable OpenCV's EXR codec before ANY cv2 import (OpenCV reads this only at init).
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+import json
 import re
 import sys
 import time
@@ -218,6 +219,30 @@ def refresh_table():
     table.update()
     _suppress_select = False
     lbl_selcount.set_content(be._sel_count_text(state))
+
+
+def refresh_row(name: str) -> bool:
+    """Update ONE row's contents in place. Returns False if that shot isn't listed.
+
+    Saving a shot changes a row's CONTENT, not the row SET, so it must not go through
+    refresh_table(). That replaces the whole row array, Quasar re-renders, and the browser
+    echoes a `selection` event back over the websocket -- which arrives a turn LATER, after
+    refresh_table has already set _suppress_select back to False. on_selection_change then
+    reads the echo as a user action and writes use=False for every row not in it. On a
+    100+ shot show the re-render is slow enough that this happens every time, so one Save
+    silently unticked the whole selection and the next Run Pipeline had nothing to do.
+
+    Mutating the existing dict keeps the array identity, so there is no re-render and no
+    echo. A shot hidden by the status chip or number filter has no row to update, and needs
+    none -- it is not on screen, and the next real rebuild picks it up.
+    """
+    fresh = _row_for(name)
+    for r in (table.rows or []):
+        if r.get("name") == name:
+            r.update(fresh)
+            table.update()
+            return True
+    return False
 
 
 def refresh_selection_only():
@@ -506,7 +531,9 @@ def save_shot():
     else:
         state.manual_notes.pop(name, None)
     be.save_manual_notes(out_dir.value, state.manual_notes)
-    refresh_table()
+    # In place, NOT refresh_table(): a full rebuild echoes a selection event back and wipes
+    # every tick on a large show. See refresh_row.
+    refresh_row(name)
     ui.notify(f"Saved {name}", type="positive")
 
 
@@ -987,9 +1014,77 @@ def shutdown_bot():
 # Last values poll() actually pushed, so an idle tick sends nothing.
 _poll_last = {"status": None, "running": None, "indeterminate": False}
 
+# ---- "Behind the scenes": what the Analyze stage is doing right now ----------
+# poll() is the ONLY consumer of be.JOB_QUEUE. A second drain would steal messages from
+# the log, so the Qwen view is fed by classifying lines inside that one drain instead.
+_ai = {"shot": "", "pass": "", "cam": "", "model": "", "gpu": "", "now": None}
+
+# logger() stamps every line "[HH:MM:SS] " before it reaches the queue (app.py:1486).
+_TS_RE = re.compile(r"^\[\d\d:\d\d:\d\d\]\s*")
+_SHOT_RE = re.compile(r"^\[(\d+)/(\d+)\]\s+(\S+)$")
+
+# Prefixes emitted by the Qwen stage, traced to their source lines:
+#   qwen2_shot_describer_core.py  633/675/678/681/685 ("    · {tag}: …"),
+#                                 710 ("  - N VLM frame(s) sampled…"), 716 ("  - camera: …")
+#   run_qwen2_shot_describer.py   146/151/159/165/184/211/237
+#   app.py worker_analyze         1951/1966/1982/2044
+_QWEN_STARTS = (
+    "Model loaded. Precision:", "GPU:", "Restricted to", "Using ", "FAILED:",
+    "Done. Wrote JSON:", "Starting…", "Run started:", "IN :", "OUT:", "Model (local):",
+    "FPS preset:", "Int4:", "Freed Qwen2.5-VL", "Qwen VRAM free skipped",
+    "Running Qwen2", "Building mask guidance", "Applied analysis to",
+    "Loaded ", "Merged ", "Skipped ", "--- Starting Step 2", "Analysis Complete.",
+    "ERROR in Analysis:",
+)
+
+
+def _qwen_line(m: str):
+    """Return the de-timestamped text if this queue line came from the Analyze stage.
+
+    None means 'not Qwen' -- the line still goes to the full activity log either way, so a
+    missed predicate only thins this view, it can never lose a message.
+    """
+    s = _TS_RE.sub("", m).rstrip()
+    t = s.strip()
+    if not t:
+        return None
+    if t.startswith("·") or t.startswith("- camera:") or "VLM frame(s) sampled" in t:
+        return s
+    if t.startswith(_QWEN_STARTS) or _SHOT_RE.match(t):
+        return s
+    return None
+
+
+def _ai_track(t: str) -> bool:
+    """Update the 'now' strip from one Qwen line. True if something changed."""
+    t = t.strip()
+    hit = False
+    mm = _SHOT_RE.match(t)
+    if mm:
+        _ai["shot"], _ai["pass"] = mm.group(3), f"shot {mm.group(1)}/{mm.group(2)}"
+        return True
+    if t.startswith("·"):
+        tag = t.lstrip("· ").split(":", 1)[0].strip()
+        if tag and tag != _ai["pass"]:
+            _ai["pass"] = tag
+            hit = True
+    elif t.startswith("- camera:"):
+        _ai["cam"] = t.split(":", 1)[1].strip().split(".")[0]
+        hit = True
+    elif t.startswith("Model loaded. Precision:"):
+        _ai["model"] = t.split(":", 1)[1].strip()
+        hit = True
+    elif t.startswith("GPU:"):
+        _ai["gpu"] = t.split(":", 1)[1].strip()
+        hit = True
+    return hit
+
 
 def poll():
     new_logs = []
+    qwen_logs = []
+    now_dirty = False
+    refresh_ai = False
     refresh_now = False
     refresh_path = None
     while True:
@@ -1001,16 +1096,33 @@ def poll():
             refresh_path = m.split(":", 1)[1].strip()
             new_logs.append(f"System: reloading {Path(refresh_path).name}")
         elif m in ("DONE_ANALYSIS",):
-            pass
+            # Stays out of the activity log (it always has been); used here as the hook to
+            # rebuild the reasoning cards now that the guide is on disk.
+            refresh_ai = True
+            qwen_logs.append("── analysis complete ──")
+            _ai["shot"] = _ai["pass"] = ""
+            now_dirty = True
         elif m in ("DONE_MASKING", "DONE_TRACKING"):
             refresh_now = True
             _refresh_badges_local(masks=(m == "DONE_MASKING"), tracks=(m == "DONE_TRACKING"))
             new_logs.append(m)
         else:
             new_logs.append(m)
+            # Same message, second view: the full log keeps everything, the Qwen stream
+            # takes only what the Analyze stage emitted. One drain, two sinks.
+            q = _qwen_line(m)
+            if q is not None:
+                qwen_logs.append(q)
+                now_dirty = _ai_track(q) or now_dirty
 
     for ln in new_logs:
         log_view.push(ln)
+    for ln in qwen_logs:
+        qwen_view.push(ln)
+    if now_dirty:
+        refresh_now_strip()
+    if refresh_ai:
+        refresh_ai_cards()
 
     if refresh_path and os.path.exists(refresh_path):
         try:
@@ -1087,6 +1199,173 @@ def _refresh_badges_local(masks: bool = False, tracks: bool = False):
         print(f"badge refresh: {ex}")
 
 
+# -----------------------------------------------------------------------------
+# "Behind the scenes": per-shot reasoning, read from the guide the bot already writes
+# -----------------------------------------------------------------------------
+def _guide_for_cards() -> dict:
+    """Newest guide JSON as a dict, or {}. Prefers the one this session produced."""
+    p = state.guide_path or ""
+    if not (p and os.path.isfile(p)):
+        try:
+            g = be._latest_guide_file(out_dir.value or "")
+            p = str(g) if g else ""
+        except Exception:
+            p = ""
+    if not (p and os.path.isfile(p)):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        d["_path"] = p
+        return d
+    except Exception as ex:
+        print(f"guide read for cards: {ex}")
+        return {}
+
+
+def _raw_passes_map(guide_path: str) -> dict:
+    """{shot: [pass dicts]} from shot_descriptions.json beside the guide.
+
+    Only present once the Qwen runner has been taught to keep its raw output; an older
+    batch simply has no 'raw_passes' key and the card omits that section.
+    """
+    out = {}
+    try:
+        j = Path(guide_path).parent / "shot_descriptions.json"
+        if not j.is_file():
+            return out
+        with open(j, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        for s in (data.get("shots") or []):
+            nm = str(s.get("name") or "")
+            if nm:
+                out[nm] = s.get("raw_passes") or []
+    except Exception as ex:
+        print(f"raw passes read: {ex}")
+    return out
+
+
+def _fmt_list(v) -> str:
+    if isinstance(v, (list, tuple)):
+        return ", ".join(str(x) for x in v if str(x).strip()) or "—"
+    return str(v).strip() or "—"
+
+
+def refresh_ai_cards():
+    """Rebuild the per-shot reasoning cards from the guide on disk.
+
+    Everything shown here is already written by the bot and has never been surfaced:
+    the scene paragraph, the camera-motion label, the intent/confidence, the per-task
+    rationale, and the exact prompt strings handed to SAM3.
+    """
+    try:
+        ai_cards.clear()
+    except Exception:
+        return
+    guide = _guide_for_cards()
+    shots = [s for s in (guide.get("shots") or []) if isinstance(s, dict)]
+    if not shots:
+        with ai_cards:
+            ui.label("No analysis on disk yet. Tick a shot and run 1 · Analyze."
+                     ).classes("bt-hint")
+        return
+    raws = _raw_passes_map(guide.get("_path", ""))
+    # Analysed shots first, then alphabetical, so the ones with content are at the top.
+    shots.sort(key=lambda s: (not bool(s.get("qwen2_description")),
+                             str(s.get("shot_name") or s.get("shot") or "")))
+    with ai_cards:
+        ui.label(f"{len(shots)} shot(s) · {os.path.basename(guide.get('_path', ''))}"
+                 ).classes("bt-hint")
+        for s in shots:
+            nm = str(s.get("shot_name") or s.get("shot") or "?")
+            cam = str(s.get("qwen2_camera_movement") or "").strip()
+            conf = s.get("confidence")
+            head = f"{nm}   ·   {cam or 'camera unknown'}"
+            if isinstance(conf, (int, float)):
+                head += f"   ·   confidence {float(conf):.2f}"
+            with ui.expansion(head, icon="psychology").classes("w-full bt-aicard"):
+                desc = str(s.get("qwen2_description") or "").strip()
+                if desc:
+                    ui.label("What it saw").classes("bt-section q-mt-xs")
+                    ui.markdown(desc).classes("bt-kv")
+
+                ui.label("Decision").classes("bt-section q-mt-sm")
+                ui.markdown(
+                    f"**Intent:** {_fmt_list(s.get('intent'))} · "
+                    f"**Targets:** {_fmt_list(s.get('tracking_targets'))}\n\n"
+                    f"**Why:** {str(s.get('notes') or '—')}"
+                ).classes("bt-kv")
+
+                tasks = s.get("tasks") or []
+                if tasks:
+                    ui.label("Tasks handed to the pipeline").classes("bt-section q-mt-sm")
+                    for t in tasks:
+                        if not isinstance(t, dict):
+                            continue
+                        ui.markdown(
+                            f"**{t.get('task_id', '?')}** · `{t.get('track_mode', '?')}` · "
+                            f"masks → `{t.get('mask_subdir', '—')}`"
+                            + (f" · subject: {t.get('subject')}" if t.get("subject") else "")
+                            + f"\n\n{t.get('notes') or ''}"
+                        ).classes("bt-kv")
+
+                ui.label("Prompts sent to SAM3").classes("bt-section q-mt-sm")
+                ui.markdown(
+                    f"**Include:** {_fmt_list(s.get('mask_includes'))}\n\n"
+                    f"**Exclude:** {_fmt_list(s.get('mask_excludes'))}"
+                ).classes("bt-kv")
+
+                raw_things = s.get("qwen2_things") or []
+                filt = s.get("qwen2_things_filtered") or []
+                if raw_things or filt:
+                    dropped = [x for x in raw_things if x not in filt]
+                    ui.label("Things it listed").classes("bt-section q-mt-sm")
+                    ui.markdown(
+                        f"**Kept:** {_fmt_list(filt)}\n\n"
+                        + (f"**Dropped by heuristics:** {_fmt_list(dropped)}" if dropped else "")
+                    ).classes("bt-kv")
+
+                d = state.shots_data.get(nm)
+                if d is not None:
+                    ui.label("Matchmove read").classes("bt-section q-mt-sm")
+                    # Same helper the shot editor uses, so the two can never disagree.
+                    ui.markdown(be._analysis_markdown(d)).classes("bt-kv")
+
+                note = str(s.get("client_note") or "").strip()
+                if note:
+                    ui.label("Client brief").classes("bt-section q-mt-sm")
+                    ui.markdown(note).classes("bt-kv")
+
+                for rp in (raws.get(nm) or []):
+                    if not isinstance(rp, dict):
+                        continue
+                    ui.label(f"Raw · {rp.get('tag', '?')} · {rp.get('secs', '?')}s "
+                             f"· {rp.get('chunks', '?')} chunks").classes("bt-section q-mt-sm")
+                    ui.label(str(rp.get("text") or "").strip() or "—").classes("bt-pass")
+
+
+def refresh_now_strip():
+    """Push the 'what is it doing right now' line. Change-gated like _poll_last."""
+    bits = []
+    if _ai["shot"]:
+        bits.append(f"**{_ai['shot']}**")
+    if _ai["pass"]:
+        bits.append(_ai["pass"])
+    if _ai["cam"]:
+        bits.append(f"camera: {_ai['cam']}")
+    txt = "  ·  ".join(bits) if bits else "Idle — nothing analysing."
+    tail = []
+    if _ai["model"]:
+        tail.append(_ai["model"])
+    if _ai["gpu"]:
+        tail.append(_ai["gpu"])
+    if tail:
+        txt += f"\n\n<span class='bt-hint'>{' · '.join(tail)}</span>"
+    if txt != _ai["now"]:
+        lbl_now.set_content(txt)
+        _ai["now"] = txt
+
+
 def on_search(e):
     """Client-side filter: Quasar hides non-matching rows in the browser, so the row
     array (and every tick in it) is untouched. No table rebuild, no scroll reset, and a
@@ -1109,40 +1388,179 @@ def on_number_filter(value):
 # LAYOUT
 # -----------------------------------------------------------------------------
 ui.dark_mode(True)
-ui.colors(primary="#4c8dff", secondary="#2dd4bf", accent="#a78bfa",
+ui.colors(primary="#5b8cff", secondary="#2dd4bf", accent="#8b5cf6",
           positive="#22c55e", negative="#f43f5e", warning="#f59e0b", info="#38bdf8",
-          dark="#12151c", dark_page="#0d1017")
+          dark="#121826", dark_page="#070a10")
 
 ui.add_head_html("""
 <style>
-  body { background: #0d1017; }
-  .bt-header  { background: linear-gradient(90deg,#141a26 0%,#101623 60%,#0d1017 100%);
-                border-bottom: 1px solid rgba(255,255,255,.07); }
-  .bt-rail    { background: #10141d; border-right: 1px solid rgba(255,255,255,.07); }
-  .bt-card    { background: #141924; border: 1px solid rgba(255,255,255,.07);
-                border-radius: 10px; box-shadow: none; }
-  .bt-card > .q-card__section { padding: 12px 14px; }
-  .bt-set { border: 1px solid rgba(255,255,255,.09); border-radius: 8px; margin-bottom: 6px; }
-  .bt-set > .q-expansion-item__container > .q-item { min-height: 38px; font-weight: 600; }
-  .bt-section { font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
-                color: #8a94a6; font-weight: 600; }
-  .bt-status  { font-size: 13px; color: #cbd5e1; }
+  /* ------------------------------------------------------------------ tokens */
+  :root {
+    --bt-bg:      #070a10;
+    --bt-panel:   #0d111a;
+    --bt-surface: #121826;
+    --bt-raised:  #161d2d;
+    --bt-line:    rgba(148,168,204,.11);
+    --bt-line-hi: rgba(148,168,204,.20);
+    --bt-text:    #eef2f9;
+    --bt-mid:     #aab6ca;
+    --bt-dim:     #6e7c94;
+    --bt-accent:  #5b8cff;
+    --bt-accent-2:#8b5cf6;
+    --bt-r:       10px;
+    --bt-r-lg:    16px;
+  }
+  body, .q-layout, .nicegui-content { background: var(--bt-bg) !important; }
+  * { font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #263042; border-radius: 8px;
+                              border: 2px solid var(--bt-bg); }
+  ::-webkit-scrollbar-thumb:hover { background: #33405a; }
+
+  /* ------------------------------------------------------------------ header */
+  .bt-header { background: var(--bt-panel) !important; min-height: 58px;
+               border-bottom: 1px solid var(--bt-line);
+               box-shadow: 0 1px 0 rgba(91,140,255,.16), 0 12px 32px -26px #000; }
+  .bt-header .text-h6 { font-size: 17px !important; font-weight: 700; letter-spacing: -.01em; }
+  /* Brand mark: the icon becomes a gradient tile instead of a loose glyph. */
+  .bt-header .q-icon.text-2xl { background: linear-gradient(135deg,var(--bt-accent),var(--bt-accent-2));
+               border-radius: 9px; padding: 5px; color: #fff !important; font-size: 20px !important;
+               box-shadow: 0 4px 14px -4px rgba(91,140,255,.8); }
+  /* Live status reads as a pill, not floating text. */
+  .bt-status { font-size: 12.5px; color: var(--bt-mid); font-weight: 600;
+               background: rgba(148,168,204,.08); border: 1px solid var(--bt-line);
+               border-radius: 999px; padding: 5px 14px; }
   .bt-status p { margin: 0; }
-  .bt-hint    { font-size: 12px; color: #7c8698; }
-  .bt-chip    { background: rgba(76,141,255,.14); color: #9dc0ff; border-radius: 999px;
-                padding: 2px 10px; font-size: 12px; }
-  .bt-chip p  { margin: 0; }
-  .bt-editor  { width: 780px; max-width: 94vw; background: #141924; }
-  .bt-paste   { width: 520px; max-width: 94vw; background: #141924; }
-  .bt-badge-off { opacity: .28; }
-  /* Run bar: pipeline button, then the four stages as one evenly-sized sequence. */
-  .bt-run     { min-width: 150px; height: 36px; font-weight: 600; }
-  .bt-step    { min-width: 122px; height: 36px; color: #9dc0ff; }
-  .bt-vsep    { height: 24px; margin: 0 6px; background: rgba(255,255,255,.12); }
+
+  /* ------------------------------------------------------------------- rail  */
+  .bt-rail { background: var(--bt-panel); border-right: 1px solid var(--bt-line);
+             padding: 14px 12px !important; }
+  .bt-rail .bt-card { background: var(--bt-surface); }
+
+  /* ------------------------------------------------------------------- cards */
+  .bt-card { background: var(--bt-surface); border: 1px solid var(--bt-line);
+             border-radius: var(--bt-r-lg); box-shadow: 0 1px 0 rgba(255,255,255,.03) inset,
+             0 18px 40px -30px #000; }
+  .bt-card > .q-card__section { padding: 16px 18px; }
+  /* Section label: small caps with an accent tick, and real space beneath it. */
+  .bt-section { position: relative; font-size: 10px; letter-spacing: .18em;
+                text-transform: uppercase; color: var(--bt-dim); font-weight: 800;
+                padding-left: 11px; margin-bottom: 10px; }
+  .bt-section::before { content: ""; position: absolute; left: 0; top: 3px; bottom: 3px;
+                width: 3px; border-radius: 2px;
+                background: linear-gradient(180deg,var(--bt-accent),var(--bt-accent-2)); }
+  .bt-title { font-size: 15px; font-weight: 700; color: var(--bt-text); }
+  .bt-hint  { font-size: 11.5px; color: var(--bt-dim); line-height: 1.5; }
+
+  /* --------------------------------------------------------------- controls  */
+  .q-field--outlined .q-field__control { border-radius: var(--bt-r); background: #0b0f18;
+                min-height: 40px; }
+  .q-field--outlined .q-field__control:before { border-color: var(--bt-line) !important; }
+  .q-field--outlined:hover .q-field__control:before { border-color: var(--bt-line-hi) !important; }
+  .q-field__native, .q-field__input { font-size: 13px; color: var(--bt-text); }
+  .q-field__label { font-size: 12px; color: var(--bt-dim); }
+  .q-btn { border-radius: var(--bt-r); font-weight: 600; letter-spacing: .01em; }
+  .q-btn--outline .q-btn__content { font-weight: 600; }
+  .q-slider__track-container { color: var(--bt-accent); }
+  .q-toggle__inner--truthy .q-toggle__track { background: var(--bt-accent); }
+
+  /* --------------------------------------------------------------- settings  */
+  .bt-set { border: 1px solid var(--bt-line); border-radius: var(--bt-r); margin-bottom: 8px;
+            background: #0f1420; overflow: hidden; transition: border-color .15s, background .15s; }
+  .bt-set:hover { border-color: var(--bt-line-hi); background: #111726; }
+  .bt-set > .q-expansion-item__container > .q-item { min-height: 44px; font-weight: 600;
+            font-size: 13px; padding: 0 14px; }
+
+  /* --------------------------------------------------------------- run strip */
+  .bt-runbar { background: linear-gradient(120deg,rgba(91,140,255,.14) 0%,
+               rgba(139,92,246,.07) 45%, transparent 78%) , var(--bt-raised);
+               border: 1px solid rgba(91,140,255,.24); }
+  .bt-run  { min-width: 168px; height: 44px; font-weight: 700; font-size: 13.5px;
+             letter-spacing: .02em; border-radius: 12px; color: #fff !important;
+             background: linear-gradient(135deg,#5b8cff 0%,#3f63e8 100%) !important;
+             box-shadow: 0 10px 26px -10px rgba(91,140,255,.9); }
+  .bt-run:hover { box-shadow: 0 14px 32px -10px rgba(91,140,255,1); }
+  .bt-step { min-width: 132px; height: 44px; border-radius: 12px; font-size: 13px;
+             color: #b9cdff !important; background: rgba(91,140,255,.07);
+             border: 1px solid rgba(91,140,255,.22) !important; }
+  .bt-step:hover { background: rgba(91,140,255,.16); }
+  /* Quasar's .q-btn__content wraps by default, so at a narrow viewport the icon and the
+     label land on two lines and the fixed height CLIPS the second one. */
+  .bt-run .q-btn__content, .bt-step .q-btn__content { flex-wrap: nowrap; white-space: nowrap; }
+  .bt-vsep { height: 28px; margin: 0 10px; background: var(--bt-line-hi); }
+
+  /* -------------------------------------------------------------------- tabs */
+  .bt-tabs { background: #0f1420; border: 1px solid var(--bt-line);
+             border-radius: 12px; padding: 4px; min-height: 46px;
+             width: max-content; max-width: 100%; }
+  .bt-tabs .q-tab { text-transform: none; font-weight: 650; font-size: 13.5px;
+             min-height: 38px; border-radius: 9px; color: var(--bt-dim);
+             padding: 0 18px; transition: color .15s, background .15s; }
+  .bt-tabs .q-tab:hover { color: var(--bt-mid); }
+  .bt-tabs .q-tab--active { color: #fff; background: linear-gradient(135deg,
+             rgba(91,140,255,.9),rgba(63,99,232,.9));
+             box-shadow: 0 6px 18px -8px rgba(91,140,255,.9); }
+  .bt-tabs .q-tab__indicator { display: none; }
+  /* Quasar ships .q-tab-panels{background:#fff} and .q-panel-parent{overflow:hidden}.
+     Left alone, the first paints a white slab under the whole main area and the second
+     CLIPS the shots card instead of scrolling it. */
+  .bt-panel { background: transparent !important; padding: 0; overflow: visible; }
+  .bt-panel > .q-tab-panel { padding: 14px 0 0 0; }
+  .bt-panel .q-panel { height: auto; }
+  .bt-panel .q-panel.scroll { overflow: visible; }
+
+  /* ------------------------------------------------------------------- chips */
+  .bt-chip { background: rgba(91,140,255,.14); color: #a9c4ff; border-radius: 999px;
+             padding: 5px 14px; font-size: 12px; font-weight: 600;
+             border: 1px solid rgba(91,140,255,.24); }
+  .bt-chip p { margin: 0; }
+  .bt-chip-ok   { background: rgba(34,197,94,.14);  color: #86efac; border-color: rgba(34,197,94,.26); }
+  .bt-chip-warn { background: rgba(245,158,11,.14); color: #fcd34d; border-color: rgba(245,158,11,.26); }
+  .bt-seg .q-btn { border-radius: 8px; font-size: 11.5px; min-height: 30px; }
+
+  /* ------------------------------------------------------------------- table */
+  .bt-shots { background: transparent; }
+  .bt-shots tbody tr { height: 46px; }
+  .bt-shots tbody td { font-size: 12.5px; color: #ccd6e6; border-bottom: 1px solid rgba(148,168,204,.06); }
+  .bt-shots tbody tr:nth-child(even) { background: rgba(148,168,204,.025); }
+  .bt-shots tbody tr:hover { background: rgba(91,140,255,.09); }
+  .bt-shots tbody tr.selected { background: rgba(91,140,255,.15) !important;
+             box-shadow: inset 3px 0 0 var(--bt-accent); }
+  .bt-shots .q-badge { border-radius: 6px; font-weight: 800; letter-spacing: .05em;
+             padding: 3px 7px; min-width: 22px; justify-content: center; font-size: 10px; }
+  .bt-badge-off { opacity: .22; background: transparent !important;
+                  box-shadow: inset 0 0 0 1px rgba(148,168,204,.18); }
   /* Shots table: virtual-scrolled so a 300-shot show puts ~20 rows in the DOM, not 300.
-     Quasar needs the scroll container height-bounded, and the header pinned over it. */
+     Quasar needs the scroll container height-bounded, and the header pinned over it.
+     The sticky/z-index/top declarations here are load-bearing — never split them into a
+     second rule that could omit one. */
   .bt-shots .q-table__middle { max-height: 58vh; }
-  .bt-shots thead tr th { position: sticky; top: 0; z-index: 2; background: #141924; }
+  .bt-shots thead tr th { position: sticky; top: 0; z-index: 2; background: #101623;
+             font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+             font-weight: 800; color: var(--bt-dim); height: 40px;
+             border-bottom: 1px solid var(--bt-line-hi); }
+
+  /* --------------------------------------------------------- behind the scenes */
+  .bt-think { background: #070b12; border: 1px solid var(--bt-line); border-radius: 12px;
+              font-family: ui-monospace,"Cascadia Mono",Consolas,monospace; font-size: 12px;
+              line-height: 1.55; color: #a7b6cd; padding: 10px 12px; }
+  .bt-now  { background: linear-gradient(120deg,rgba(91,140,255,.16),rgba(139,92,246,.09) 60%,transparent),
+             var(--bt-raised); border: 1px solid rgba(91,140,255,.26); }
+  .bt-aicard { background: #101623; border: 1px solid var(--bt-line); border-radius: 12px;
+             border-left: 3px solid var(--bt-accent); }
+  .bt-kv   { font-size: 12.5px; color: #c6d2e4; line-height: 1.6; }
+  .bt-kv b { color: #9dbaff; font-weight: 700; }
+  .bt-pass { background: #070b12; border-left: 2px solid rgba(91,140,255,.55);
+             border-radius: 0 8px 8px 0; padding: 8px 12px; font-size: 12px;
+             color: #a7b6cd; white-space: pre-wrap;
+             font-family: ui-monospace,"Cascadia Mono",Consolas,monospace; }
+
+  /* ----------------------------------------------------------------- dialogs */
+  .bt-editor { width: 820px; max-width: 94vw; background: var(--bt-surface);
+               border-radius: var(--bt-r-lg); border: 1px solid var(--bt-line); }
+  .bt-paste  { width: 540px; max-width: 94vw; background: var(--bt-surface);
+               border-radius: var(--bt-r-lg); border: 1px solid var(--bt-line); }
 </style>
 """)
 
@@ -1611,7 +2029,7 @@ with ui.column().classes("w-full gap-3 p-3"):
     bar.visible = False
 
     # ---- Run bar: one-click pipeline, then the same stages individually ----
-    with ui.card().classes("w-full bt-card"):
+    with ui.card().classes("w-full bt-card bt-runbar"):
         with ui.row().classes("w-full items-center no-wrap gap-2"):
             btn_pipe = ui.button("Run Pipeline", icon="play_arrow", on_click=start_pipeline, color="primary"
                                  ).props("unelevated no-caps").classes("bt-run")
@@ -1635,112 +2053,147 @@ with ui.column().classes("w-full gap-3 p-3"):
             btn_track = ui.button("3 · Track", icon="my_location", on_click=start_track
                                   ).props("outline no-caps").classes("bt-step")
 
-    # ---- Shots table ----
-    with ui.card().classes("w-full bt-card"):
-        with ui.row().classes("w-full items-center justify-between no-wrap gap-3"):
-            with ui.column().classes("gap-0"):
-                ui.label("Shots").classes("bt-section")
-                ui.label("tick to include · click a row to edit · A/M/T = analysed, masked, tracked · trash clears them"
-                         ).classes("bt-hint")
-            lbl_selcount = ui.markdown("No shots yet — set **Shows Root**, load shows, then pick a **Show**."
-                                       ).classes("bt-chip")
-            ed_pick = ui.select([], label="Edit shot", with_input=True).props("dense outlined").classes("w-64")
-            ed_pick.on_value_change(on_pick_edit)
+    # ---- Two views: the shot list, and everything the bot is thinking behind it ----
+    with ui.tabs().classes("bt-tabs") as main_tabs:
+        tab_shots = ui.tab("Shots", icon="grid_view")
+        tab_think = ui.tab("Behind the scenes", icon="psychology")
+    # animated=False: the slide transition needs overflow:hidden, which is exactly what the
+    # CSS above removes so the shots card can't be clipped. It also removes the transient
+    # zero-height mid-transition that makes the table's virtual-scroll probe miscount rows.
+    with ui.tab_panels(main_tabs, value=tab_shots, animated=False).classes("w-full bt-panel"):
+        with ui.tab_panel(tab_shots).classes("q-pa-none"):
+            # ---- Shots table ----
+            with ui.card().classes("w-full bt-card"):
+                with ui.row().classes("w-full items-center justify-between no-wrap gap-3"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("Shots").classes("bt-section")
+                        ui.label("tick to include · click a row to edit · A/M/T = analysed, masked, tracked · trash clears them"
+                                 ).classes("bt-hint")
+                    lbl_selcount = ui.markdown("No shots yet — set **Shows Root**, load shows, then pick a **Show**."
+                                               ).classes("bt-chip")
+                    ed_pick = ui.select([], label="Edit shot", with_input=True).props("dense outlined").classes("w-64")
+                    ed_pick.on_value_change(on_pick_edit)
 
-        # ---- Bulk selection + status filter (the 100+ shot workflow) ----
-        with ui.row().classes("w-full items-center no-wrap gap-2 q-mb-xs"):
-            ui.button("Select all matching", icon="done_all", on_click=select_all_matching
-                      ).props("outline dense no-caps"
-                              ).tooltip("Ticks every shot currently listed — status chip, shot-number box and search box combined.")
-            ui.button("None", icon="remove_done", on_click=select_none
-                      ).props("outline dense no-caps").tooltip("Unticks every shot in the show.")
-            ui.button("Invert", icon="swap_horiz", on_click=select_invert
-                      ).props("outline dense no-caps").tooltip("Flips the tick on every matching shot.")
-            ui.button("Paste list", icon="content_paste", on_click=lambda: paste_dlg.open()
-                      ).props("outline dense no-caps"
-                              ).tooltip("Paste a production shot list to tick them all at once.")
-            ui.separator().props("vertical").classes("bt-vsep")
-            ui.toggle(STATUS_CHIPS, value="All", on_change=on_status_chip
-                      ).props("dense no-caps unelevated toggle-color=primary size=sm"
-                              ).tooltip("Narrow the list. 'Selected' shows only the shots you have ticked — "
-                                        "use it to review a selection before running. Unticking a shot while "
-                                        "on 'Selected' leaves the row in place until the list next rebuilds "
-                                        "(click the chip again to re-apply), so the list can't jump under your "
-                                        "cursor mid-click.")
+                # ---- Bulk selection + status filter (the 100+ shot workflow) ----
+                with ui.row().classes("w-full items-center no-wrap gap-2 q-mb-xs"):
+                    ui.button("Select all matching", icon="done_all", on_click=select_all_matching
+                              ).props("outline dense no-caps"
+                                      ).tooltip("Ticks every shot currently listed — status chip, shot-number box and search box combined.")
+                    ui.button("None", icon="remove_done", on_click=select_none
+                              ).props("outline dense no-caps").tooltip("Unticks every shot in the show.")
+                    ui.button("Invert", icon="swap_horiz", on_click=select_invert
+                              ).props("outline dense no-caps").tooltip("Flips the tick on every matching shot.")
+                    ui.button("Paste list", icon="content_paste", on_click=lambda: paste_dlg.open()
+                              ).props("outline dense no-caps"
+                                      ).tooltip("Paste a production shot list to tick them all at once.")
+                    ui.separator().props("vertical").classes("bt-vsep")
+                    ui.toggle(STATUS_CHIPS, value="All", on_change=on_status_chip
+                              ).classes("bt-seg").props("dense no-caps unelevated toggle-color=primary size=sm"
+                                      ).tooltip("Narrow the list. 'Selected' shows only the shots you have ticked — "
+                                                "use it to review a selection before running. Unticking a shot while "
+                                                "on 'Selected' leaves the row in place until the list next rebuilds "
+                                                "(click the chip again to re-apply), so the list can't jump under your "
+                                                "cursor mid-click.")
 
-        table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple",
-                         pagination={"rowsPerPage": 0}
-                         ).props("flat dense virtual-scroll hide-bottom").classes("w-full bt-shots")
-        table.on("selection", on_selection_change)
-        table.on("rowClick", on_row_click)
-        # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
-        # editor via rowClick; emits the row up to the Python handler.
-        table.add_slot("body-cell-clear", r'''
-          <q-td :props="props" auto-width>
-            <q-btn dense flat round color="grey-6" icon="delete_outline"
-                   @click.stop="() => $parent.$emit('clearmem', props.row)">
-              <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
-            </q-btn>
-          </q-td>
-        ''')
-        table.on("clearmem", lambda e: on_clear_mem(e.args))
-        # Progress badges. Read from each shot's OWN folder at scan time, so they are the
-        # same on any workstation pointed at the share. Dim = not done yet.
-        table.add_slot("body-cell-status", r'''
-          <q-td :props="props" auto-width>
-            <div class="row no-wrap items-center q-gutter-xs">
-              <q-badge :color="props.row.st_a ? 'info' : 'grey-9'"
-                       :class="props.row.st_a ? '' : 'bt-badge-off'">A
-                <q-tooltip>{{ props.row.st_a ? 'Analyzed' : 'Not analyzed yet' }}</q-tooltip>
-              </q-badge>
-              <q-badge :color="props.row.st_m ? 'secondary' : 'grey-9'"
-                       :class="props.row.st_m ? '' : 'bt-badge-off'">M
-                <q-tooltip>{{ props.row.st_m ? 'Masks generated' : 'No masks yet' }}</q-tooltip>
-              </q-badge>
-              <q-badge :color="props.row.st_t ? 'positive' : 'grey-9'"
-                       :class="props.row.st_t ? '' : 'bt-badge-off'">T
-                <q-tooltip>{{ props.row.st_t ? 'Tracked' : 'Not tracked yet' }}</q-tooltip>
-              </q-badge>
-            </div>
-          </q-td>
-        ''')
-        # Per-shot plate-version dropdown. Emits {name, version} up to Python, which
-        # re-resolves that shot's plate_dir. @click.stop so it doesn't open the editor.
-        table.add_slot("body-cell-version", r'''
-          <q-td :props="props" auto-width @click.stop>
-            <q-select dense options-dense borderless
-                      v-model="props.row.version" :options="props.row.versions"
-                      @update:model-value="(val) => $parent.$emit('pickversion', {name: props.row.name, version: val})"
-                      style="min-width:88px">
-              <template v-slot:no-option>
-                <q-item><q-item-section class="text-grey">no versions</q-item-section></q-item>
-              </template>
-            </q-select>
-          </q-td>
-        ''')
-        table.on("pickversion", lambda e: on_pick_version(e.args))
+                table = ui.table(columns=TABLE_COLS, rows=[], row_key="name", selection="multiple",
+                                 pagination={"rowsPerPage": 0}
+                                 ).props("flat dense virtual-scroll hide-bottom").classes("w-full bt-shots")
+                table.on("selection", on_selection_change)
+                table.on("rowClick", on_row_click)
+                # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
+                # editor via rowClick; emits the row up to the Python handler.
+                table.add_slot("body-cell-clear", r'''
+                  <q-td :props="props" auto-width>
+                    <q-btn dense flat round color="grey-6" icon="delete_outline"
+                           @click.stop="() => $parent.$emit('clearmem', props.row)">
+                      <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
+                    </q-btn>
+                  </q-td>
+                ''')
+                table.on("clearmem", lambda e: on_clear_mem(e.args))
+                # Progress badges. Read from each shot's OWN folder at scan time, so they are the
+                # same on any workstation pointed at the share. Dim = not done yet.
+                table.add_slot("body-cell-status", r'''
+                  <q-td :props="props" auto-width>
+                    <div class="row no-wrap items-center q-gutter-xs">
+                      <q-badge :color="props.row.st_a ? 'info' : 'grey-9'"
+                               :class="props.row.st_a ? '' : 'bt-badge-off'">A
+                        <q-tooltip>{{ props.row.st_a ? 'Analyzed' : 'Not analyzed yet' }}</q-tooltip>
+                      </q-badge>
+                      <q-badge :color="props.row.st_m ? 'secondary' : 'grey-9'"
+                               :class="props.row.st_m ? '' : 'bt-badge-off'">M
+                        <q-tooltip>{{ props.row.st_m ? 'Masks generated' : 'No masks yet' }}</q-tooltip>
+                      </q-badge>
+                      <q-badge :color="props.row.st_t ? 'positive' : 'grey-9'"
+                               :class="props.row.st_t ? '' : 'bt-badge-off'">T
+                        <q-tooltip>{{ props.row.st_t ? 'Tracked' : 'Not tracked yet' }}</q-tooltip>
+                      </q-badge>
+                    </div>
+                  </q-td>
+                ''')
+                # Per-shot plate-version dropdown. Emits {name, version} up to Python, which
+                # re-resolves that shot's plate_dir. @click.stop so it doesn't open the editor.
+                table.add_slot("body-cell-version", r'''
+                  <q-td :props="props" auto-width @click.stop>
+                    <q-select dense options-dense borderless
+                              v-model="props.row.version" :options="props.row.versions"
+                              @update:model-value="(val) => $parent.$emit('pickversion', {name: props.row.name, version: val})"
+                              style="min-width:88px">
+                      <template v-slot:no-option>
+                        <q-item><q-item-section class="text-grey">no versions</q-item-section></q-item>
+                      </template>
+                    </q-select>
+                  </q-td>
+                ''')
+                table.on("pickversion", lambda e: on_pick_version(e.args))
+        with ui.tab_panel(tab_think).classes("q-pa-none"):
+            # ---- What the AI is doing right now ----
+            with ui.card().classes("w-full bt-card bt-now"):
+                ui.label("Now").classes("bt-section")
+                lbl_now = ui.markdown("Idle — nothing analysing.").classes("bt-kv")
 
-    # ---- Paste shot list (dialog; the "Paste list" button opens it) ----
-    with ui.dialog() as paste_dlg, ui.card().classes("bt-paste"):
-        ui.markdown("#### 📋 Paste a shot list").classes("q-mb-none")
-        ui.label("One per line, or comma/space separated. Matched case-insensitively; "
-                 "anything not in this show is reported back.").classes("bt-hint")
-        paste_box = ui.textarea(placeholder="ABC_0010\nABC_0020\nABC_0030"
-                                ).props("outlined autogrow input-style=min-height:180px").classes("w-full")
-        with ui.row().classes("w-full justify-end no-wrap gap-2"):
-            ui.button("Cancel", on_click=paste_dlg.close).props("flat no-caps")
+            # ---- Qwen per-pass stream ----
+            # Fed from poll()'s SINGLE queue drain (a second consumer would steal messages
+            # from the activity log below); see _qwen_line / _ai_track.
+            with ui.card().classes("w-full bt-card"):
+                ui.label("Qwen · live reasoning").classes("bt-section")
+                ui.label("Each shot runs three vision passes: scene → things → matchmove. "
+                         "This is the model working, as it happens.").classes("bt-hint")
+                qwen_view = ui.log(max_lines=400).classes("w-full h-56 bt-think")
 
-            def _apply_paste():
-                apply_pasted_list(paste_box.value or "")
-                paste_dlg.close()
+            # ---- Per-shot decisions, read back from the guide the bot already writes ----
+            with ui.card().classes("w-full bt-card"):
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    with ui.column().classes("gap-0"):
+                        ui.label("Why each shot was masked this way").classes("bt-section")
+                        ui.label("Read from mask_guidance.json — the same file the Mask stage "
+                                 "obeys, so this is the decision, not a summary of it."
+                                 ).classes("bt-hint")
+                    ui.button("Reload", icon="refresh", on_click=refresh_ai_cards
+                              ).props("outline dense no-caps")
+                ai_cards = ui.column().classes("w-full gap-2")
 
-            ui.button("Tick these shots", icon="done_all", on_click=_apply_paste,
-                      color="primary").props("unelevated no-caps")
+            # ---- Full activity log: every stage, not just Analyze ----
+            with ui.card().classes("w-full bt-card"):
+                with ui.expansion("Full activity log", icon="article", value=True).classes("w-full"):
+                    log_view = ui.log(max_lines=400).classes("w-full h-80 bt-think")
 
-    # ---- Logs ----
-    with ui.card().classes("w-full bt-card"):
-        with ui.expansion("Logs", icon="article", value=True).classes("w-full"):
-            log_view = ui.log(max_lines=400).classes("w-full h-64")
+# ---- Paste shot list (dialog; the "Paste list" button opens it) ----
+with ui.dialog() as paste_dlg, ui.card().classes("bt-paste"):
+    ui.markdown("#### 📋 Paste a shot list").classes("q-mb-none")
+    ui.label("One per line, or comma/space separated. Matched case-insensitively; "
+             "anything not in this show is reported back.").classes("bt-hint")
+    paste_box = ui.textarea(placeholder="ABC_0010\nABC_0020\nABC_0030"
+                            ).props("outlined autogrow input-style=min-height:180px").classes("w-full")
+    with ui.row().classes("w-full justify-end no-wrap gap-2"):
+        ui.button("Cancel", on_click=paste_dlg.close).props("flat no-caps")
+
+        def _apply_paste():
+            apply_pasted_list(paste_box.value or "")
+            paste_dlg.close()
+
+        ui.button("Tick these shots", icon="done_all", on_click=_apply_paste,
+                  color="primary").props("unelevated no-caps")
 
 # ---------- SHOT EDITOR (dialog; load_editor() calls editor.open()) ----------
 with ui.dialog() as editor, ui.card().classes("bt-editor"):
@@ -1796,6 +2249,15 @@ with ui.dialog() as editor, ui.card().classes("bt-editor"):
         with ui.row().classes("gap-2"):
             ui.button("Close", on_click=editor.close).props("flat")
             ui.button("Save shot settings", icon="save", on_click=save_shot, color="primary")
+
+# Populate the Behind-the-scenes tab from whatever analysis is already on disk, so it has
+# content on a cold start instead of only after a run. Must come AFTER every widget above
+# (ai_cards / lbl_now) and BEFORE the timer, which is the first thing to touch them.
+try:
+    refresh_ai_cards()
+    refresh_now_strip()
+except Exception as _ex:      # a bad guide on disk must never stop the app from starting
+    print(f"initial AI panel build: {_ex}")
 
 ui.timer(1.0, poll)
 

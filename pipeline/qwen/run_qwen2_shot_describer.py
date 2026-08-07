@@ -211,6 +211,19 @@ def run_batch(in_dir: str, out_dir: str, fps: int, use_int4: bool, log_cb=None, 
                 log("FAILED:")
                 log(str(e))
 
+            # The model's own words, and the numbers behind the camera label. Both are
+            # thrown away by the parsers that consume them, so this is the only record --
+            # and on a FAILED shot it is the only evidence of what the model actually said.
+            # New keys only: the loader and bridge.py read by name, so nothing downstream
+            # sees a difference. Never allowed to break a run.
+            try:
+                item["raw_passes"] = list(getattr(describer, "_raw_passes", []) or [])
+                cam_stats = dict(getattr(describer, "_cam_stats", {}) or {})
+                if cam_stats:
+                    item["cam_stats"] = cam_stats
+            except Exception:
+                pass
+
             payload["shots"].append(item)
             _atomic_write_json(out_json, payload)
 
