@@ -222,6 +222,30 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
     leaving the offset in would put a visible step at the junction, which is the one artefact
     this must not introduce. The offset is constant, so the track's SHAPE -- the only thing a
     solve reads -- is untouched.
+
+    FUSION (`fuse_passes`, off by default). The above is a JOIN: it uses the donor only where
+    the primary has no point, and drops the donor's opinion everywhere they overlap. That
+    throws away real information. The four passes are four INDEPENDENT estimates of the same
+    physical feature, so where two of them agree, averaging them cuts the random component --
+    and it cuts the systematic one too, because a causal tracker's error grows with distance
+    from its own query frame and FWD and BWD accumulate that error from opposite ends.
+
+    Averaged how: each estimate is weighted 1/(1 + age/tau), age being frames since the pass
+    seeded THAT track (its last frame for the backward passes, its first for the forward
+    ones). This is the accumulation model from ProTracker's probabilistic integration --
+    variance grows along the chain, so an estimate 200 frames from its seed is worth less than
+    one 5 frames from its seed. Weights accumulate across donors, so a 4-way agreement is a
+    true 4-way weighted mean rather than three pairwise blends.
+
+    (ProTracker also carries a correlation coefficient to stop N correlated estimates being
+    counted as N independent ones. That term corrects the fused VARIANCE, not the fused mean,
+    and nothing downstream of here reads a variance -- so it is deliberately not implemented
+    rather than added as a knob that does nothing.)
+
+    Fusion is also what makes a same-length partner worth merging at all. Without it, a donor
+    covering exactly the frames the primary already covers "adds nothing" and is skipped here,
+    then quietly deleted by select_spread as a duplicate -- which is the most common shape of
+    a FWD/BWD pair on a feature visible all shot, i.e. precisely the pair worth averaging.
     """
     def _log(m):
         if log:
@@ -235,6 +259,29 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
     max_sep = float(getattr(cfg, "stitch_max_sep_px", 1.5) or 1.5)
     min_overlap = int(getattr(cfg, "stitch_min_overlap", 4) or 4)
     max_gap = int(getattr(cfg, "stitch_max_gap", 2) or 2)
+    fuse = bool(getattr(cfg, "fuse_passes", False))
+    tau = float(getattr(cfg, "fuse_age_tau", 30.0) or 30.0)
+    # A fused frame needs more agreement than a joined one. A join only ever writes where the
+    # primary is silent, so a marginal partner costs coverage at worst; a fuse MOVES points
+    # the primary already had, so a partner sitting 1.4px away on a neighbouring feature would
+    # drag every shared frame toward it.
+    fuse_max_sep = float(getattr(cfg, "fuse_max_sep_px", 0.75) or 0.75)
+
+    def _seed_frame(idx: int, pmap: Dict[int, Tuple[float, float]]) -> int:
+        """Frame this track was QUERIED on -- the origin its error grows from.
+
+        The backward passes are seeded at the end of the block and tracked in reverse, so in
+        absolute frame numbers their query is their LAST frame. Getting this backwards would
+        weight every estimate by exactly the wrong end of its own drift.
+        """
+        p = str(candidates[idx].get("pass") or candidates[idx].get("id") or "").upper()
+        fs = sorted(pmap)
+        if not fs:
+            return 0
+        return fs[-1] if (p.startswith("BWD") or p.startswith("MID_B")) else fs[0]
+
+    def _w(f: int, seed: int) -> float:
+        return 1.0 / (1.0 + abs(int(f) - int(seed)) / max(1e-6, tau))
 
     # Index every candidate by frame so partners are found by POSITION at a shared frame.
     # Bucketing by lifetime-mean position would not work here: the whole point is that these
@@ -252,6 +299,8 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
         for i in range(len(candidates))
     }
     n_merged = 0
+    n_fused = 0
+    wsum_by_idx: Dict[int, Dict[int, float]] = {}   # primary idx -> per-frame accumulated weight
 
     def _velocity(pmap: Dict[int, Tuple[float, float]], f0: int, back: bool) -> Optional[Tuple[float, float]]:
         fs = sorted(pmap)
@@ -295,12 +344,15 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
                 if 0 < jf[0] - pf[-1] <= max_gap or 0 < pf[0] - jf[-1] <= max_gap:
                     seen[j] = 0
 
-            best_j, best_shift = None, None
+            best_j, best_shift, best_fuse = None, None, False
             for j in sorted(seen, key=lambda k: -seen[k]):
                 don = pts_by_idx[j]
                 shared = sorted(set(prim) & set(don))
                 new_frames = [f for f in don if f not in prim]
-                if not new_frames:
+                # Without fusion a same-coverage donor is dead weight. With it, that donor IS
+                # the payload: a second independent estimate of every frame the primary has.
+                can_fuse = fuse and len(shared) >= min_overlap
+                if not new_frames and not can_fuse:
                     continue                      # adds nothing, so nothing to gain
                 if len(shared) >= min_overlap:
                     dx = [prim[f][0] - don[f][0] for f in shared]
@@ -318,6 +370,12 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
                     if resid > max_sep * 0.5:
                         continue
                     shift = (mx, my)
+                    # Fuse only where the two really are the same point. `sep` is the raw
+                    # separation, before the offset is removed -- a partner further away than
+                    # this is joinable (its shape agrees) but not averageable.
+                    can_fuse = can_fuse and sep <= fuse_max_sep
+                    if not new_frames and not can_fuse:
+                        continue
                 elif shared:
                     continue                      # overlapping but too briefly to judge
                 else:
@@ -343,16 +401,38 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
                     if math.hypot(px - tgt[0], py - tgt[1]) > max_sep:
                         continue
                     shift = (px - tgt[0], py - tgt[1])
-                best_j, best_shift = j, shift
+                    can_fuse = False              # no shared frames: nothing to average
+                best_j, best_shift, best_fuse = j, shift, can_fuse
                 break
 
             if best_j is None:
                 continue
             don = pts_by_idx[best_j]
             sx, sy = best_shift
-            for f, (x, y) in don.items():
-                if f not in prim:                 # primary's own points always win
-                    prim[f] = (x + sx, y + sy)
+            if best_fuse:
+                # Accumulated weighted mean, so N donors give one N-way average rather than
+                # N pairwise blends -- absorbing a second donor must not halve the first.
+                if pi not in wsum_by_idx:
+                    sp = _seed_frame(pi, prim)
+                    wsum_by_idx[pi] = {f: _w(f, sp) for f in prim}
+                wsum = wsum_by_idx[pi]
+                sd = _seed_frame(best_j, don)
+                for f, (x, y) in don.items():
+                    if f not in prim:
+                        prim[f] = (x + sx, y + sy)
+                        wsum[f] = _w(f, sd)
+                        continue
+                    wd = _w(f, sd)
+                    w0 = wsum.get(f, 1.0)
+                    tot = w0 + wd
+                    prim[f] = ((prim[f][0] * w0 + (x + sx) * wd) / tot,
+                               (prim[f][1] * w0 + (y + sy) * wd) / tot)
+                    wsum[f] = tot
+                n_fused += 1
+            else:
+                for f, (x, y) in don.items():
+                    if f not in prim:             # primary's own points always win
+                        prim[f] = (x + sx, y + sy)
             merged_into[best_j] = pi
             n_merged += 1
             grew = True
@@ -372,7 +452,8 @@ def stitch_passes(candidates: List[dict], T: int, diag: float, cfg,
                     "mean": (st.mean([p[1] for p in pts]), st.mean([p[2] for p in pts])),
                     "score": score_track(pts, T, diag, cfg)})
     _log(f"  stitch: joined {n_merged} partial track(s) onto {len(out)} feature(s) "
-         f"({len(candidates)} -> {len(out)} candidates)")
+         f"({len(candidates)} -> {len(out)} candidates)"
+         + (f"; {n_fused} averaged across passes (tau={tau:g}f)" if n_fused else ""))
     return out
 
 

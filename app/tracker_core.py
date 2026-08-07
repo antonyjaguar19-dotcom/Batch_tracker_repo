@@ -125,6 +125,17 @@ class RunnerConfig:
     stitch_max_sep_px: float = 1.5   # two features do not sit this close for this long
     stitch_min_overlap: int = 4      # shared frames needed to trust the pairing
     stitch_max_gap: int = 2          # or join across at most this many missing frames
+    # Average agreeing passes instead of picking one. Stitching JOINS -- it uses a donor only
+    # where the primary is silent -- so where two passes both saw the feature, one opinion is
+    # discarded and select_spread later deletes the donor as a duplicate. Those are four
+    # independent estimates of the same point, and FWD/BWD accumulate their drift from
+    # opposite ends of the shot, so averaging cancels part of it rather than picking a side.
+    # Weighted 1/(1 + age/fuse_age_tau) by each estimate's distance from its OWN query frame
+    # (ProTracker's variance-along-the-chain model). OFF until measured: it moves points the
+    # primary already had, which nothing in stitch has ever done.
+    fuse_passes: bool = False
+    fuse_age_tau: float = 30.0       # frames at which an estimate is worth half a fresh one
+    fuse_max_sep_px: float = 0.75    # tighter than stitch_max_sep_px: averaging needs SAME point
 
     # --- Quality-ranked, evenly-spread track selection (post-pass) ---
     # Collapses the 4x pass duplication, scores each surviving track on its OWN
@@ -1164,6 +1175,10 @@ class BatchTrackerRunner:
                         "pts": valid_pts,
                         "mean": (sx / n, sy / n),
                         "score": self._track_quality_score(valid_pts, T, diag),
+                        # Which pass produced this. stitch_passes needs it to know which END
+                        # of the track was the query frame: the backward passes are seeded at
+                        # the block's last frame, so their error grows toward frame 0.
+                        "pass": p_name,
                     })
                     if self.registry.enabled and j < len(pass_seeds):
                         feat, kind = pass_seeds[j]
