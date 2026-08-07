@@ -1830,6 +1830,17 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                      on_change=lambda e: setattr(state, "use_sam3_matte", bool(e.value)))
                 sw_matte.tooltip("Feed SAM3 per-frame masks into SynthEyes so trackers avoid masked regions. Off = track full frame.")
 
+                sw_seref = ui.switch("Sub-pixel pattern refine on SynthEyes tracks",
+                                     value=getattr(state, "refine_syntheyes", False),
+                                     on_change=lambda e: setattr(state, "refine_syntheyes", bool(e.value)))
+                sw_seref.tooltip("Run the same native-resolution NCC/ECC pattern lock over the finished "
+                                 "SynthEyes export that the TAPNext path already gets, then gate on the "
+                                 "certainty and seed-identity it measures. Against ground truth on raw "
+                                 "tracker input it pulls the median to ~0.11px. Two costs: it is the slow "
+                                 "stage (tens of minutes on a 4K shot), and it DROPS tracks that never "
+                                 "lock, so the delivered count changes. Leave off unless you have compared "
+                                 "a refined and an unrefined export on your own plate.")
+
                 sw_3de = ui.switch("Auto-create .3de project", value=state.auto_3de,
                                    on_change=lambda e: setattr(state, "auto_3de", bool(e.value)))
                 sw_3de.tooltip("After export, build a 3DEqualizer .3de project from the 2D tracks. Needs the 3DE4 exe below.")
@@ -2039,6 +2050,15 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                     sw_refine.tooltip("After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
                                       "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
                                       "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
+                    sw_pyr = ui.switch("Coarse-to-fine NCC search (speed)",
+                                       value=getattr(state, "refine_pyramid", False),
+                                       on_change=lambda e: setattr(state, "refine_pyramid", bool(e.value)))
+                    sw_pyr.tooltip("Find the pattern at half resolution first, then re-match at full "
+                                   "resolution around it. Returns the SAME position — measured 0.0000px "
+                                   "median difference — so this is a speed setting, not an accuracy one. "
+                                   "Only runs when the search box has grown past 48px (fast-moving points); "
+                                   "below that it measured slower, so it stays off there. ~1.4x on the "
+                                   "frames it does run.")
                     ui.label("Pattern box (px · odd)")
                     refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
                     refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))

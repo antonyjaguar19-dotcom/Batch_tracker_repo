@@ -1376,6 +1376,9 @@ class AppState:
     # has a single pass). Off until measured on real footage.
     fuse_passes: bool = False
     fuse_age_tau: float = 30.0
+    # Coarse-to-fine NCC in pattern_refine. Output-identical to the single-level search
+    # (0.0000px median difference), so this is purely speed; see RunnerConfig.refine_pyramid.
+    refine_pyramid: bool = False
     # Run the SAME native-res NCC/ECC pattern refine over the SynthEyes export.
     #
     # Every accuracy pass above is TAPNext-only, because it lives in tracker_core's per-point
@@ -1649,6 +1652,7 @@ def _refine_exported_tracks(txt_path: str, state, plate_path: str, width: int = 
             refine_iterations=int(getattr(state, "refine_iterations", 3) or 1),
             min_corner_anisotropy=float(getattr(state, "min_corner_anisotropy", 0.08) or 0.0),
             min_track_certainty=float(getattr(state, "min_track_certainty", 0.0) or 0.0),
+            refine_pyramid=bool(getattr(state, "refine_pyramid", False)),
             auto_tune=bool(getattr(state, "auto_tune", True)),
             auto_tune_overrides=dict(getattr(state, "auto_tune_overrides", {}) or {}),
             quality_flags=list(quality_flags or []),
@@ -2635,6 +2639,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 # default is the only value it could ever have.
                 fuse_passes=bool(getattr(state, "fuse_passes", False)),
                 fuse_age_tau=float(getattr(state, "fuse_age_tau", 30.0) or 30.0),
+                refine_pyramid=bool(getattr(state, "refine_pyramid", False)),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()
