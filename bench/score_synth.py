@@ -18,6 +18,9 @@ as the same-named number in `refs/gt4k/baseline.json`. Two are computed here ins
   first_step   error on the first frame after the seed -- the divergence introduced by one
                step, with no anchor-picking heuristic needed because the seed IS the anchor.
 
+One more is reported separately, over the pooled samples rather than per track -- see
+`lock_report` below for what it is and why the per-track columns cannot show it.
+
 WHAT THIS CANNOT SEE, stated because a metric that cannot fail is worse than no metric:
 ground truth is anchored on each track's OWN seed, so shifting an entire export by a
 constant leaves every column unchanged (verified by injecting +1px in x). That is not a gap
@@ -193,8 +196,149 @@ def score_run(shot_dir: str, bot_path: str, min_aniso: float, seed_count: int,
             "fast": r.get("fast_ratio", float("nan")),
             "slow": r.get("slow_ratio", float("nan")),
             "jerk": r.get("jerk_ratio", float("nan")),
+            # Signed, per-axis, for the pooled peak-locking test. Kept off the printed columns
+            # and out of the CSV: one track's 100 samples say nothing on their own.
+            "_lock": _lock_samples(pts, ref, common[1:]),
         }
     return results
+
+
+# --------------------------------------------------------------------------------------
+# Peak locking
+# --------------------------------------------------------------------------------------
+# Everything above is a DISTANCE, so it cannot tell a random 0.1px from a 0.1px that always
+# points the same way relative to the pixel grid. The second one is peak locking: sub-pixel
+# estimators built on a curve fit through discrete samples, and patches resampled with a
+# bilinear kernel, both pull their answer toward whole pixels. It is a systematic error, so
+# it does not average out over a shot the way noise does -- it is a fixed pattern that rides
+# on top of the true motion, which on a slow move is exactly the wobble an artist sees.
+#
+# The test is standard in PIV/DIC and needs no extra ground truth, only the phase (fractional
+# part) of the true position:
+#
+#   * pull toward the integer means the signed error is negative just above an integer and
+#     positive just below the next one -- a sawtooth in phase, whose first harmonic is
+#     -sin(2*pi*phase). Its coefficient IS the amplitude, in pixels.
+#   * a constant offset of the whole export is orthogonal to that harmonic, so this number
+#     survives the anchoring blind spot documented at the top of this file.
+#   * with no locking the coefficient is 0 and the exported positions' own phases are
+#     uniform. Both are printed, because a non-flat GT phase would invalidate the second.
+#
+# Scale: the number is the amplitude of the best-fit sinusoid, so a tracker that snapped
+# every estimate to the nearest whole pixel reads 1/pi = 0.318px, and one pulled a fraction
+# k of the way there reads k/pi. `--selfcheck` proves that on constructed input, along with
+# the two things this must NOT react to: a constant shift of the whole export, and a linear
+# drift. Both are real errors and both belong to other columns; a locking number that moved
+# on them would be measuring the plate's motion instead of the estimator (see bench/README).
+#
+# MEASURED 2026-08, and the reason this column now mostly reads as a regression guard rather
+# than a lead: there is no locking to fix. Across lab01/02/03 the amplitude is -0.004 to
+# +0.008px, roughly 40x below the smallest per-track error on the same runs (0.04px), and
+# lab01's `shift1` run -- a real +1px injection -- reads -0.0016 against its base's -0.0018,
+# confirming the shift-invariance on real output and not just on constructed input.
+#
+# So the log-quadratic peak fit (pattern_refine._subpix_peak) and getRectSubPix's bilinear
+# patch sampling are NOT biasing toward whole pixels here. Replacing that bilinear sampling
+# with bicubic/B-spline -- which the DIC literature recommends, and which was the reason this
+# column was written -- was dropped on this evidence rather than on taste. Re-read the number
+# before re-opening it; a change that introduces locking will show up here first.
+_LOCK_BINS = 12
+
+
+def _lock_samples(pts: Track, ref: Track, frames: List[int]) -> np.ndarray:
+    """(M,3) rows of [gt_phase, signed_err, bot_phase], x and y pooled as separate rows."""
+    if not frames:
+        return np.zeros((0, 3), dtype=np.float64)
+    out = np.empty((2 * len(frames), 3), dtype=np.float64)
+    for i, f in enumerate(frames):
+        for ax in (0, 1):
+            g, b = ref[f][ax], pts[f][ax]
+            out[2 * i + ax] = (g - math.floor(g), b - g, b - math.floor(b))
+    return out
+
+
+def _lock_amp(gt_phase: np.ndarray, err: np.ndarray) -> float:
+    """First-harmonic coefficient of signed error against GT phase, in pixels.
+
+    Fitted rather than binned, so the answer does not depend on a bin count, and orthogonal
+    to a constant by construction -- which is what makes it immune to a whole-export shift.
+    """
+    return -2.0 * float(np.mean(err * np.sin(2.0 * math.pi * gt_phase)))
+
+
+def lock_report(res: Dict[str, dict], base: Optional[Dict[str, dict]] = None) -> None:
+    """Print the pooled locking amplitude, a phase histogram, and the GT-phase control."""
+    def measure(r: Dict[str, dict]):
+        rows = [x["_lock"] for x in r.values() if x.get("_lock") is not None and len(x["_lock"])]
+        if not rows:
+            return None
+        s = np.concatenate(rows, axis=0)
+        gt_ph, err, bot_ph = s[:, 0], s[:, 1], s[:, 2]
+        amp = _lock_amp(gt_ph, err)
+        hist = np.bincount((bot_ph * _LOCK_BINS).astype(np.int64) % _LOCK_BINS,
+                           minlength=_LOCK_BINS).astype(np.float64)
+        ctrl = np.bincount((gt_ph * _LOCK_BINS).astype(np.int64) % _LOCK_BINS,
+                           minlength=_LOCK_BINS).astype(np.float64)
+        return amp, hist / max(1.0, hist.mean()), ctrl / max(1.0, ctrl.mean()), len(s)
+
+    now = measure(res)
+    if now is None:
+        return
+    amp, hist, ctrl, n = now
+    was = measure(base) if base else None
+    bamp = was[0] if was else None
+
+    print(f"\npeak locking   amplitude {amp:+.4f}px" + (f"{_delta(amp, bamp)}" if bamp is not None
+                                                        else "") + f"   ({n} samples, x+y pooled)")
+    print("               positive = estimates pulled toward whole pixels; 0 = none")
+
+    def bar(v: float) -> str:
+        return "#" * int(round(max(0.0, min(2.0, v)) * 20))
+    print("\n  exported-position phase        (flat = clean)      GT phase (control, must be flat)")
+    for i in range(_LOCK_BINS):
+        lo = i / _LOCK_BINS
+        print(f"   {lo:4.2f}  {hist[i]:5.2f} {bar(hist[i]):<40} {ctrl[i]:5.2f} {bar(ctrl[i])}")
+    spread = float(ctrl.max() - ctrl.min())
+    if spread > 0.35:
+        print(f"  !! GT phase is not uniform (spread {spread:.2f}); the left histogram is not "
+              f"readable on this shot -- trust the amplitude, not the bars.")
+
+
+def lock_selfcheck() -> int:
+    """Feed the locking measure constructed input and check it reports the known answer.
+
+    Returns a process exit code. Run it after touching _lock_amp or _lock_samples: a metric
+    that has not been shown to fail on input designed to break it is not evidence.
+    """
+    rng = np.random.default_rng(0)
+    n = 200_000
+    gt = rng.uniform(0.0, 200.0, n)
+    ph = gt - np.floor(gt)
+    snap = np.round(gt) - gt                 # displacement of a full snap to the whole pixel
+
+    cases = [
+        ("clean (no error)",            np.zeros(n),                        0.0),
+        ("gaussian noise 0.3px",        rng.normal(0.0, 0.3, n),            0.0),
+        ("lock 25% to whole px",        0.25 * snap,                        0.25 / math.pi),
+        ("lock 100% to whole px",       1.00 * snap,                        1.00 / math.pi),
+        ("anti-lock 50% (to half px)",  -0.50 * snap,                       -0.50 / math.pi),
+        ("constant shift +1.00px",      np.full(n, 1.00),                   0.0),
+        ("constant shift +0.37px",      np.full(n, 0.37),                   0.0),
+        ("linear drift 0 -> 3px",       np.linspace(0.0, 3.0, n),           0.0),
+        ("lock 50% + shift 0.37px",     0.50 * snap + 0.37,                 0.50 / math.pi),
+    ]
+    print("peak-locking self-check (tolerance 0.005px)\n")
+    bad = 0
+    for label, err, want in cases:
+        got = _lock_amp(ph, err)
+        ok = abs(got - want) <= 0.005
+        bad += 0 if ok else 1
+        print(f"  {'ok ' if ok else 'BAD'}  {label:<28} got {got:+.5f}   want {want:+.5f}")
+    if bad:
+        print(f"\n{bad} case(s) wrong -- the locking column is not trustworthy.")
+    else:
+        print("\nAll cases pass: reacts to locking, ignores a constant shift and a drift.")
+    return 1 if bad else 0
 
 
 def _agg(rows: List[dict], key: str) -> float:
@@ -260,6 +404,8 @@ def report(res: Dict[str, dict], base: Optional[Dict[str, dict]] = None) -> None
 
 
 def main() -> None:
+    if "--selfcheck" in sys.argv:
+        sys.exit(lock_selfcheck())
     ap = argparse.ArgumentParser()
     ap.add_argument("shot", help="bench shot folder")
     ap.add_argument("--run", default="base", help="run tag under <shot>/runs/")
@@ -269,6 +415,8 @@ def main() -> None:
     ap.add_argument("--quality", type=float, default=0.02)
     ap.add_argument("--min-dist", type=int, default=12)
     ap.add_argument("--csv", default=None, help="write per-track rows here")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="skip the pooled peak-locking report")
     a = ap.parse_args()
 
     shot = os.path.basename(os.path.normpath(a.shot))
@@ -282,6 +430,8 @@ def main() -> None:
                          a.quality, a.min_dist)
     print(f"run '{a.run}'" + (f" vs baseline '{a.baseline}'" if a.baseline else ""))
     report(res, base)
+    if not a.no_lock:
+        lock_report(res, base)
 
     if a.csv:
         with open(a.csv, "w", encoding="utf-8", newline="") as f:
