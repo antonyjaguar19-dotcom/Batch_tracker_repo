@@ -1371,6 +1371,11 @@ class AppState:
     spread_max_starts_per_window: int = 0   # cap tracks STARTING together; 0 = unlimited
     match_ambiguity_ratio: float = 0.90     # reject a match a rival peak nearly ties; 1 = off
     refine_search_max: int = 64             # ceiling for the adaptive NCC search radius
+    # Average passes that agree instead of keeping one and deleting the rest. See
+    # RunnerConfig.fuse_passes / track_filter.stitch_passes. TAPNext backend only (SynthEyes
+    # has a single pass). Off until measured on real footage.
+    fuse_passes: bool = False
+    fuse_age_tau: float = 30.0
     # Run the SAME native-res NCC/ECC pattern refine over the SynthEyes export.
     #
     # Every accuracy pass above is TAPNext-only, because it lives in tracker_core's per-point
@@ -2625,6 +2630,11 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 spread_max_starts_per_window=int(getattr(state, "spread_max_starts_per_window", 0) or 0),
                 match_ambiguity_ratio=float(getattr(state, "match_ambiguity_ratio", 0.90) or 1.0),
                 refine_search_max=int(getattr(state, "refine_search_max", 64) or 24),
+                # Cross-pass averaging. Reachable from AppState so bench/run_bench.py --set
+                # can A/B it against the same binary; without this line the RunnerConfig
+                # default is the only value it could ever have.
+                fuse_passes=bool(getattr(state, "fuse_passes", False)),
+                fuse_age_tau=float(getattr(state, "fuse_age_tau", 30.0) or 30.0),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()

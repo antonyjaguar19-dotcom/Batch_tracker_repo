@@ -131,8 +131,26 @@ class RunnerConfig:
     # independent estimates of the same point, and FWD/BWD accumulate their drift from
     # opposite ends of the shot, so averaging cancels part of it rather than picking a side.
     # Weighted 1/(1 + age/fuse_age_tau) by each estimate's distance from its OWN query frame
-    # (ProTracker's variance-along-the-chain model). OFF until measured: it moves points the
-    # primary already had, which nothing in stitch has ever done.
+    # (ProTracker's variance-along-the-chain model).
+    #
+    # MEASURED 2026-08 and REJECTED. The arithmetic is right -- tools/check_fusion.py shows
+    # 0.2729 -> 0.1559px against truth on constructed passes, beating an unweighted mean --
+    # and it still does not help this pipeline:
+    #
+    #     shot     median      p90          worst track      fused
+    #     lab02    0.10 =    0.53 -> 0.45   1.03 -> 2.66px    309 tracks
+    #     lab03    0.04 =    0.06 =         0.09 -> 0.41px    215 tracks
+    #
+    # No median gain on either, and the WORST track -- the number a batch is judged by, see
+    # bench/score_synth.py -- got worse on both. Two independent shots agreeing is why this
+    # is a verdict and not noise. (lab02 also showed a 10x peak-locking spike that lab03 did
+    # not reproduce; that was the single 2.66px mistrack, not a systematic bias.)
+    #
+    # The likely cause, for anyone revisiting: this runs BEFORE refine, so it averages two
+    # COARSE 256px-guide estimates and hands pattern_refine a start point that can sit
+    # between two features rather than on either. Fusing AFTER refine -- where the estimates
+    # are already native-res and certainty is known per track -- is a different design and
+    # the one worth trying. Do not simply re-enable this flag.
     fuse_passes: bool = False
     fuse_age_tau: float = 30.0       # frames at which an estimate is worth half a fresh one
     fuse_max_sep_px: float = 0.75    # tighter than stitch_max_sep_px: averaging needs SAME point
