@@ -58,7 +58,6 @@ TABLE_COLS = [
     {"name": "scale", "label": "Scale", "field": "scale", "align": "left"},
     {"name": "range", "label": "Range / Frames", "field": "range", "align": "left"},
     {"name": "metrics", "label": "Track Metrics", "field": "metrics", "align": "left"},
-    {"name": "clear", "label": "", "field": "clear", "align": "right"},
 ]
 
 _suppress_select = False  # guard so programmatic selection doesn't re-trigger handlers
@@ -410,47 +409,50 @@ def _reset_shot_analysis(d):
     d.notes = ""
 
 
-def on_clear_mem(row):
-    """Per-shot clear: pick which of Analysis / Masks / Tracks to remove, then delete them
-    from BOTH the local work dir and the shot's own studio folder.
+async def on_clear_selected():
+    """Clear the BOT'S OWN work for every ticked shot: the analysis, the SAM3 masks and the
+    exported tracks it generated, in the local work dir and in each shot's bot_tracks
+    folder. Plates are never touched — clear_shot_artifacts only ever reaches
+    <work>/<shot>/masks*, <work>/<shot>__*.txt and <studio>/{analysis,masks,*_2Dtracks*}.
 
-    TEMP DIAGNOSTIC (remove once the dead-click report is resolved): prints what actually
-    arrives from the Vue slot. Silence here means the emit never reached Python.
+    This lives on the toolbar rather than as a per-row trash icon because event bindings
+    inside ui.table add_slot templates do not fire on this build: a six-way probe (parent
+    $emit, emitEvent, window.emitEvent, native span, native button, with and without
+    .stop) had all six dead, while emitEvent called directly from run_javascript fired
+    immediately. An ordinary ui.button uses the event path that works.
 
-    The studio copies are what make the badges read 'done' (here and on any other
-    workstation), so clearing a badge has to remove them too. Scopes are independent
-    because masks are the expensive stage — redoing a track shouldn't cost a SAM3 re-run.
+    The studio copies are what make the badges read 'done' here and on any other
+    workstation, so clearing a badge has to remove them too. Scopes stay independent
+    because masks are by far the most expensive stage to rebuild.
     """
-    print(f"[clearmem] event arrived: type={type(row).__name__} value={row!r}")
-    if isinstance(row, list):
-        row = row[0] if row else None
-    name = (row or {}).get("name") if isinstance(row, dict) else None
-    if not name or name not in state.shots_data:
-        print(f"[clearmem] REJECTED: name={name!r} known={name in state.shots_data if name else False}")
+    names = [n for n, d in state.shots_data.items() if getattr(d, "use", False)]
+    if not names:
+        ui.notify("Tick the shots you want to clear first.", type="warning")
         return
-    d = state.shots_data[name]
-    has_a, has_m, has_t = _is_analyzed(d), _is_masked(d), _is_tracked(d)
-    if not (has_a or has_m or has_t):
-        ui.notify(f"{name} has nothing to clear yet.", type="info")
+    any_a = any(_is_analyzed(state.shots_data[n]) for n in names)
+    any_m = any(_is_masked(state.shots_data[n]) for n in names)
+    any_t = any(_is_tracked(state.shots_data[n]) for n in names)
+    if not (any_a or any_m or any_t):
+        ui.notify("None of the ticked shots have bot work to clear yet.", type="info")
         return
-    studio = getattr(d, "studio_dir", "") or ""
 
     dlg = ui.dialog()
     with dlg, ui.card().classes("bt-paste"):
-        ui.markdown(f"**Clear work for `{name}`?**")
-        # Pre-tick only what exists; disable the rest so the dialog states the shot's state.
-        cb_a = ui.checkbox("Analysis — scope, prompts, Qwen result", value=has_a)
-        cb_m = ui.checkbox("Masks — SAM3 mask frames", value=has_m)
-        cb_t = ui.checkbox("Tracks — exported 2D track files", value=has_t)
-        for cb, present in ((cb_a, has_a), (cb_m, has_m), (cb_t, has_t)):
+        ui.markdown(f"**Clear bot work for {len(names)} ticked shot(s)?**")
+        ui.label(", ".join(sorted(names)[:12]) + (" …" if len(names) > 12 else "")
+                 ).classes("bt-hint")
+        # Pre-tick only what at least one ticked shot actually has.
+        cb_a = ui.checkbox("Analysis — scope, prompts, Qwen result", value=any_a)
+        cb_m = ui.checkbox("Masks — SAM3 mask frames", value=any_m)
+        cb_t = ui.checkbox("Tracks — exported 2D track files", value=any_t)
+        for cb, present in ((cb_a, any_a), (cb_m, any_m), (cb_t, any_t)):
             if not present:
                 cb.disable()
         cb_m.tooltip("Masks are the slowest stage to regenerate — untick to keep them "
                      "and only redo tracking.")
-        if studio:
-            ui.label(f"Deletes from the shot's own folder: {studio}").classes("bt-hint")
-        ui.label("This also removes the local working copies. It cannot be undone.").classes(
-            "text-caption text-orange")
+        ui.label("Removes only what the bot generated, from the work dir and each shot's "
+                 "bot_tracks folder. Your plates are not touched.").classes("bt-hint")
+        ui.label("This cannot be undone.").classes("text-caption text-orange")
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
 
@@ -460,22 +462,40 @@ def on_clear_mem(row):
                     ui.notify("Nothing ticked.", type="info")
                     return
                 dlg.close()
-                # Deletions touch the network share -> keep them off the event loop.
-                counts = await run.io_bound(be.clear_shot_artifacts, out_dir.value, studio,
-                                            name, analysis=a, masks=m, tracks=t)
-                if a:
-                    _reset_shot_analysis(d)
-                    d.has_analysis = False
-                    if isinstance(getattr(state, "manual_notes", None), dict):
-                        state.manual_notes.pop(name, None)
-                if m:
-                    d.has_masks = False
-                if t:
-                    d.has_tracks = False
-                    d.track_metrics_summary = ""
+                work = out_dir.value
+
+                def _clear_all():
+                    """One io_bound hop for the whole batch: these deletions reach the
+                    share, and a round trip per shot would stall the event loop."""
+                    tot = {"analysis": 0, "masks": 0, "tracks": 0}
+                    for n in names:
+                        d = state.shots_data.get(n)
+                        c = be.clear_shot_artifacts(
+                            work, getattr(d, "studio_dir", "") or "", n,
+                            analysis=a, masks=m, tracks=t) or {}
+                        for k in tot:
+                            tot[k] += int(c.get(k, 0) or 0)
+                    return tot
+
+                counts = await run.io_bound(_clear_all)
+                for n in names:
+                    d = state.shots_data.get(n)
+                    if not d:
+                        continue
+                    if a:
+                        _reset_shot_analysis(d)
+                        d.has_analysis = False
+                        if isinstance(getattr(state, "manual_notes", None), dict):
+                            state.manual_notes.pop(n, None)
+                    if m:
+                        d.has_masks = False
+                    if t:
+                        d.has_tracks = False
+                        d.track_metrics_summary = ""
                 refresh_table()
                 done = ", ".join(f"{k} {v}" for k, v in (counts or {}).items() if v)
-                ui.notify(f"Cleared {name}" + (f" · removed {done} file(s)" if done else ""),
+                ui.notify(f"Cleared {len(names)} shot(s)"
+                          + (f" · removed {done} file(s)" if done else " · nothing to remove"),
                           type="warning")
 
             ui.button("Clear", on_click=_do, color="negative")
@@ -2072,7 +2092,8 @@ with ui.column().classes("w-full gap-3 p-3"):
                 with ui.row().classes("w-full items-center justify-between no-wrap gap-3"):
                     with ui.column().classes("gap-0"):
                         ui.label("Shots").classes("bt-section")
-                        ui.label("tick to include · click a row to edit · A/M/T = analysed, masked, tracked · trash clears them"
+                        ui.label("tick to include · click a row to edit · A/M/T = analysed, masked, tracked · "
+                         "Clear memory wipes the bot's work for the ticked shots"
                                  ).classes("bt-hint")
                     lbl_selcount = ui.markdown("No shots yet — set **Shows Root**, load shows, then pick a **Show**."
                                                ).classes("bt-chip")
@@ -2091,6 +2112,13 @@ with ui.column().classes("w-full gap-3 p-3"):
                     ui.button("Paste list", icon="content_paste", on_click=lambda: paste_dlg.open()
                               ).props("outline dense no-caps"
                                       ).tooltip("Paste a production shot list to tick them all at once.")
+                    ui.button("Clear memory", icon="delete_sweep", on_click=on_clear_selected
+                              ).props("outline dense no-caps color=orange"
+                                      ).tooltip("Delete the BOT'S work for the ticked shots — its analysis, "
+                                                "SAM3 masks and exported tracks — from the work dir and each "
+                                                "shot's bot_tracks folder, so those stages re-run from scratch. "
+                                                "Your plates are never touched. Pick which of the three to "
+                                                "remove in the dialog.")
                     ui.separator().props("vertical").classes("bt-vsep")
                     ui.toggle(STATUS_CHIPS, value="All", on_change=on_status_chip
                               ).classes("bt-seg").props("dense no-caps unelevated toggle-color=primary size=sm"
@@ -2107,21 +2135,13 @@ with ui.column().classes("w-full gap-3 p-3"):
                 table.on("rowClick", on_row_click)
                 # Per-shot "clear memory" button (right end). @click.stop so it doesn't also open the
                 # editor via rowClick; emits the row up to the Python handler.
-                # The click lives on a NATIVE <span>, not on the q-btn. `@click.stop` on a
-                # Quasar component binds to its custom `click` emit, where the .stop modifier
-                # is not the plain DOM one -- on a real element both the handler and .stop
-                # behave unambiguously.
-                table.add_slot("body-cell-clear", r'''
-                  <q-td :props="props" auto-width>
-                    <span @click.stop="$parent.$emit('clearmem', props.row)"
-                          style="display:inline-flex;cursor:pointer">
-                      <q-btn dense flat round color="grey-5" icon="delete_outline">
-                        <q-tooltip>Clear this shot's analysis / masks / tracks</q-tooltip>
-                      </q-btn>
-                    </span>
-                  </q-td>
-                ''')
-                table.on("clearmem", lambda e: on_clear_mem(e.args))
+                # NO per-row clear button here. Event bindings inside add_slot templates do
+                # not fire on this build -- six variants were probed (parent $emit,
+                # emitEvent, window.emitEvent, native span, native button, with and without
+                # .stop) and all six were dead, while emitEvent called straight from
+                # run_javascript fired at once. A dead trash icon is worse than no icon, so
+                # the action lives on the toolbar as an ordinary button (on_clear_selected).
+                # The same defect silently disables the version dropdown slot below.
                 # Progress badges. Read from each shot's OWN folder at scan time, so they are the
                 # same on any workstation pointed at the share. Dim = not done yet.
                 table.add_slot("body-cell-status", r'''
