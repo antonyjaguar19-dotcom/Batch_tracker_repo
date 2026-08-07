@@ -363,9 +363,83 @@ def _peak_is_ambiguous(resp: np.ndarray, maxloc: Tuple[int, int], maxv: float,
     return float(masked.max()) >= ratio * float(maxv)
 
 
+# Below this search radius the pyramid is SLOWER, measured (tools/check_pyramid.py sweep,
+# ms per match, RTX A4000 host, band-limited synthetic):
+#
+#     half\search      24      32      48      64
+#         10        0.77x   1.04x   1.16x   1.59x
+#         15        0.85x   0.84x   0.99x   1.42x
+#         20        0.81x   0.79x   1.31x   1.43x
+#         25        1.03x   0.85x   1.26x   1.43x
+#
+# The op count says ~13x fewer multiply-accumulates; the clock says otherwise, because at
+# these window sizes two cv2.resize calls plus a second matchTemplate setup cost more than
+# the arithmetic they save. So this fires only where it is never slower. Raising it from 24
+# to 48 on those numbers, not on the theory.
+_PYR_MIN_SEARCH = 48
+# Pyramid on/off for this refine call. A module stash rather than a `pyramid=` argument
+# threaded through ten call sites, matching what _LAST_FLATNESS / _CERTAINTY already do here
+# and for the same reason; refine_tracks sets it from cfg and runs single-threaded.
+_PYR_ON: Dict[str, bool] = {"v": False}
+# Full-res re-search window around the coarse peak. Must be wide enough for TWO things that
+# would otherwise silently degrade: halving loses up to 1px so the coarse answer can be ~2px
+# off, and _peak_flatness reads a ring out to radius 5 -- a tighter pad would make certainty
+# mean something different on the pyramid path than on the single-level one, and certainty
+# feeds a gate.
+_PYR_PAD = 6
+
+
+def _ncc_match_pyramid(win: np.ndarray, patch: np.ndarray, half: int, ambiguity_ratio: float):
+    """Coarse-to-fine NCC inside an already-cropped search window.
+
+    Returns (top_left_x, top_left_y, dx, dy, cc, flatness) in `win` coordinates, or None when
+    the coarse level cannot decide and the caller should do the plain single-level search.
+
+    Why: `_adaptive_search` grows the radius with the point's speed up to refine_search_max
+    (64), and matchTemplate cost is quadratic in it -- but the bigger problem is that a wide
+    box admits more rival peaks, which is what `match_ambiguity_ratio` then rejects the frame
+    over. Searching at half resolution first shrinks the response 4x and, because a
+    half-resolution rival has to survive being blurred to still tie, resolves most of them.
+
+    The ambiguity test stays at the COARSE level deliberately. That is the level whose
+    response spans the whole search box, so it is the only one where a distant rival is
+    visible at all; running it on the small fine window would suppress the entire response
+    and quietly report "never ambiguous".
+    """
+    Ph = 2 * half + 1
+    hw, ww = win.shape[:2]
+    if hw < 2 * Ph or ww < 2 * Ph:
+        return None                       # too small to be worth halving
+    w_small = cv2.resize(win, (ww // 2, hw // 2), interpolation=cv2.INTER_AREA)
+    p_small = cv2.resize(patch, (Ph // 2, Ph // 2), interpolation=cv2.INTER_AREA)
+    if (w_small.shape[0] < p_small.shape[0] or w_small.shape[1] < p_small.shape[1]
+            or p_small.shape[0] < 3):
+        return None
+    resp_c = cv2.matchTemplate(w_small, p_small, cv2.TM_CCOEFF_NORMED)
+    _, cmax, _, cloc = cv2.minMaxLoc(resp_c)
+    # half is halved too: the suppression radius is in the coarse level's own pixels.
+    if _peak_is_ambiguous(resp_c, cloc, float(cmax), ambiguity_ratio, max(2, half // 2)):
+        return None
+
+    # Fine pass: full resolution, a small box around where the coarse level pointed.
+    gx, gy = cloc[0] * 2, cloc[1] * 2
+    fx0 = max(0, min(ww - Ph, gx - _PYR_PAD))
+    fy0 = max(0, min(hw - Ph, gy - _PYR_PAD))
+    fx1 = min(ww, fx0 + Ph + 2 * _PYR_PAD)
+    fy1 = min(hw, fy0 + Ph + 2 * _PYR_PAD)
+    sub = win[fy0:fy1, fx0:fx1]
+    if sub.shape[0] < Ph or sub.shape[1] < Ph:
+        return None
+    resp_f = cv2.matchTemplate(sub, patch, cv2.TM_CCOEFF_NORMED)
+    _, fmax, _, floc = cv2.minMaxLoc(resp_f)
+    dx, dy = _subpix_peak(resp_f, floc)
+    flat = _peak_flatness(resp_f, floc, float(fmax))
+    return (fx0 + floc[0], fy0 + floc[1], dx, dy, float(fmax), float(flat))
+
+
 def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
                search: int, half: int, edge_clamp: bool = False,
-               ambiguity_ratio: float = 1.0
+               ambiguity_ratio: float = 1.0, pyramid: Optional[bool] = None
                ) -> Optional[Tuple[float, float, float]]:
     """NCC template match of `patch` in a search box around (cx,cy). -> (x,y,cc).
 
@@ -398,6 +472,16 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
         win = gray[y0:y1, x0:x1]
         if win.shape[0] < P or win.shape[1] < P:   # window smaller than the patch -> can't match
             return None
+    if (_PYR_ON["v"] if pyramid is None else pyramid) and search >= _PYR_MIN_SEARCH:
+        got = _ncc_match_pyramid(win, patch, half, float(ambiguity_ratio))
+        if got is not None:
+            tlx, tly, dx, dy, maxv, flat = got
+            _LAST_FLATNESS["v"] = flat
+            return (float(x0 + tlx + dx + half), float(y0 + tly + dy + half), float(maxv))
+        # Coarse level could not decide, or the window was too small to halve. Fall through
+        # to the single-level search rather than returning None: a rival that ties at half
+        # resolution is often separable at full resolution, so giving up here would lose
+        # frames the non-pyramid path keeps.
     resp = cv2.matchTemplate(win, patch, cv2.TM_CCOEFF_NORMED)
     _, maxv, _, maxloc = cv2.minMaxLoc(resp)
     if _peak_is_ambiguous(resp, maxloc, float(maxv), float(ambiguity_ratio), half):
@@ -1156,6 +1240,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     """
     if not final_tracks:
         return final_tracks, "no tracks to refine"
+    _PYR_ON["v"] = bool(getattr(cfg, "refine_pyramid", False))
     flip = bool(cfg.flip_y_for_3de) and H0 > 0
 
     def to_img(t: Track) -> Track:

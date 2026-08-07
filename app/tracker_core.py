@@ -259,6 +259,14 @@ class RunnerConfig:
     # feature falls OUTSIDE the box, so NCC returns the best match inside it -- the wrong
     # place -- and the point slides. Too large and rival peaks creep in. Grow the radius only
     # as fast as the point actually moves; cost is quadratic in radius, so it is capped.
+    # Coarse-to-fine NCC: match at half resolution over the whole adaptive search box, then
+    # re-match at full resolution in a small window around that. Cost is quadratic in the
+    # search radius, and the radius grows with point speed up to refine_search_max -- but the
+    # real target is rival peaks, which is what match_ambiguity_ratio rejects whole frames
+    # over. A rival has to survive being blurred to still tie at half resolution. Falls back
+    # to the single-level search whenever the coarse level cannot decide, so it can lose
+    # speed but not frames. OFF until measured.
+    refine_pyramid: bool = False
     refine_search_max: int = 64      # ceiling; == refine_search_px disables adaptation
     refine_search_speed_k: float = 1.5   # px of extra radius per px/frame of local speed
     # Distinctiveness test. Repetitive detail -- bolts, rivets, window grids, tiles -- gives
