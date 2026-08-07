@@ -1371,6 +1371,37 @@ class AppState:
     spread_max_starts_per_window: int = 0   # cap tracks STARTING together; 0 = unlimited
     match_ambiguity_ratio: float = 0.90     # reject a match a rival peak nearly ties; 1 = off
     refine_search_max: int = 64             # ceiling for the adaptive NCC search radius
+    # Run the SAME native-res NCC/ECC pattern refine over the SynthEyes export.
+    #
+    # Every accuracy pass above is TAPNext-only, because it lives in tracker_core's per-point
+    # loop and SynthEyes blips and peels internally. But `pattern_refine.refine_tracks` does
+    # not need that loop: it takes finished tracks, a plate and a config, which is exactly
+    # what a SynthEyes export is. So the measured gains (4.88 -> 1.30px against 17 manual 4K
+    # tracks) were reaching only the FALLBACK backend while the default one shipped raw.
+    #
+    # Measured on bench/synth/lab02 against exact ground truth, feeding it the errors a raw
+    # correlation tracker makes (self-anchored scoring, i.e. bench/score_synth's model):
+    #
+    #     raw input                     median          p90
+    #     jitter 0.3px             0.505 -> 0.108   0.554 -> 0.658
+    #     jitter 0.3 + drift 1.5   0.917 -> 0.107   1.140 -> 0.713
+    #     jitter 0.6 + drift 3.0   1.835 -> 0.124   2.281 -> 0.757
+    #
+    # It converges the median to ~0.11px on this plate whatever it is handed, which is the
+    # point: it re-localises against the plate rather than tidying the input. Two things the
+    # table also says, and neither is a detail:
+    #   * the TAIL barely moves, and on already-clean input it gets slightly WORSE. ~0.11px
+    #     is a floor, not a guarantee, so refining a track that is already better than that
+    #     costs accuracy. (Feeding it a finished TAPNext export -- 0.06px -- measured as a
+    #     clear regression. That is double-refining, not a bug.)
+    #   * it cannot fix WHERE a track was seeded. The template comes from the track's own
+    #     reported position, so a seed 1px off its corner stays 1px off; what refine fixes is
+    #     everything after the anchor.
+    #
+    # Still off by default: that is a synthetic plate and synthetic input. The gate for
+    # turning it on is a real SynthEyes export, refined vs unrefined on the same shot, via
+    # tools/eval_refs.py and tools/verify_against_lk.py.
+    refine_syntheyes: bool = False
     # --- Tracking backend selection + SynthEyes settings ---
     track_backend: str = "syntheyes"   # "syntheyes" (default) | "tapnext" (fallback)
     syntheyes_exe: str = field(default_factory=lambda: os.environ.get("BTR_SYNTHEYES_EXE", ""))
@@ -1543,6 +1574,140 @@ def _fmt_pct(x: float) -> str:
     try: return f"{max(0.0, min(1.0, x)) * 100.0:.1f}%"
     except Exception: return "0.0%"
 def _safe_div(a: float, b: float) -> float: return a / b if b else 0.0
+
+def _refine_exported_tracks(txt_path: str, state, plate_path: str, width: int = 0,
+                            height: int = 0, quality_flags=None) -> int:
+    """Native-res NCC/ECC pattern-refine an exported 3DE track file, in place.
+
+    The accuracy stack (moving-tile, pattern-refine, the certainty and identity gates) grew
+    inside tracker_core's per-point loop, so it only ever ran on TAPNext -- the FALLBACK
+    backend. SynthEyes, which is the default and therefore what actually ships, got the
+    track_filter selection and nothing else. `pattern_refine.refine_tracks` never needed that
+    loop though: it takes finished tracks, a plate and a config, and a SynthEyes export is
+    exactly that. This is the whole port.
+
+    Two things differ from the TAPNext call and both are load-bearing:
+
+      * Y CONVENTION. tracker_core exports 3DE-flipped y (bottom-left origin) and hands
+        refine `flip_y_for_3de=True` so it can un-flip. The Sizzle export writes
+        `0.5*(1-v)*height`, which is ALREADY image space (top-left origin), so it must pass
+        False. Flipping twice does not fail loudly -- it silently refines every point
+        against the mirrored part of the plate, so nothing locks and the whole shot comes
+        back empty or worse.
+      * MOVING-TILE IS NOT PORTED. It re-runs TAPNext inside the tile, which would load the
+        torch stack and take the GPU back while SynthEyes still holds it.
+
+    Returns the track count after refining, or -1 if nothing was done (caller keeps its own).
+    Best-effort throughout, for the same reason as the SAM3 post-filter and the track filter:
+    the export is the expensive part of a SynthEyes run and must survive a failure here.
+    """
+    if not bool(getattr(state, "refine_syntheyes", False)):
+        return -1
+    try:
+        from app.pattern_refine import refine_tracks
+        from app.export_3de import write_tracks_txt
+        from app.video_io import FrameSource, estimate_clip_bytes
+        from app import track_filter as _tf
+        from app.tracker_core import RunnerConfig as _RC     # torch import; CUDA stays lazy
+    except Exception as e:
+        logger(f"  pattern-refine unavailable ({e}); leaving the SynthEyes export as tracked")
+        return -1
+    if not plate_path or not os.path.exists(plate_path):
+        logger(f"  pattern-refine skipped: plate not readable ({plate_path or 'unset'})")
+        return -1
+    try:
+        end_frame, tracks = _parse_tracks_txt(txt_path)
+        if not tracks:
+            return -1
+
+        cfg = _RC(
+            # Required by RunnerConfig, unread by refine_tracks: nothing here drives the
+            # tracker, only the refine parameters below.
+            input_dir=os.path.dirname(txt_path), output_dir=os.path.dirname(txt_path),
+            # SynthEyes coords are already image-space -- see the docstring. This one line is
+            # the difference between a refine and a mirror.
+            flip_y_for_3de=False,
+            enable_pattern_refine=True,
+            refine_patch_px=int(getattr(state, "refine_patch_px", 31) or 31),
+            refine_ecc_polish=bool(getattr(state, "refine_ecc_polish", True)),
+            refine_ncc_reref=float(getattr(state, "refine_ncc_reref", 0.68) or 0.68),
+            refine_ncc_hold=float(getattr(state, "refine_ncc_hold", 0.45) or 0.45),
+            refine_ncc_reacquire=float(getattr(state, "refine_ncc_reacquire", 0.75) or 0.75),
+            refine_bandpass=float(getattr(state, "refine_bandpass", 0.0) or 0.0),
+            refine_fb_max_px=float(getattr(state, "refine_fb_max_px", 1.5) or 0.0),
+            refine_drift_floor=float(getattr(state, "refine_drift_floor", 0.55) or 0.0),
+            refine_gap_aware=bool(getattr(state, "gap_aware_refine", True)),
+            refine_search_max=int(getattr(state, "refine_search_max", 64) or 24),
+            reacquire_max_gap=int(getattr(state, "reacquire_max_gap", 24) or 0),
+            match_ambiguity_ratio=float(getattr(state, "match_ambiguity_ratio", 0.90) or 1.0),
+            template_frames=int(getattr(state, "template_frames", 5) or 1),
+            refine_iterations=int(getattr(state, "refine_iterations", 3) or 1),
+            min_corner_anisotropy=float(getattr(state, "min_corner_anisotropy", 0.08) or 0.0),
+            min_track_certainty=float(getattr(state, "min_track_certainty", 0.0) or 0.0),
+            auto_tune=bool(getattr(state, "auto_tune", True)),
+            auto_tune_overrides=dict(getattr(state, "auto_tune_overrides", {}) or {}),
+            quality_flags=list(quality_flags or []),
+        )
+
+        # Hold the plate whole when it fits, stream it when it does not. FrameSource -- not
+        # pattern_refine's own _FrameGray -- because an image SEQUENCE is the normal SynthEyes
+        # input and _FrameGray's streaming path goes through cv2.VideoCapture, which cannot
+        # open a directory of EXRs.
+        stream = False
+        try:
+            import psutil  # type: ignore
+            need = int(estimate_clip_bytes(plate_path, 1.0))
+            stream = need > int(psutil.virtual_memory().available * 0.5)
+        except Exception:
+            stream = False
+        src = FrameSource(plate_path, scale=1.0, stream=stream)
+        total = int(src.total or 0) or int(end_frame or 0)
+        W0 = int(width or src.w0 or 0)
+        H0 = int(height or src.h0 or 0)
+
+        # Same per-shot measurement the TAPNext runner does (tracker_core._auto_tune): the
+        # refine parameters that matter most here -- pattern box size and band-pass -- are
+        # exactly the ones shot_profile derives, and a soft plate wants both different.
+        if cfg.auto_tune:
+            try:
+                from app import shot_profile as _sp
+                prof = _sp.profile_shot(src.get(0, min(6, max(2, total))),
+                                        flags=list(cfg.quality_flags or []))
+                for k, v in _sp.tune(prof, overrides=dict(cfg.auto_tune_overrides)).items():
+                    if hasattr(cfg, k):
+                        setattr(cfg, k, v)
+                logger(f"  auto-tune: {prof.describe()}")
+            except Exception as e:
+                logger(f"  auto-tune skipped ({e}); refining with the configured values")
+
+        logger(f"  Pattern-refine (SynthEyes): {len(tracks)} track(s) at {W0}x{H0}"
+               f"{' [streamed]' if stream else ''}")
+        refined, info = refine_tracks(tracks, plate_path, W0, H0, total, cfg,
+                                      status=lambda m: logger(f"  {m}"), bgr_source=src)
+        if not refined:
+            logger("  pattern-refine kept nothing; leaving the export as tracked")
+            return -1
+
+        # The two gates that need refine's measurements and so could never run here before.
+        # identity_gate is the only test in the repo that catches a track which drifted
+        # SMOOTHLY off its feature -- the failure an artist finds last and hates most.
+        before = len(refined)
+        refined = _tf.identity_gate(refined, getattr(refine_tracks, "last_identity", {}) or {},
+                                    cfg, log=logger)
+        refined = _tf.certainty_gate(refined, getattr(refine_tracks, "last_certainty", {}) or {},
+                                     cfg, log=logger)
+        if not refined:
+            logger("  refine gates kept nothing; leaving the export as tracked")
+            return -1
+
+        write_tracks_txt(txt_path, refined, end_frame=int(end_frame or total))
+        logger(f"  pattern-refine: {len(tracks)} -> {before} refined -> {len(refined)} kept "
+               f"({info})")
+        return len(refined)
+    except Exception as e:
+        logger(f"  pattern-refine failed ({e}); leaving the SynthEyes export as tracked")
+        return -1
+
 
 def _filter_exported_tracks(txt_path: str, state, width: int = 0, height: int = 0,
                             n_frames: int = 0, fallback: int = 0) -> int:
@@ -2643,6 +2808,21 @@ def _track_shots_syntheyes(in_root, out_root, shot_tasks_map, state, seed_count)
                     # shot used to report success AND publish an empty .txt over a previously
                     # good one; now it is a failure and goes to the TAPNext retry pass.
                     if n_trk > 0:
+                        # Sub-pixel first, selection second. Refine changes the positions the
+                        # scores are computed from, and it is what produces the certainty and
+                        # identity numbers -- so running the filter first would grade tracks
+                        # on measurements the refine is about to replace.
+                        _ref = _refine_exported_tracks(
+                            os.path.join(str(out_root), out_base), state,
+                            # dirname(first_frame), not shot_dir: that is the exact folder
+                            # SynthEyes read, so refine indexes the same frames the export
+                            # numbers refer to. shot_dir can hold more than one version, and
+                            # FrameSource would rediscover the sequence its own way.
+                            plate_path=(movie_path or os.path.dirname(str(first_frame))),
+                            width=int(img_w or 0), height=int(img_h or 0),
+                            quality_flags=list(getattr(data, "quality_flags", []) or []))
+                        if _ref > 0:
+                            n_trk = _ref
                         # Same solve-ready selection the TAPNext path runs. Without it
                         # SynthEyes exported everything it tracked (800 on the 'Normal'
                         # preset) and the cleanup landed on the artist -- and since
