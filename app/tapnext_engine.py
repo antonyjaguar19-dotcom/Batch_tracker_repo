@@ -182,6 +182,52 @@ class TapNextEngine:
                   f"running 256-trained weights at {self.img}px")
         return out
 
+    def _autocast(self):
+        """Half-precision inference, unless BTR_TAPNEXT_FP32=1.
+
+        The tile model is the dominant cost of a 4K run: moving_tile_refine re-runs it per
+        track per window, which on SH016 was 9.3 of an 18 min pipeline. Two things it is NOT,
+        both measured before this was written:
+
+          * launch-bound. Batching tiles gives nothing -- per-track cost is flat at ~1.2s
+            whether B is 1, 4 or 16, i.e. a single 256px stream already saturates the GPU.
+          * cheap to pack differently. The win has to come from less work per frame.
+
+        fp16 autocast, 16-frame tile, measured on an RTX A4000:
+
+            fp32     1337.1 ms   (reference)
+            fp16      816.7 ms   1.64x   max coordinate change 0.0023 px
+            bfloat16  806.8 ms   1.66x   max coordinate change 0.0266 px
+
+        0.0023px is ~40x below the bench's own measurement floor (0.06px). bfloat16 is no
+        faster and 10x less precise -- fewer mantissa bits -- so fp16 is the choice, not
+        "whatever half is available".
+
+        Confirmed on the real plate, whole moving-tile stage, SH016 4096x2160 / 38 tracks:
+        6.24 min -> 3.58 min (1.74x). The accuracy story there is NOT just the mean, and the
+        tail is the honest part:
+
+            coords 4718   mean 0.00522   p50 0.00136   p99 0.0413   max 1.5354 px
+            over 0.1px: 38/4718     over 1.0px: 3/4718
+            tracks with any coord >0.1px: 4 of 38   (worst 1.535, next 0.255)
+
+        One track moved 1.5px. That is not rounding -- moving_tile_refine is a FEEDBACK loop
+        (each window's result places the next window's tile) with hard branches in it: the
+        `tx <= 2.0` tile-edge tests and the `if not vs[k]: break` visibility stop. A 0.002px
+        perturbation can flip one of those, end a window a frame earlier, and send that track
+        down a different path from there. Neither result is the correct one; both are valid
+        outcomes of a knife-edge decision, and the quality gates downstream judge them the
+        same way. p99 = 0.04px is the number that describes the other 34 tracks.
+
+        Accepted for 1.74x on the pipeline's dominant stage. Escape hatch rather than a
+        silent default: BTR_TAPNEXT_FP32=1 restores fp32 -- use it if a shot needs to be
+        reproduced bit-for-bit against an earlier fp32 delivery.
+        """
+        torch = self.torch
+        if self.device == "cpu" or os.environ.get("BTR_TAPNEXT_FP32", "").strip() == "1":
+            return torch.autocast("cuda", enabled=False)
+        return torch.autocast("cuda", dtype=torch.float16)
+
     # ---- video / coordinate plumbing (256x256 <-> caller frame space) ----------
     def _prep_video(self, frames_bgr: np.ndarray):
         """(T,H,W,3) BGR -> (1,T,256,256,3) float[-1,1] RGB tensor. Returns (video, H, W).
@@ -229,7 +275,7 @@ class TapNextEngine:
         torch = self.torch
         T = int(video.shape[1])
         tr_all, vis_all = [], []
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             # Frame 0 seeds the queries and initializes the recurrent state.
             tracks, _tlog, vlog, state = self.model(
                 video=video[:, :1], query_points=query_points
