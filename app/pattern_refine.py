@@ -23,7 +23,10 @@ ceiling because refinement happens on the full-res plate.
 from __future__ import annotations
 
 import math
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -503,12 +506,50 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
 # Peak flatness of the most recent _ncc_match. A module-level stash rather than a wider
 # return tuple, so the ~10 existing call sites are untouched; read it immediately after a
 # successful match. Single-threaded per refine call, which is how refine_tracks runs.
-_LAST_FLATNESS: Dict[str, float] = {"v": 1.0}
+class _ThreadStash:
+    """Dict-like scratch space that is PRIVATE TO EACH THREAD.
+
+    The stashes below are written deep inside the matcher and read a few frames later by its
+    caller -- a deliberate alternative to widening ten call signatures. That is safe while one
+    track is refined at a time, and silently wrong the moment tracks are refined in parallel:
+    two threads would overwrite each other's certainty and aperture counts, and the numbers
+    would be attributed to whichever track happened to finish reading first. Nothing would
+    crash; the report would just be wrong.
+
+    Same access pattern as the plain dicts it replaces, so no call site changes.
+
+    NOTE: _PYR_ON is deliberately NOT one of these. It is written once by refine_tracks before
+    any worker starts and only read afterwards, so it must be SHARED -- making it thread-local
+    would hand every worker the default instead of the configured value.
+    """
+
+    def __init__(self, **defaults):
+        self._defaults = dict(defaults)
+        self._local = threading.local()
+
+    def _d(self) -> dict:
+        d = getattr(self._local, "d", None)
+        if d is None:
+            d = dict(self._defaults)
+            self._local.d = d
+        return d
+
+    def __getitem__(self, k):
+        return self._d()[k]
+
+    def __setitem__(self, k, v):
+        self._d()[k] = v
+
+    def get(self, k, default=None):
+        return self._d().get(k, default)
+
+
+_LAST_FLATNESS = _ThreadStash(v=1.0)
 
 # Median localisation certainty of the segment _refine_segment last returned, in [0,1].
 # Same stash-not-signature approach as _LAST_FLATNESS: _refine_segment's (points, reason)
 # contract is consumed in several places and is not worth widening for a diagnostic.
-_CERTAINTY: Dict[str, float] = {"v": 0.0}
+_CERTAINTY = _ThreadStash(v=0.0)
 
 # Aperture (edge-slide) evidence for the segment being refined, as counts of what the
 # matcher ALREADY decided: how many frames it was asked for a match, and how many it refused
@@ -525,7 +566,7 @@ _CERTAINTY: Dict[str, float] = {"v": 0.0}
 # Certainty in particular cannot do this job -- it confounds blur with dimensionality: a
 # sharp edge measures 0.176 and a soft corner 0.151, so any absolute floor deletes the corner
 # and keeps the edge.
-_APERTURE: Dict[str, int] = {"asked": 0, "refused": 0}
+_APERTURE = _ThreadStash(asked=0, refused=0)
 
 
 def _ecc_refine(gray: np.ndarray, patch: np.ndarray, px: float, py: float,
@@ -556,6 +597,7 @@ class _FrameGray:
     else per-frame window decode with a small LRU cache (bounds RAM on 4K clips)."""
 
     def __init__(self, path: str, total: int, host_ram_frac: float = 0.5, lru: int = 96):
+        self._lock = threading.Lock()   # refine_tracks may drive this from several threads
         self.path = path
         self.total = int(total)
         self._all: Optional[np.ndarray] = None
@@ -592,11 +634,11 @@ class _FrameGray:
         if win is None or win.shape[0] < 1:
             return None
         g = cv2.cvtColor(win[0], cv2.COLOR_BGR2GRAY)
-        self._cache[idx0] = g
-        self._order.append(idx0)
-        if len(self._order) > self._lru:
-            old = self._order.pop(0)
-            self._cache.pop(old, None)
+        with self._lock:
+            self._cache[idx0] = g
+            self._order.append(idx0)
+            if len(self._order) > self._lru:
+                self._cache.pop(self._order.pop(0), None)
         return g
 
 
@@ -1223,6 +1265,7 @@ class _GrayFromBGR:
     Caches converted gray frames in a small LRU (bounds RAM when the BGR source streams)."""
 
     def __init__(self, src, lru: int = 128):
+        self._lock = threading.Lock()   # refine_tracks may drive this from several threads
         self.src = src
         self._all = getattr(src, "_arr", None)   # for the 'full-decode' status line
         self._cache: Dict[int, np.ndarray] = {}
@@ -1241,10 +1284,11 @@ class _GrayFromBGR:
         if win is None or win.shape[0] < 1:
             return None
         g = cv2.cvtColor(win[0], cv2.COLOR_BGR2GRAY)
-        self._cache[idx0] = g
-        self._order.append(idx0)
-        if len(self._order) > self._lru:
-            self._cache.pop(self._order.pop(0), None)
+        with self._lock:
+            self._cache[idx0] = g
+            self._order.append(idx0)
+            if len(self._order) > self._lru:
+                self._cache.pop(self._order.pop(0), None)
         return g
 
 
@@ -1287,6 +1331,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         _raw_get = prov.get
         _bp_cache: Dict[int, Optional[np.ndarray]] = {}
         _bp_order: List[int] = []
+        _bp_lock = threading.Lock()
 
         def _bp_get(idx0: int) -> Optional[np.ndarray]:
             hit = _bp_cache.get(idx0)
@@ -1299,10 +1344,11 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             out = f - cv2.GaussianBlur(f, (0, 0), _bp)
             # Back to the 0-255 band the rest of the stage assumes, centred on mid-grey.
             out = np.clip(out + 128.0, 0.0, 255.0).astype(np.uint8)
-            _bp_cache[idx0] = out
-            _bp_order.append(idx0)
-            if len(_bp_order) > 128:
-                _bp_cache.pop(_bp_order.pop(0), None)
+            with _bp_lock:
+                _bp_cache[idx0] = out
+                _bp_order.append(idx0)
+                if len(_bp_order) > 128:
+                    _bp_cache.pop(_bp_order.pop(0), None)
             return out
 
         prov_get_filtered = _bp_get
@@ -1326,7 +1372,13 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     _t0 = time.time()
     _last = _t0
     _n = len(final_tracks)
-    for _i, (name, tr) in enumerate(final_tracks.items(), 1):
+    _items = list(final_tracks.items())
+
+    def _refine_one_track(item):
+        """Refine ONE track. Independent of every other track, which is what makes the pool
+        safe: the only shared state left is the frame cache (locked) and the per-thread
+        stashes (_ThreadStash)."""
+        name, tr = item
         # The whole per-track policy arrives through this one substitution: a view of the
         # shot config carrying this track's overrides, or the shot config ITSELF when it has
         # none. Nothing inside _refine_segment changes -- it already reads every parameter
@@ -1337,7 +1389,40 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         cert = float(_CERTAINTY.get("v", 0.0))
         # Fraction of requested matches the matcher refused as a ridge. NaN when it was never
         # asked (nothing to conclude), the same "unknown is not zero" rule certainty follows.
-        _ap = (float(_APERTURE["refused"]) / _APERTURE["asked"]) if _APERTURE["asked"] else float("nan")
+        ap = (float(_APERTURE["refused"]) / _APERTURE["asked"]) if _APERTURE["asked"] else float("nan")
+        return pieces, cert, ap
+
+    # Threads, not processes: the cost here is cv2.matchTemplate / findTransformECC, and
+    # OpenCV releases the GIL around both, so threads get real parallelism. Processes would
+    # have to ship 4K frames across a pipe per task, which costs more than the refine.
+    #
+    # Results are collected in the ORIGINAL track order regardless of completion order, so
+    # the output is identical whatever refine_workers is set to -- verified in
+    # tools/check_refine_parallel.py.
+    _w = int(getattr(cfg, "refine_workers", 0) or 0)
+    if _w <= 0:
+        _w = max(1, min(8, (os.cpu_count() or 4) - 1))
+    _w = max(1, min(_w, max(1, _n)))
+    if status and _w > 1:
+        status(f"Pattern-refine: {_w} worker threads over {_n} tracks")
+
+    if _w == 1:
+        _results = [_refine_one_track(it) for it in _items]
+    else:
+        with ThreadPoolExecutor(max_workers=_w, thread_name_prefix="refine") as _ex:
+            _futs = [_ex.submit(_refine_one_track, it) for it in _items]
+            _results = []
+            for _j, _f in enumerate(_futs, 1):
+                _results.append(_f.result())
+                now = time.time()
+                if status and (now - _last >= 15.0 or _j == _n):
+                    done = now - _t0
+                    eta = (done / _j) * (_n - _j)
+                    status(f"Pattern-refine: {_j}/{_n} tracks ({done / 60.0:.1f} min elapsed, "
+                           f"~{eta / 60.0:.1f} min left)")
+                    _last = now
+
+    for _i, ((name, tr), (pieces, cert, _ap)) in enumerate(zip(_items, _results), 1):
         if not pieces:
             dropped += 1
             continue
@@ -1360,13 +1445,8 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
             certainty[tid] = cert
             aperture[tid] = _ap
 
-        now = time.time()
-        if status and (now - _last >= 15.0 or _i == _n):
-            done = now - _t0
-            eta = (done / _i) * (_n - _i)
-            status(f"Pattern-refine: {_i}/{_n} tracks ({done / 60.0:.1f} min elapsed, "
-                   f"~{eta / 60.0:.1f} min left)")
-            _last = now
+    if status and _w == 1:
+        status(f"Pattern-refine: {_n}/{_n} tracks ({(time.time() - _t0) / 60.0:.1f} min)")
 
     # Wobble report: amplitude says how bad, period says WHERE it comes from. A period
     # clustering near mt_window points at the moving-tile seams; no dominant period means a

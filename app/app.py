@@ -1404,6 +1404,9 @@ class AppState:
     # has a single pass). Off until measured on real footage.
     fuse_passes: bool = False
     fuse_age_tau: float = 30.0
+    # Threads for the pattern-refine stage (the run's dominant cost). 0 = auto.
+    # See RunnerConfig.refine_workers for the measured scaling.
+    refine_workers: int = 0
     # Raise the seeding anisotropy floor to the frame's own edge/corner split when the
     # distribution is genuinely bimodal. See RunnerConfig.adaptive_anisotropy.
     adaptive_anisotropy: bool = False
@@ -2473,6 +2476,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 fuse_age_tau=float(getattr(state, "fuse_age_tau", 30.0) or 30.0),
                 refine_pyramid=bool(getattr(state, "refine_pyramid", False)),
                 adaptive_anisotropy=bool(getattr(state, "adaptive_anisotropy", False)),
+                refine_workers=int(getattr(state, "refine_workers", 0) or 0),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()

@@ -274,6 +274,23 @@ class RunnerConfig:
     # over. A rival has to survive being blurred to still tie at half resolution. Falls back
     # to the single-level search whenever the coarse level cannot decide, so it can lose
     # speed but not frames. OFF until measured.
+    # Threads used by pattern_refine, which is per-track independent and was the single
+    # biggest cost in a run (measured: 52 of SH006's ~62 min, at ~1.1 cores of 56).
+    #
+    # Threads, not processes: OpenCV releases the GIL inside matchTemplate/findTransformECC,
+    # and a process pool would have to ship 4K frames down a pipe per task. Measured on a
+    # 17-track x 160-frame HD workload (tools/check_refine_parallel.py):
+    #
+    #     1 worker  23.3s  1.00x      8 workers 10.4s  2.25x
+    #     4 workers 11.0s  2.12x     16 workers 13.4s  1.75x
+    #
+    # It stops scaling around 8 and gets WORSE past it: the refine inner loop is Python, so
+    # the GIL caps this well below the core count -- 2.2x, not 8x. Hence the cap of 8 in the
+    # auto default rather than cpu_count. Verified byte-identical output at every worker
+    # count, positions and per-track certainty/aperture alike; a stage that changes the answer
+    # when you change its thread count is not a speed-up.
+    # 0 = auto (cpu_count-1, capped at 8).
+    refine_workers: int = 0
     refine_pyramid: bool = False
     refine_search_max: int = 64      # ceiling; == refine_search_px disables adaptation
     refine_search_speed_k: float = 1.5   # px of extra radius per px/frame of local speed
