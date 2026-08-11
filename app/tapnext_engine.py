@@ -6,9 +6,11 @@ Drop-in replacement for the old CoTracker3 engine: exposes the SAME two methods
 (seeding, 4-pass merge, mask gating, filtering, 3DE export) is untouched.
 
 Key differences from CoTracker, absorbed entirely inside this wrapper:
-  * TAPNext++ is a FIXED 256x256 model. Frames are resized to 256x256 on the way
-    in and predicted coordinates are rescaled back to the caller's frame space,
-    so tracker_core keeps working in its (Ws,Hs) scaled-pixel space.
+  * TAPNext++ is a 256x256 model in practice. Frames are resized to the model's
+    input size on the way in and predicted coordinates are rescaled back to the
+    caller's frame space, so tracker_core keeps working in its (Ws,Hs) scaled-pixel
+    space. The input size is parameterised (BTR_TAPNEXT_IMG) but 256 is the only
+    value that works -- see the measurement by _IMG_ENV below before changing it.
   * TAPNext is CAUSAL/STREAMING (next-token): seed query points at frame 0 of the
     block, then feed one frame at a time carrying the recurrent state. tracker_core
     already reverses frames for the BWD / MID passes, so every pass seeds at the
@@ -28,6 +30,45 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # TAPNext++ published checkpoint is trained/served at 256x256.
 _IMG = 256
+
+# Optional higher inference resolution, from BTR_TAPNEXT_IMG (must be a multiple of the
+# patch size, i.e. 256 / 384 / 512).
+#
+# There is NO 512 checkpoint. Probed 2026-08-11: tapnextpp_512.ckpt, tapnextpp_512.pt and
+# tapnextpp_ckpt_512.pt all return 404 from storage.googleapis.com/dm-tapnet/tapnextpp/;
+# only tapnextpp_ckpt.pt (256) exists, and the repo's own table lists TAPNext at 256x256
+# only. So running at 512 means running the 256 WEIGHTS at 512, with the learned image
+# position embedding bicubically resized 32x32 -> 64x64.
+#
+# That is the step the TAPNext++ paper performs BEFORE fine-tuning at 512, and the fine-tune
+# is the part we cannot reproduce.
+#
+# MEASURED 2026-08-11 and the answer is NO. Same 12-frame synthetic pan, three points,
+# ground-truth motion of (+2.0, +1.0) px/frame:
+#
+#     img=256   mean err   0.553px   max   1.250px   1.49s   1.35 GB
+#     img=512   mean err 135.790px   max 761.660px   5.62s   3.19 GB
+#
+# 245x worse -- on a 960px-wide frame a 761px error is not a degraded track, it is noise.
+# The interpolated table puts the transformer in a positional space it never trained on and
+# the model simply does not work there. The fine-tune is not a refinement of this idea, it is
+# the whole thing.
+#
+# Kept, env-gated and defaulting to 256, for two reasons: the measurement above is one
+# command away from being reproduced, and if a real 512 checkpoint is ever published the
+# plumbing (coordinate scaling, chunk sizing) is already correct. Do NOT raise this expecting
+# accuracy from the current weights.
+_IMG_ENV = "BTR_TAPNEXT_IMG"
+
+
+def _resolve_img_size() -> int:
+    try:
+        v = int(os.environ.get(_IMG_ENV, "") or _IMG)
+    except ValueError:
+        return _IMG
+    if v % 8 or v < 128 or v > 1024:
+        return _IMG
+    return v
 
 
 def _add_tapnext_to_path(tool_root: str) -> str:
@@ -90,13 +131,56 @@ class TapNextEngine:
         self.device = device if (device == "cpu" or torch.cuda.is_available()) else "cpu"
 
         self.checkpoint = _resolve_ckpt(tool_root, self.repo_root)
-        model = TAPNext(image_size=(_IMG, _IMG))
+        self.img = _resolve_img_size()
+        model = TAPNext(image_size=(self.img, self.img))
         ckpt = torch.load(self.checkpoint, map_location="cpu")
         state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         # Published checkpoint prefixes weights with "tapnext." — strip it.
         state_dict = {k.replace("tapnext.", "", 1): v for k, v in state_dict.items()}
+        if self.img != _IMG:
+            state_dict = self._fit_state_dict_to_img(state_dict, model)
         model.load_state_dict(state_dict)
         self.model = model.to(self.device).eval()
+
+    # ---- running the 256 weights at another resolution -------------------------
+    def _fit_state_dict_to_img(self, sd: dict, model) -> dict:
+        """Resize the checkpoint's position tables to this model's token grid.
+
+        Two entries are resolution-bound and neither can be loaded as-is:
+
+          image_pos_emb   a LEARNED (1, 32*32, 768) table. Bicubically resampled to the new
+                          patch grid -- the same operation the TAPNext++ paper applies before
+                          fine-tuning at 512. Nothing here reproduces that fine-tune, so the
+                          transformer is being asked to read positions it never trained on.
+          query_pos_embed a DETERMINISTIC sincos buffer the model already rebuilt for its own
+                          image_size in __init__. The checkpoint's copy is simply dropped;
+                          keeping it would only overwrite a correct table with a stale one.
+        """
+        torch = self.torch
+        out = dict(sd)
+
+        want = model.state_dict()
+        # Substitute, don't drop: load_state_dict stays STRICT, so a genuinely missing weight
+        # is still an error rather than silently leaving a randomly-initialised layer in a
+        # model that then tracks plausible-looking nonsense.
+        if "query_pos_embed" in want:
+            out["query_pos_embed"] = want["query_pos_embed"]
+
+        key = "image_pos_emb"
+        if key in out and key in want and out[key].shape != want[key].shape:
+            src, dst = out[key], want[key]
+            n_src, c = int(src.shape[1]), int(src.shape[2])
+            n_dst = int(dst.shape[1])
+            g_src, g_dst = int(round(n_src ** 0.5)), int(round(n_dst ** 0.5))
+            if g_src * g_src != n_src or g_dst * g_dst != n_dst:
+                raise RuntimeError(f"{key}: non-square token grid ({n_src} -> {n_dst})")
+            grid = src.reshape(1, g_src, g_src, c).permute(0, 3, 1, 2).float()
+            grid = torch.nn.functional.interpolate(
+                grid, size=(g_dst, g_dst), mode="bicubic", align_corners=False)
+            out[key] = grid.permute(0, 2, 3, 1).reshape(1, n_dst, c).to(src.dtype)
+            print(f"TAPNext: image_pos_emb {g_src}x{g_src} -> {g_dst}x{g_dst} (bicubic); "
+                  f"running 256-trained weights at {self.img}px")
+        return out
 
     # ---- video / coordinate plumbing (256x256 <-> caller frame space) ----------
     def _prep_video(self, frames_bgr: np.ndarray):
@@ -108,32 +192,31 @@ class TapNextEngine:
         """
         torch = self.torch
         T, H, W = frames_bgr.shape[0], frames_bgr.shape[1], frames_bgr.shape[2]
-        out = np.empty((T, _IMG, _IMG, 3), dtype=np.float32)
+        S = self.img
+        out = np.empty((T, S, S, 3), dtype=np.float32)
         for t in range(T):
-            r = cv2.resize(frames_bgr[t], (_IMG, _IMG), interpolation=cv2.INTER_AREA)
+            r = cv2.resize(frames_bgr[t], (S, S), interpolation=cv2.INTER_AREA)
             out[t] = r[..., ::-1]  # BGR -> RGB
         out = out / 255.0 * 2.0 - 1.0  # -> [-1, 1]
-        video = torch.from_numpy(out)[None].to(self.device)  # (1,T,256,256,3)
+        video = torch.from_numpy(out)[None].to(self.device)  # (1,T,S,S,3)
         return video, H, W
 
-    @staticmethod
-    def _q_to_256(queries: np.ndarray, H: int, W: int) -> np.ndarray:
-        """Caller queries are [frame, x, y] in (W,H) pixels. TAPNext wants [t, y, x] in 256px
-        (see tapnet/tapvid/evaluation_datasets: query_points = [t, y, x]). Swap axes + scale."""
+    def _q_to_model(self, queries: np.ndarray, H: int, W: int) -> np.ndarray:
+        """Caller queries are [frame, x, y] in (W,H) pixels. TAPNext wants [t, y, x] in model
+        px (see tapnet/tapvid/evaluation_datasets: query_points = [t, y, x]). Swap + scale."""
         qin = queries.astype(np.float32)
-        sx, sy = float(_IMG) / max(1, W), float(_IMG) / max(1, H)
+        sx, sy = float(self.img) / max(1, W), float(self.img) / max(1, H)
         out = np.empty_like(qin)
         out[..., 0] = qin[..., 0]           # t
         out[..., 1] = qin[..., 2] * sy      # y -> row (256)
         out[..., 2] = qin[..., 1] * sx      # x -> col (256)
         return out
 
-    @staticmethod
-    def _tracks_from_256(tracks256: np.ndarray, H: int, W: int) -> np.ndarray:
-        """TAPNext returns (T,N,2) as [y, x] in 256px. Swap back to [x, y] in (W,H) pixels."""
-        out = np.empty_like(tracks256, dtype=np.float32)
-        out[..., 0] = tracks256[..., 1] * (float(W) / _IMG)   # x = col
-        out[..., 1] = tracks256[..., 0] * (float(H) / _IMG)   # y = row
+    def _tracks_from_model(self, tracks_m: np.ndarray, H: int, W: int) -> np.ndarray:
+        """TAPNext returns (T,N,2) as [y, x] in model px. Back to [x, y] in (W,H) pixels."""
+        out = np.empty_like(tracks_m, dtype=np.float32)
+        out[..., 0] = tracks_m[..., 1] * (float(W) / self.img)   # x = col
+        out[..., 1] = tracks_m[..., 0] * (float(H) / self.img)   # y = row
         return out
 
     # ---- core streaming inference ---------------------------------------------
@@ -176,10 +259,10 @@ class TapNextEngine:
         if N == 0:
             T = int(frames_bgr.shape[0])
             return np.zeros((T, 0, 2), np.float32), np.zeros((T, 0), bool)
-        q = self._q_to_256(queries, H, W)
+        q = self._q_to_model(queries, H, W)
         q_t = self.torch.from_numpy(q).float().to(self.device)
         tracks256, vis = self._stream(video, q_t)
-        return self._tracks_from_256(tracks256, H, W), vis
+        return self._tracks_from_model(tracks256, H, W), vis
 
     def track_grid(self, frames_bgr: np.ndarray, grid_size: int,
                    grid_query_frame: int = 0, segm_mask: np.ndarray | None = None):
