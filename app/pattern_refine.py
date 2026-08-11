@@ -1401,8 +1401,35 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     # tools/check_refine_parallel.py.
     _w = int(getattr(cfg, "refine_workers", 0) or 0)
     if _w <= 0:
-        _w = max(1, min(8, (os.cpu_count() or 4) - 1))
+        _w = max(1, min(4, (os.cpu_count() or 4) - 1))
     _w = max(1, min(_w, max(1, _n)))
+
+    # Warm the gray cache SERIALLY before the pool starts.
+    #
+    # Without this the pool is a large net loss on a 4K plate, measured on SH016
+    # (39 tracks, 127 frames, 4096x2160): 0.3 min serial -> 3.2 min at 8 workers, with the
+    # first result alone taking 1.6 min. Serial, the first track converts each frame once and
+    # every later track is a pure cache hit; in parallel, eight threads start on a COLD cache
+    # and redundantly convert the same 8.8MB frames, saturating memory bandwidth long before
+    # any correlation work happens. Threads cannot help with that -- the fix is to not race
+    # for it in the first place.
+    #
+    # Only worth it when the provider can actually hold the clip: with a small LRU over a long
+    # streamed shot the early frames are evicted before the pool reaches them, so the pass is
+    # wasted work rather than a warm-up.
+    if _w > 1:
+        _cap = int(getattr(prov, "_lru", 0) or 0)
+        _held = getattr(prov, "_all", None) is not None or _cap >= int(total_frames or 0)
+        if _held and total_frames:
+            _t_warm = time.time()
+            for _f0 in range(int(total_frames)):
+                prov_get_filtered(_f0)
+            if status:
+                status(f"Pattern-refine: gray cache warmed in "
+                       f"{time.time() - _t_warm:.1f}s ({int(total_frames)} frames)")
+        else:
+            _w = 1   # streamed clip: the pool would thrash the cache instead of sharing it
+
     if status and _w > 1:
         status(f"Pattern-refine: {_w} worker threads over {_n} tracks")
 

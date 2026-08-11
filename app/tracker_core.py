@@ -274,22 +274,26 @@ class RunnerConfig:
     # over. A rival has to survive being blurred to still tie at half resolution. Falls back
     # to the single-level search whenever the coarse level cannot decide, so it can lose
     # speed but not frames. OFF until measured.
-    # Threads used by pattern_refine, which is per-track independent and was the single
-    # biggest cost in a run (measured: 52 of SH006's ~62 min, at ~1.1 cores of 56).
+    # Threads for pattern_refine. Tracks are independent, so they pool cleanly; OpenCV
+    # releases the GIL inside matchTemplate/findTransformECC, so threads (not processes --
+    # a process pool would ship 4K frames down a pipe per task).
     #
-    # Threads, not processes: OpenCV releases the GIL inside matchTemplate/findTransformECC,
-    # and a process pool would have to ship 4K frames down a pipe per task. Measured on a
-    # 17-track x 160-frame HD workload (tools/check_refine_parallel.py):
+    # Measured on the REAL plate (SH016, 4096x2160, 127 frames, 38 tracks), which is the
+    # number that counts:
     #
-    #     1 worker  23.3s  1.00x      8 workers 10.4s  2.25x
-    #     4 workers 11.0s  2.12x     16 workers 13.4s  1.75x
+    #     1 worker  8.0s 1.00x    8 workers  6.9s 1.15x
+    #     4 workers 4.8s 1.68x   16 workers 11.7s 0.68x
     #
-    # It stops scaling around 8 and gets WORSE past it: the refine inner loop is Python, so
-    # the GIL caps this well below the core count -- 2.2x, not 8x. Hence the cap of 8 in the
-    # auto default rather than cpu_count. Verified byte-identical output at every worker
-    # count, positions and per-track certainty/aperture alike; a stage that changes the answer
-    # when you change its thread count is not a speed-up.
-    # 0 = auto (cpu_count-1, capped at 8).
+    # Peak is 4, hence the cap. An HD synthetic peaked at 8 (2.25x) and that generalised
+    # badly -- bigger frames make the shared frame cache, not the correlation, the limit.
+    #
+    # The pool is a LOSS without the serial cache warm-up in refine_tracks: before it,
+    # this same shot went 0.3 min serial -> 3.2 min at 8 workers, because eight threads
+    # raced to convert the same 4K frames. Do not remove that pass.
+    #
+    # Output is byte-identical at every worker count -- positions and per-track
+    # certainty/aperture -- verified on synthetics by tools/check_refine_parallel.py and on
+    # the real plate above. 0 = auto (cpu_count-1, capped at 4).
     refine_workers: int = 0
     refine_pyramid: bool = False
     refine_search_max: int = 64      # ceiling; == refine_search_px disables adaptation
