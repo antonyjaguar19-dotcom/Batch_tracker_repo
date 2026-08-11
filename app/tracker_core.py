@@ -2003,7 +2003,13 @@ class BatchTrackerRunner:
                             T, W0, H0, self.cfg, wobble_fn=measure_wobble,
                             weak=locals().get("_weak_ids") or set(),
                             registry=(self.registry if self.registry.enabled else None),
-                            geo=(_geo or None))
+                            geo=(_geo or None),
+                            aperture=(getattr(_rt, "last_aperture", None)))
+                        # Shot-level: say when most of what was tracked can only slide. Not a
+                        # gate -- on a plate whose only structure IS edges there is nothing
+                        # better to offer, so the batch publishes and flags for review.
+                        _tf.aperture_report(getattr(_rt, "last_aperture", {}) or {},
+                                            len(final_tracks_out), log=self._status)
                         if got:
                             self._status(f"[{i}/{len(vids)}] Track report -> {os.path.basename(got)}")
                         # Full records beside the CSV: the CSV is for reading, this is for

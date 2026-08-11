@@ -951,11 +951,51 @@ def geometric_residuals(tracks: Dict[str, Track], width: int, height: int,
     return out
 
 
+def aperture_report(aperture: Dict[str, float], n_tracks: int, hi: float = 0.5,
+                    warn_frac: float = 0.35, log: Optional[Callable] = None) -> Dict[str, float]:
+    """Summarise how much of a shot is aperture-limited, and say so when it is a lot.
+
+    A point on a 1-D feature -- a door edge, a picture-frame moulding, a rope -- can be
+    localised across the edge and never along it, so it slides. Nothing else in this file
+    catches that: the track is long, smooth and jump-free, so `score_track` RANKS IT HIGHLY;
+    `identity_gate` sees the same pattern before and after (measured: 0.967 identity after
+    sliding 150px along an edge, against a 0.25 floor); and certainty cannot separate it
+    because it confounds blur with dimensionality.
+
+    This is deliberately a REPORT and not a gate. On a shot that is a person against a flat
+    wall with one door edge and one picture frame, the edges are the only high-contrast
+    structure there is -- gating them away leaves nothing to solve with, and inventing
+    corners is not an option. For an unattended batch the useful behaviour is to publish the
+    tracks AND say the shot needs eyes on it, so it lands in a review queue instead of
+    passing silently.
+
+    Returns summary stats; logs a warning line when the aperture-limited share is large.
+    """
+    vals = [v for v in aperture.values() if v == v]          # drop NaN = never measured
+    if not vals or n_tracks <= 0:
+        return {}
+    bad = [v for v in vals if v >= hi]
+    frac = len(bad) / float(len(vals))
+    out = {"measured": float(len(vals)), "aperture_limited": float(len(bad)), "frac": float(frac),
+           "median": float(st.median(vals))}
+    if log:
+        if frac >= warn_frac:
+            log(f"  !! APERTURE-LIMITED SHOT: {len(bad)}/{len(vals)} track(s) refused a "
+                f"definite match on >={hi:.0%} of their frames -- they sit on edges and can "
+                f"slide along them. Long, smooth and high-scoring is exactly how this failure "
+                f"looks, so review this shot before solving.")
+        else:
+            log(f"  aperture: {len(bad)}/{len(vals)} track(s) edge-limited "
+                f"(median refusal {out['median']:.2f})")
+    return out
+
+
 def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, float],
                       T: int, width: int, height: int, cfg,
                       wobble_fn: Optional[Callable] = None,
                       weak: Optional[set] = None, registry=None,
-                      geo: Optional[Dict[str, float]] = None) -> str:
+                      geo: Optional[Dict[str, float]] = None,
+                      aperture: Optional[Dict[str, float]] = None) -> str:
     """Write a per-track CSV: length, score, certainty, wobble amplitude and period.
 
     Several rounds of tracking fixes have been judged by eye on real footage and by
@@ -976,7 +1016,8 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
         base_geo = geo is not None and not extra
         rows = ["name,frames,span,score,certainty,wobble_px,wobble_period,mean_x,mean_y,weak"
                 + ("," + ",".join(extra) if extra else "")
-                + (",geo_residual" if base_geo else "")]
+                + (",geo_residual" if base_geo else "")
+                + (",aperture" if aperture is not None else "")]
         for tid, pts in sorted(tracks.items()):
             p = sorted(pts, key=lambda q: q[0])
             if not p:
@@ -996,6 +1037,9 @@ def dump_track_report(path: str, tracks: Dict[str, Track], certainty: Dict[str, 
             elif base_geo:
                 g = float((geo or {}).get(tid, float("nan")))
                 row += "," + ("" if g != g else f"{g:.3f}")   # blank, not 0, when unmeasured
+            if aperture is not None:
+                a = float(aperture.get(tid, float("nan")))
+                row += "," + ("" if a != a else f"{a:.3f}")
             rows.append(row)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:

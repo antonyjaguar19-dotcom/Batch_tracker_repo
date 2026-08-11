@@ -472,6 +472,10 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
         win = gray[y0:y1, x0:x1]
         if win.shape[0] < P or win.shape[1] < P:   # window smaller than the patch -> can't match
             return None
+    # Counted once per requested match, before the pyramid branch: a pyramid hit returns
+    # early, so incrementing further down would leave those frames out of the denominator and
+    # inflate the refusal ratio whenever refine_pyramid is on.
+    _APERTURE["asked"] += 1
     if (_PYR_ON["v"] if pyramid is None else pyramid) and search >= _PYR_MIN_SEARCH:
         got = _ncc_match_pyramid(win, patch, half, float(ambiguity_ratio))
         if got is not None:
@@ -485,6 +489,7 @@ def _ncc_match(gray: np.ndarray, patch: np.ndarray, cx: float, cy: float,
     resp = cv2.matchTemplate(win, patch, cv2.TM_CCOEFF_NORMED)
     _, maxv, _, maxloc = cv2.minMaxLoc(resp)
     if _peak_is_ambiguous(resp, maxloc, float(maxv), float(ambiguity_ratio), half):
+        _APERTURE["refused"] += 1
         return None
     dx, dy = _subpix_peak(resp, maxloc)
     px = x0 + maxloc[0] + dx + half
@@ -504,6 +509,23 @@ _LAST_FLATNESS: Dict[str, float] = {"v": 1.0}
 # Same stash-not-signature approach as _LAST_FLATNESS: _refine_segment's (points, reason)
 # contract is consumed in several places and is not worth widening for a diagnostic.
 _CERTAINTY: Dict[str, float] = {"v": 0.0}
+
+# Aperture (edge-slide) evidence for the segment being refined, as counts of what the
+# matcher ALREADY decided: how many frames it was asked for a match, and how many it refused
+# because the correlation surface was a ridge rather than a peak (_peak_is_ambiguous).
+#
+# That refusal is the one signal in this file that identifies a 1-D feature at match time,
+# and until now its only effect was returning None -- the caller's hysteresis then held the
+# previous position, so a point sliding along a door edge kept its slid coarse position and
+# nothing recorded why. Measured on synthetic features (edge / corner / checker / blob at two
+# blur levels) the flag fires on the edge and on nothing else.
+#
+# Kept as a RATIO of refusals rather than a pixel number on purpose: it needs no threshold
+# that travels between plates, which is the failing of every absolute bar tried here so far.
+# Certainty in particular cannot do this job -- it confounds blur with dimensionality: a
+# sharp edge measures 0.176 and a soft corner 0.151, so any absolute floor deletes the corner
+# and keeps the edge.
+_APERTURE: Dict[str, int] = {"asked": 0, "refused": 0}
 
 
 def _ecc_refine(gray: np.ndarray, patch: np.ndarray, px: float, py: float,
@@ -1297,6 +1319,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
 
     out: Dict[str, Track] = {}
     certainty: Dict[str, float] = {}
+    aperture: Dict[str, float] = {}
     trimmed = dropped = split = gapped = 0
     # Same reason as moving-tile: this loop is per-track and slow on a big plate, and printed
     # nothing between its opening line and its result, so a long shot looked hung.
@@ -1309,8 +1332,12 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
         # none. Nothing inside _refine_segment changes -- it already reads every parameter
         # off cfg, so handing it a different cfg is all that per-track adaptation needs.
         tcfg = registry.view(name, cfg) if registry is not None else cfg
+        _APERTURE["asked"] = _APERTURE["refused"] = 0
         pieces = _refine_one_multi(to_img(tr), prov_get_filtered, tcfg, predict)
         cert = float(_CERTAINTY.get("v", 0.0))
+        # Fraction of requested matches the matcher refused as a ridge. NaN when it was never
+        # asked (nothing to conclude), the same "unknown is not zero" rule certainty follows.
+        _ap = (float(_APERTURE["refused"]) / _APERTURE["asked"]) if _APERTURE["asked"] else float("nan")
         if not pieces:
             dropped += 1
             continue
@@ -1331,6 +1358,7 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
                 registry.derive(name, tid)   # same feature, so it keeps the same policy
             out[tid] = to_out(piece)
             certainty[tid] = cert
+            aperture[tid] = _ap
 
         now = time.time()
         if status and (now - _last >= 15.0 or _i == _n):
@@ -1405,5 +1433,6 @@ def refine_tracks(final_tracks: Dict[str, Track], video_path: str, W0: int, H0: 
     # Hand the per-track certainty to the caller for selection. Stashed on the function so
     # the (tracks, info) return contract used by tracker_core is unchanged.
     refine_tracks.last_certainty = certainty
+    refine_tracks.last_aperture = aperture
     refine_tracks.last_identity = identity
     return out, " ".join(bits)
