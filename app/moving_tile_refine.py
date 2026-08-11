@@ -114,7 +114,8 @@ def _retrack_one(frs: np.ndarray, xs: np.ndarray, ys: np.ndarray, src: FrameSour
         # correcting it, which is what let the per-window step accumulate into a visible beat.
         sx0, sy0 = float(xs[i0]), float(ys[i0])
         q[0, 0] = (0.0, sx0 - ox, sy0 - oy)   # query at the guide, tile-local, local frame 0
-        tr, vs = engine.track_queries(crop, q)   # tr (L,1,2) [x,y] in tile space, vs (L,1)
+        # fp16 for this stage only -- see TapNextEngine._autocast for why not globally.
+        tr, vs = engine.track_queries(crop, q, fp16=True)  # tr (L,1,2) [x,y] tile space
         tr = tr[:, 0, :]
         vs = vs[:, 0]
         last_ok = i0
@@ -220,6 +221,12 @@ def moving_tile_refine(final_tracks: Dict[str, Track], video_path: str, W0: int,
         status(f"Moving-tile: {len(final_tracks)} tracks, tile {_TILE}px win={win} "
                f"overlap={overlap} ({src_note} {W0}x{H0})")
 
+    # Half-precision inference, for THIS stage only. Measured 1.74x on the real 4K plate
+    # (6.24 -> 3.58 min on SH016), which is the single biggest saving available in the run.
+    # It is opted into here rather than set on the engine globally because the coarse
+    # FWD/BWD/MID passes feed seeding and selection: perturbing them changes which tracks
+    # survive and what they are named, making a whole run irreproducible against an earlier
+    # delivery for ~2 min of a 18 min run. See TapNextEngine._autocast for both measurements.
     out: Dict[str, Track] = {}
     moved = 0
     shortened = 0

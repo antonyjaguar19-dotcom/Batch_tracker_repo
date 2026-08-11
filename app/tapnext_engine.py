@@ -182,7 +182,7 @@ class TapNextEngine:
                   f"running 256-trained weights at {self.img}px")
         return out
 
-    def _autocast(self):
+    def _autocast(self, fp16: bool):
         """Half-precision inference, unless BTR_TAPNEXT_FP32=1.
 
         The tile model is the dominant cost of a 4K run: moving_tile_refine re-runs it per
@@ -219,12 +219,31 @@ class TapNextEngine:
         outcomes of a knife-edge decision, and the quality gates downstream judge them the
         same way. p99 = 0.04px is the number that describes the other 34 tracks.
 
-        Accepted for 1.74x on the pipeline's dominant stage. Escape hatch rather than a
-        silent default: BTR_TAPNEXT_FP32=1 restores fp32 -- use it if a shot needs to be
-        reproduced bit-for-bit against an earlier fp32 delivery.
+        SCOPE: this is an explicit per-CALL argument, and only moving_tile_refine passes it.
+        That is not caution, it is where the measurement applies. Enabling it globally was
+        tried and measured on a full SH016 pipeline run against the fp32 run:
+
+            isolated moving-tile   p99 0.041px   max 1.54px    4/38 tracks >0.1px
+            whole pipeline         p99 9.14px    max 14.65px  26/34 tracks >0.1px, 38 -> 37
+
+        The second number is not fp16 tracking 14px worse. The main FWD/BWD/MID passes feed
+        seeding, the quality gate, spread selection and defragmentation -- so perturbing them
+        changes WHICH tracks survive and what they are called, and the diff is then comparing
+        different tracks. Chaotic, not wrong, but it makes a run irreproducible against an
+        earlier delivery for no measured gain: those passes are ~2 min of an 18 min run, while
+        moving-tile is 9.3.
+
+        It is an argument rather than a flag on the engine on purpose: a sticky flag left on
+        by an exception mid-stage (an OOM in the tile loop is the obvious one) would silently
+        put every LATER shot's coarse passes in fp16, and nothing would report it.
+
+        So the coarse passes stay fp32 -- deterministic, and identical to every export made
+        before this existed -- and the half-precision speed is taken on the stage that
+        actually costs the time. BTR_TAPNEXT_FP32=1 disables it there too.
         """
         torch = self.torch
-        if self.device == "cpu" or os.environ.get("BTR_TAPNEXT_FP32", "").strip() == "1":
+        if (self.device == "cpu" or not fp16
+                or os.environ.get("BTR_TAPNEXT_FP32", "").strip() == "1"):
             return torch.autocast("cuda", enabled=False)
         return torch.autocast("cuda", dtype=torch.float16)
 
@@ -266,7 +285,7 @@ class TapNextEngine:
         return out
 
     # ---- core streaming inference ---------------------------------------------
-    def _stream(self, video, query_points):
+    def _stream(self, video, query_points, fp16: bool = False):
         """Run TAPNext causally over the whole block.
 
         video: (1,T,256,256,3) float tensor. query_points: (1,N,3) [t,x,y] tensor (256 space).
@@ -275,7 +294,7 @@ class TapNextEngine:
         torch = self.torch
         T = int(video.shape[1])
         tr_all, vis_all = [], []
-        with torch.no_grad(), self._autocast():
+        with torch.no_grad(), self._autocast(fp16):
             # Frame 0 seeds the queries and initializes the recurrent state.
             tracks, _tlog, vlog, state = self.model(
                 video=video[:, :1], query_points=query_points
@@ -296,7 +315,7 @@ class TapNextEngine:
         return tracks.float().cpu().numpy(), vis.cpu().numpy().astype(bool)
 
     # ---- public API (matches the old CoTracker3Engine) -------------------------
-    def track_queries(self, frames_bgr: np.ndarray, queries: np.ndarray):
+    def track_queries(self, frames_bgr: np.ndarray, queries: np.ndarray, fp16: bool = False):
         """queries: (1,N,3) [frame,x,y] in caller frame space (frame index expected 0)."""
         video, H, W = self._prep_video(frames_bgr)
         if queries.ndim == 2:
@@ -307,7 +326,7 @@ class TapNextEngine:
             return np.zeros((T, 0, 2), np.float32), np.zeros((T, 0), bool)
         q = self._q_to_model(queries, H, W)
         q_t = self.torch.from_numpy(q).float().to(self.device)
-        tracks256, vis = self._stream(video, q_t)
+        tracks256, vis = self._stream(video, q_t, fp16=fp16)
         return self._tracks_from_model(tracks256, H, W), vis
 
     def track_grid(self, frames_bgr: np.ndarray, grid_size: int,

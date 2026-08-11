@@ -1,0 +1,511 @@
+================================================================================
+BOT BATCH TRACKER -- EVERY FILTER IN THE PIPELINE, IN PLAIN ENGLISH
+Written 2026-08-11. Defaults are what a run uses if nobody touches a slider.
+================================================================================
+
+HOW TO READ THIS
+----------------
+A "filter" here means anything that decides a point, a frame, or a whole track
+does not go into the export. Some of them do not delete -- they mark a frame as
+occluded, or join two tracks, or add tracks back. Those are called out.
+
+The bot has two tracking backends:
+
+  * SYNTHEYES  -- the default. It has its own tracker, so it gets only the mask
+                  post-filter (section G). Everything else below does not run.
+  * TAPNEXT++  -- the GPU fallback / comparison engine. It runs the whole stack,
+                  filters 1 through 42.
+
+Order matters. The list is in the order a track actually meets them.
+
+Legend:  [ON]  = active with default settings
+         [OFF] = present, wired, but switched off by default
+         [COND]= only fires when a condition is met
+
+
+================================================================================
+SECTION A -- SEEDING: choosing which pixels to track at all
+(app/tracker_core.py, _detect_features / _staggered_queries / _drop_edge_points)
+================================================================================
+
+1. CORNER STRENGTH BAR (feature_quality = 0.02)                            [ON]
+   Before tracking anything, the bot looks at a frame and finds the corners.
+   OpenCV scores every candidate and this throws away anything scoring below 2%
+   of the best corner in that frame. It is a RELATIVE bar, so on a plate with
+   one brilliant corner and a lot of mush, the mush goes.
+   The auto-tune moves it: 0.015 on a detailed plate (let more in), 0.06 on a
+   low-texture plate (2% of the best corner there is just noise).
+
+2. MINIMUM SEED SPACING (min_feature_dist = 12 px)                         [ON]
+   No two seeds may start closer than 12 pixels. Stops fifty points piling onto
+   one high-contrast bolt while the rest of the frame gets nothing.
+   Auto-tune raises it to 16 on fast/handheld shots and 18 on low-texture ones.
+
+3. SAM3 SEED REGION (mask_mode = "outside")                        [ON w/ masks]
+   The mask stage has already painted where the moving characters and props are.
+   In "outside" mode the bot is only allowed to plant seeds OFF those movers --
+   because a camera track wants the static world, not the actor. In "inside"
+   mode the rule flips (used when tracking an object rather than the camera).
+
+4. MASK EDGE PULL-IN AT SEED TIME (mask_margin_px = 8 px)                  [ON]
+   SAM3 mattes usually stop a few pixels short of the real silhouette -- hair,
+   motion-blur fringe. A point seeded in that thin halo is actually stuck to the
+   character and slides with them. So the keep-region is shrunk 8 px inward
+   before any seed is planted.
+
+5. APERTURE / EDGE REJECT (min_corner_anisotropy = 0.08)                   [ON]
+   A point sitting on a plain line -- a rope, a table edge, the border of a TV
+   screen -- can be located ACROSS the line but not ALONG it. It will slide up
+   and down that line all shot and look fine while doing it. The bot measures
+   how "corner-like" versus "line-like" each seed is (1.0 = perfect corner,
+   0.0 = pure line) and drops anything under 0.08. This test does not care about
+   contrast, so unlike filter 1 it does not also throw away faint real corners.
+
+5b. ADAPTIVE EDGE FLOOR (adaptive_anisotropy)                             [OFF]
+   Optional upgrade to filter 5: instead of the fixed 0.08, look at THIS frame's
+   own spread of corner-vs-edge scores, and if it clearly splits into two groups,
+   cut at the split. Refuses to fire if it would remove more than half the seeds
+   (a plate made entirely of edges has nothing better to offer). Off by default.
+
+6. ALREADY-CLAIMED GROUND (claim radius = min_feature_dist)                [ON]
+   Seeds are planted at 4 different moments inside each window, not all at frame
+   one. Without this filter each of those 4 rounds would re-detect the SAME
+   corners (the frames barely differ) and produce 4 duplicate tracks per point.
+   So each round paints over the ground it took, and later rounds may only seed
+   what is genuinely new -- content that just entered or was revealed.
+
+7. PER-WINDOW SEED BUDGET (60 seeds per megapixel, floor 64, ceiling 1200) [ON]
+   Re-seeding runs every 30 frames. Without a cap, a 300-frame shot would ask
+   for the full seed count ten times over and saturate the machine. Instead each
+   window gets a budget scaled to the frame's resolution, so the total across a
+   shot grows with its LENGTH and resolution instead of exploding.
+
+
+================================================================================
+SECTION B -- MASK GATING: what the movers cover
+(app/tracker_core.py, _apply_per_frame_mask_gating)
+================================================================================
+
+8. PER-FRAME OCCLUSION MARKING (occlusion_continuity)                      [ON]
+   NOT A DELETE. When a character walks in front of a tracked point, those
+   frames are marked occluded and the track carries a HOLE through them. It used
+   to delete the whole track for the whole shot because of one crossing.
+   3DE accepts gapped tracks natively, so a hole is a perfectly good answer.
+
+9. OCCLUSION FLICKER GUARD (min_occlusion_run = 3 frames)                  [ON]
+   A point sitting right on the mask boundary flips in and out from sub-pixel
+   jitter alone, so the track appears to blink on and off while its pattern is
+   plainly visible. A real crossing lasts. Occluded runs shorter than 3 frames
+   are treated as boundary chatter and those frames are put back.
+
+10. INSIDE-MODE RESIDENCY (inside_ratio = 0.80)                          [COND]
+   Only used when mask_mode is "inside" (object tracking). A track must sit
+   inside the object mask for at least 80% of its life or it is dropped whole --
+   an object track that wanders off its object is not an object track.
+
+11. MASK EDGE PULL-IN AT GATE TIME (mask_margin_px = 8 px)                 [ON]
+   The same 8 px margin as filter 4, but applied every frame while gating. This
+   catches a track that started on safe ground and later DRIFTED into the halo
+   around a character -- something a seed-time-only check would miss.
+
+
+================================================================================
+SECTION C -- MOTION / SANITY FILTER (per pass)
+(app/tracker_core.py, _post_filter_tracks and _bad_track)
+================================================================================
+
+12. VISIBILITY RATIO (min_visibility_ratio = 0.05)                         [ON]
+   A track must be visible for at least 5% of the frames it spans. Anything
+   below that never really existed.
+
+13. MOTION-INLIER RATIO (min_motion_inlier_ratio = 0.10, residual 1% of diag)
+                                                                          [ON]
+   For each frame the bot works out the MEDIAN movement of all points -- roughly
+   "what the camera did". A track must move in rough agreement with that on at
+   least 10% of its frames. This is deliberately a very loose bar: a point with
+   real parallax (a close foreground object) genuinely does not match the median,
+   and must not be punished for it. This only catches total nonsense.
+
+14. MAXIMUM JUMP (max_jump_diag_frac = 0.05 of the frame diagonal)         [ON]
+   If a track ever teleports more than 5% of the frame diagonal in one frame,
+   it was never tracking a thing. Dropped.
+
+15. NaN / INFINITY GUARD                                                   [ON]
+   Any sample the tracker leaked as not-a-number or infinity is marked invisible
+   before anything else looks at it. Purely defensive.
+
+16. MINIMUM SURVIVING POINTS (min_track_points = 8)                        [ON]
+   After occlusion holes and gating have taken their bites, a track with fewer
+   than 8 usable frames left is not worth carrying forward.
+
+17. JUMP / JITTER REJECT (filter_max_jump_px, filter_max_jitter_px)       [OFF]
+   Optional hard limits in plate pixels: drop a track if any single-frame step
+   exceeds X, or if its average change-in-speed exceeds Y. Both default to 0
+   (off) because they are blunt -- a fast but SMOOTH high-parallax point passes,
+   but tuning them per shot is guesswork. Left as sliders.
+
+18. PATH SMOOTHING (smooth_window = 0)                                    [OFF]
+   Optional moving-average over each track's path. Off, because smoothing a
+   track hides tracking error rather than fixing it, and 3DE would rather have
+   the truth.
+
+
+================================================================================
+SECTION D -- CANDIDATE STAGE: choosing which tracks ship
+(app/track_filter.py)
+================================================================================
+
+19. PASS STITCHING (stitch_passes: 1.5 px apart, 4 frames overlap, 2 frame gap)
+                                                                          [ON]
+   NOT A DELETE -- A REPAIR. The bot runs 4 tracking passes (forwards, backwards,
+   from the middle) and seeds enter at staggered times, so one pass may hold the
+   first half of a feature's life and another the second half, under two
+   different IDs. Two features never sit 1.5 px apart for 4 straight frames, so
+   that pairing is trusted and the two halves are joined into one long track --
+   BEFORE anything judges tracks on length. Without this, the length gate saw
+   two short tracks and the spacing gate then deleted one as a duplicate.
+
+20. PASS FUSION (fuse_passes)                                             [OFF]
+   Would AVERAGE the passes that agree instead of picking one. The arithmetic
+   is correct and it beats an unweighted mean on constructed tests -- but it was
+   measured on two real bench shots and did not help: no gain at the median, and
+   the WORST track got worse on both. Reason: it runs before the refine stage,
+   so it averages two coarse guesses and can hand the refiner a start point
+   sitting between two features rather than on either. Left off with the numbers
+   recorded in the code so it is not silently re-enabled.
+
+21. LENGTH GATE (min_track_frames = 24)                                    [ON]
+   A track shorter than 24 frames does not constrain a camera solve; it just
+   makes the artist scroll. Scaled down on short shots -- it will never demand
+   more than a quarter of the shot's length, so a 40-frame plate is not gated
+   into nothing.
+
+21b. SPAN-FRACTION GATE (min_track_span_frac = 0.0)                       [OFF]
+   Same idea as 21 but expressed as a fraction of the shot. Off; the absolute
+   frame count is used instead.
+
+21c. QUALITY SCORE FLOOR (min_track_score = 0.35)                          [ON]
+   Every track gets a 0-1 score built from three things it can be judged on
+   WITHOUT comparing it to other tracks (so parallax is never punished):
+     - coverage  (50%): how much of the shot it covers, how few holes it has
+     - smoothness(30%): how little its own path jitters
+     - stability (20%): how small its worst single-frame jump is
+   Below 0.35 it does not ship. Note this score is a good ranking tool and a
+   POOR error predictor -- it rewards long unbroken tracks, and a smooth drifter
+   is exactly that. Filters 37 and 40 exist because of that blind spot.
+
+21d. GATE RELAXATION FLOOR (quality_gate_floor = 8)                        [ON]
+   Safety rail on 21 and 21c. If the gates would leave fewer than 8 tracks, they
+   are relaxed and the best 8 are kept instead. A hard shot returning something
+   flagged beats a hard shot returning nothing.
+
+22. EVEN SPREAD SELECTION (track_spacing_px = 60 px quoted at 1920 wide)   [ON]
+   The 4 passes produce up to 4 copies of every physical point, plus natural
+   clumping on high-contrast areas. This walks the list best-score-first and
+   accepts a track only if it stays at least 60 px from every track already
+   accepted -- giving an even blanket over the frame instead of clusters.
+   Two important details:
+     - spacing is measured ON SCREEN at 5 evenly-spaced frames, not on each
+       track's average position. With a moving camera two tracks can sit a few
+       px apart most of the shot while their averages are far apart.
+     - the 60 px is scaled by plate width / 1920, so one slider value looks the
+       same on HD, 4K and 6K.
+   The surviving COUNT floats with the footage. Dense texture clears the spacing
+   test in more places, so it exports more. There is no fixed target number.
+
+23. OUTPUT CEILING (max_output_tracks = 600)                               [ON]
+   A safety ceiling, not a target. Best-scoring tracks are taken first, so the
+   cap keeps the good ones. If only 200 clear the quality bar, 200 ship.
+
+24. START-TIME SPACING (spread_max_starts_per_window = 0)                 [OFF]
+   Would cap how many tracks are allowed to START within the same short window,
+   so track births are spread through the shot as well as across the frame.
+   Off -- staggered seeding already largely solved the bulk-arrival problem.
+
+
+================================================================================
+SECTION E -- INSIDE THE PATTERN REFINE (per frame, per segment)
+(app/pattern_refine.py). This is where a track is polished to sub-pixel and
+where most per-frame rejections happen.
+================================================================================
+
+Background: the moving-tile stage runs first and only MOVES positions -- it
+never drops a track. Then pattern refine cuts a small image patch at the point's
+first good frame (the "anchor") and matches it into every other frame at full
+plate resolution, the way 3DE does.
+
+25. LOCK-LOST BAR (refine_ncc_lost = 0.60)                                 [ON]
+   If the best match in a frame correlates below 0.60 with the pattern, the lock
+   is considered lost and the track is cut there (or handed to re-acquisition,
+   filter 30). Auto-tune moves it: 0.48 on a grainy plate (grain lowers every
+   score, so a fixed bar throws away good matches), 0.68 on a clean one.
+
+26. HYSTERESIS HOLD BAR (refine_ncc_hold = 0.45)                           [ON]
+   A single hard threshold means a correlation hovering right at 0.60 drops the
+   point for a frame here and there, and the track looks like it is flickering.
+   So: it takes 0.60 to declare a lock, but only 0.45 to KEEP one. A frame held
+   this way is never allowed to re-grab the pattern.
+
+27. RIVAL-PEAK / AMBIGUITY REJECT (match_ambiguity_ratio = 0.90)           [ON]
+   Repetitive detail -- rivets, bolts, window grids, tiles -- gives the matcher
+   several near-equal answers. Taking the single best silently snapped the point
+   to the identical feature NEXT DOOR, at high correlation, so nothing
+   downstream noticed. Now, if a second peak scores 90% or more of the winner,
+   the frame is refused outright. "I don't know" beats a confident wrong answer.
+
+28. RE-REFERENCE TRIGGER (refine_ncc_reref = 0.68)                         [ON]
+   As the shot goes on, lighting and perspective change and the original patch
+   stops matching. Below 0.68 (but still above the lost bar) the bot re-grabs a
+   fresh patch. This bar used to be 0.85, which meant re-grabbing on nearly
+   every frame -- that quietly turns a pattern tracker into a frame-to-frame one,
+   which random-walks off the feature. Re-referencing is now the exception.
+
+29. DRIFT GUARD (refine_drift_floor = 0.55, re-check every 24 frames)      [ON]
+   A re-grabbed patch is only accepted if it STILL correlates 0.55 or better
+   with the ORIGINAL anchor patch. Otherwise re-referencing has nothing tying it
+   to where it started and the point wanders off over a long shot. The anchor is
+   also re-checked every 24 frames regardless.
+
+30. RE-ACQUISITION AFTER A GAP (max gap 24 frames, bar 0.75, search 50%)   [ON]
+   A lost lock used to end that side of the track -- which is how points were
+   lost to occluders SAM3 never masked (a pole, a prop, a hand). Now the bot
+   keeps stepping through the gap and tries to re-find the ORIGINAL anchor
+   patch. Where to look is predicted from nearby surviving tracks. It demands a
+   higher bar than mid-track (0.75, not 0.60) and searches only HALF the normal
+   radius, so a rival feature further away cannot win the re-grab. Gives up
+   after 24 frames.
+
+31. SPLIT UNVERIFIED SEGMENTS (split_unverified_segments)                  [ON]
+   If the segment after a gap does NOT pass the anchor check, it is emitted as
+   a SEPARATE track rather than welded onto the old ID. Welding two different
+   features together is invisible until the camera solve fails, so on any doubt
+   it splits.
+
+32. END EXTENSION, STOPS AT FIRST FAILURE (refine_extend_max = 48 frames)  [ON]
+   NOT A DELETE -- AN EXTENSION, with a filter built in. A track starts where a
+   seed happened to enter and stops where its pass ran out; neither says
+   anything about the feature, usually still visible either side. So the bot
+   walks outward from the OUTER ends, matching the original anchor at the
+   position the track's own speed predicts, demanding the strict 0.75 bar, and
+   verifying each frame backwards. It STOPS at the first failed frame -- because
+   skipping a bad frame is exactly how a point walks through an occluder and
+   re-attaches on the far side. It never walks into an internal gap; that gap is
+   an occlusion and filter 30 is what crosses it.
+
+33. FORWARD-BACKWARD CONSISTENCY (refine_fb_max_px = 1.5 px)               [ON]
+   Refine the segment, then re-run it backwards. A good point returns to where
+   it started. If the MEDIAN return error exceeds 1.5 px the whole segment is
+   rejected; if only a contiguous TAIL fails, just that tail is trimmed (a
+   perforated track full of holes is useless to 3DE, so this never punches
+   single frames out of the middle). Self-referential, so parallax is safe.
+   Roughly doubles refine time.
+
+34. REFINED-TRACK MINIMUM LENGTH (refine_min_len = 8 frames)               [ON]
+   After all of the above trimming, a refined piece shorter than 8 frames is
+   dropped.
+
+35. 1-D FEATURE DROP (segment reason "edge")                               [ON]
+   If the refiner finds a segment's correlation surface is a RIDGE rather than a
+   peak, the point is on a line, not a corner (same problem as filter 5, caught
+   later at full resolution). Those points are dropped rather than kept in their
+   raw state -- raw they would be both jittery and still sliding.
+
+36. ZERO-VARIANCE PATCH REJECT                                             [ON]
+   A patch of flat sky or a blown-out highlight has no variation, and the
+   correlation maths divides by its standard deviation. Rejected outright rather
+   than producing a meaningless number.
+
+
+================================================================================
+SECTION F -- POST-REFINE GATES (order is deliberate)
+(app/tracker_core.py lines ~1990-2025, implemented in app/track_filter.py)
+================================================================================
+
+37. SEED IDENTITY GATE (min_seed_identity = 0.25)                          [ON]
+   Compares the track's patch at its FIRST frame with its patch at its LAST
+   frame. This is the ONLY test that catches a point which slid SMOOTHLY off its
+   feature over a whole shot. Such a track has a sharp correlation peak every
+   frame (so certainty passes it), runs the whole shot unbroken (so the score
+   ranks it TOP), and never jitters (so wobble sees nothing).
+   Measured on a real plate: the drifter scored -0.055 while every other
+   exported track scored 0.50 to 0.99. So this is an outlier catch, not a
+   ranking. It is an ABSOLUTE bar, because "is this still the same patch" means
+   the same thing on every plate.
+   Safety rail: if more than half the export fails it, the PLATE changed
+   (a lighting cut, a whip pan) rather than every track drifting -- so it is not
+   applied at all.
+   Runs FIRST and on the full set, deliberately: a drifter must also leave the
+   backfill pool (filter 39), or it simply comes back through that door.
+
+38. CERTAINTY GATE -- ABSOLUTE FLOOR (min_track_certainty, auto-tuned)     [ON]
+   Certainty = how SHARP the correlation peak was, i.e. how confidently the
+   point was localised. It can only be known after refine, which is why this
+   gate cannot live with the others. It is the one signal that catches a
+   defocused point, because such a point's motion statistics -- long, smooth, no
+   jumps -- are excellent and fool every other test.
+   The floor is set by the auto-tune from how much of the FRAME is in focus:
+     - under 25% of frame sharp -> 0.35 (nearly every seed lands on soft ground)
+     - soft, or under 50% sharp -> 0.25
+     - otherwise               -> 0.12
+
+38b. CERTAINTY GATE -- RELATIVE BAR (certainty_rel = 0.80)              [COND]
+   An absolute certainty number cannot travel between plates -- it depends on
+   contrast, grain and lens, so 0.5 is excellent on one shot and poor on
+   another. So each track is also compared to its OWN shot's best.
+   Critically, this only fires when the shot's numbers show TWO POPULATIONS with
+   a clean gap between them (the sharp-subject / defocused-background case).
+   On a single smeared-out population it is switched off, because slicing an
+   arbitrary percentile off a continuum cut 13 of 23 tracks on a bench shot
+   whose true error was 0.06 px on every one of them.
+   Where a real gap exists the bot cuts AT THE GAP rather than at a percentile,
+   because on a defocused background the GOOD tracks are the minority and a
+   percentile bar lands inside the bad cluster.
+
+38c. CERTAINTY CUT CAP (certainty_max_cut = 0.6)                           [ON]
+   If the gate wants to remove more than 60% of the tracks AND there is no clean
+   gap in the numbers, it is measuring badly rather than finding something --
+   so the cut is capped and the best 40% are kept. If there IS a clean gap, the
+   cut stands at any size, because then it is discriminating, not arbitrary.
+
+38d. UNMEASURED = NOT JUDGED                                               [ON]
+   A track with no certainty number (refine could not anchor it at all) is NOT
+   a track with bad certainty. Those are excluded from the distribution and
+   never dropped by it. Counting them as zero once both condemned them AND
+   manufactured a fake gap wide enough to look like two populations, which
+   dropped 23 accurate tracks on a bench shot.
+
+39. BACKFILL TO FLOOR (min_export_tracks = 40)                             [ON]
+   THE ONLY ANTI-FILTER. A handful of tracks with no explanation is not a usable
+   delivery. If the export has fallen below 40 tracks, it is topped back up from
+   the best rejects, and those additions are FLAGGED as weak in the track report
+   so the artist knows which ones to look at.
+   The top-up is ranked by wobble, not by score, because on real footage wobble
+   is the only measure here that predicts true error (+0.573 correlation), while
+   score is actively misleading (+0.291 -- it ranks drifters as the best tracks).
+
+40. WOBBLE GATE (wobble_rel = 0.0)                                        [OFF]
+   Would drop any track deviating from its own smooth path by more than 1.5x the
+   shot's own median. It runs LAST and on the FINAL set, so it can see what the
+   top-up just added -- a filter that sees only part of the export cannot remove
+   a track that came in through another door.
+   Off by default: measured on real footage it cut 14 of 29 tracks and left the
+   worst one (20.5 px) untouched, because that track drifts SMOOTHLY and wobble
+   only measures deviation from a track's own smooth path. Kept as a slider for
+   shots where visible jitter is the actual complaint.
+
+41. DEFRAGMENT (max 2 holes, each >= 3 frames, each run >= 8 frames)       [ON]
+   Occlusion continuity (filter 8) deliberately lets a track survive a crossing
+   by carrying a hole. One or two long holes is exactly that, and worth keeping
+   under one ID.
+   MANY SHORT holes is a different animal: not an occluded track but a marginal
+   one that kept losing and regaining lock -- and it blinks on and off in the
+   3DE viewport like an LED. So a track may carry at most 2 holes, each at least
+   3 frames long (i.e. plausibly something really crossing), and every visible
+   stretch must be at least 8 frames. Anything else is CUT into its continuous
+   runs, and runs too short to use are dropped. A solid track is never touched
+   here whatever its length -- length is the quality gate's job.
+
+42. GEOMETRIC + APERTURE REPORTS                                  [REPORT ONLY]
+   Two measurements that are written to the track report and the log but NEVER
+   used to drop anything:
+     - Epipolar residual: how well each track agrees with the shot's overall
+       camera geometry. Deliberately never gated, because a point on a real
+       moving object is off-geometry AND correct -- gating on this would delete
+       exactly the object tracks the bot was asked for.
+     - Aperture report: says out loud when most of what got tracked can only
+       slide along an edge. On a plate whose only structure IS edges there is
+       nothing better to offer, so the batch publishes and flags for review
+       rather than returning an empty shot.
+
+ALSO OFF: PER-TRACK POLICY (per_track_policy)                             [OFF]
+   Not a filter itself -- it would give every track its OWN settings (pattern
+   box size, motion model, NCC bars) based on what its seed is sitting on
+   (corner / blob / edge / dense) instead of one setting for the whole shot.
+   Turned on during development, then turned back off when measured on a real
+   soft plate: the classifier judges cornerness against the FRAME'S OWN
+   percentiles, so on a plate where everything is soft it still labels the top
+   quartile "corner" and SHRINKS their pattern box -- the opposite of what a
+   soft feature needs. It fought the shot-level auto-tune and lost, on exactly
+   the shot type it was enabled to help.
+
+
+================================================================================
+SECTION G -- THE SYNTHEYES BACKEND (the default engine)
+(app/syntheyes_engine.py, _apply_sam3_postfilter)
+================================================================================
+
+SynthEyes has its own tracker and its own notion of a good track. Grading it
+with measurements derived from the TAPNext path mixed two policies with no
+number to justify either, so that was deliberately stopped. Its output is
+published as tracked, with only two filters:
+
+S1. SAM3 MASK POST-FILTER
+   Every exported point is sampled against that frame's mask. White (>=127) is
+   background and is KEPT; black is a mover and is DROPPED. A point whose frame
+   has no matching mask is kept ungated (and the count of those is logged
+   separately, so "the mask did nothing" and "the mask dropped everything" do
+   not look alike -- a plate numbered from 1001 against 120 masks lines up with
+   nothing).
+
+S2. MINIMUM TRACK LENGTH (5 points)
+   After gating, a track with fewer than 5 surviving points is dropped.
+
+S3. ALL-GATED-AWAY SAFETY
+   If the gating wipes out every track, the shot is FAILED and the export file
+   removed, rather than overwriting a good ungated export with an empty one
+   (which would then publish over a previously good delivery). The masks are
+   probably inverted or misaligned.
+
+Note: a full score-gate-spread-cap chain for finished tracks exists in
+app/track_filter.py (filter_tracks) but has had no caller since 2026-08-11. It
+is kept intact so reinstating it is a decision, not a rewrite.
+
+
+================================================================================
+SECTION H -- FILTERS OUTSIDE THE TRACKING STAGE
+================================================================================
+
+ANALYZE STAGE
+   Qwen describes each shot; deterministic term lists in the heuristics module
+   filter those descriptions into SAM3 include/exclude prompts. Client
+   requirements (the requirements file and anything typed in the UI) are merged
+   in and win.
+
+MASK STAGE
+   - Mask dilation (10 px): grows the exclude region at MASK time, because SAM3
+     edges are soft and a matte that stops short of the silhouette leaves a halo.
+   - Reuse existing masks: if a shot already has masks, SAM3 is skipped.
+   - Motion backstop: OFF by default. It would mask anything moving
+     independently of the camera as a fourth safety net -- but that includes
+     objects the artist deliberately removed from the exclude list, so it
+     overrides a decision made on purpose. Opt in per shot.
+
+FRAME RANGE
+   frame_start / frame_end (1-based, inclusive, 0 = unset) slice the clip before
+   anything runs. Exported frame numbers stay aligned to the original shot.
+
+
+================================================================================
+QUICK SUMMARY -- WHAT IS OFF BY DEFAULT
+================================================================================
+   5b  adaptive anisotropy floor       -- needs measuring
+   17  jump / jitter hard limits       -- blunt, per-shot guesswork
+   18  path smoothing                  -- hides error rather than fixing it
+   20  pass fusion                     -- measured on two shots and rejected
+   21b span-fraction length gate       -- absolute frame count used instead
+   24  start-time spacing              -- staggered seeding solved it
+   40  wobble gate                     -- cut 14/29 and missed the real drifter
+   --  per-track policy                -- classifier is relative, fails on soft
+                                          plates
+
+WHAT CATCHES WHAT (the short version)
+   Point on an edge, slides along it ......... 5, 35
+   Point on a mover / occluded ............... 3, 8, 11, S1
+   Point that teleports ...................... 14, 21c
+   Point that snapped to an identical rival ... 27, 30
+   Point that is soft / badly localised ...... 38
+   Point that slid SMOOTHLY off its feature ... 37 (nothing else sees it)
+   Point that blinks on and off .............. 9, 41
+   Too many points, clumped .................. 22, 23
+   Too few points ............................ 21d, 38c, 39 (all push back)
+================================================================================
