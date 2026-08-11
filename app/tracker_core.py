@@ -85,6 +85,14 @@ class RunnerConfig:
     # lambda_max) is below this: a corner tends to 1, a pure edge to 0. Contrast-invariant, so
     # unlike feature_quality it does not also throw away faint-but-real corners. 0 = off.
     min_corner_anisotropy: float = 0.08
+    # Raise the anisotropy floor to the frame's OWN edge/corner split when the distribution
+    # is genuinely bimodal, instead of trusting one constant on every plate. See
+    # _drop_edge_points for the measurement that motivates it. Never cuts below
+    # min_corner_anisotropy, and never removes more than adaptive_anisotropy_max_cut of the
+    # seeds -- a frame that is mostly edges has nothing better to offer, and an empty shot is
+    # worse than a flagged one (see track_filter.aperture_report).
+    adaptive_anisotropy: bool = False
+    adaptive_anisotropy_max_cut: float = 0.5
 
     mask_subdir: str = "masks"
     output_tag: str = ""
@@ -786,11 +794,36 @@ class BatchTrackerRunner:
         lmin = np.minimum(np.abs(l1), np.abs(l2))
         if thr > 0.0:
             ratio = np.divide(lmin, lmax, out=np.zeros_like(lmax), where=lmax > 1e-12)
+            why = f"< {thr:.2f}"
+            # Self-calibrating floor. The absolute one cannot travel: measured on a synthetic
+            # wall + door edge, seeds strictly on the edge run 0.075/0.128/0.665 (p10/50/90)
+            # against 0.663/0.843/0.947 for everything else -- a clean split, but the default
+            # 0.08 sits BELOW even the edge population's p10, so 16 of 22 edge seeds survive
+            # it. Where the split is real, cut at the split instead of at a constant.
+            #
+            # Only when the frame's own distribution is genuinely bimodal (the same
+            # two-population test certainty_gate uses, and for the same reason: a largest gap
+            # on its own fires on ordinary spread). A frame of uniform texture has one
+            # population and keeps the absolute floor.
+            if bool(getattr(self.cfg, "adaptive_anisotropy", False)) and ratio.size >= 8:
+                gap, cut = _tf.two_population_split(ratio.tolist())
+                # Never below the configured floor, and never a cut that guts the frame --
+                # on a plate whose only structure IS edges, dropping them leaves nothing to
+                # track and the aperture report is the right response, not an empty shot.
+                if gap > 0.0 and cut > thr:
+                    frac_cut = float(np.mean(ratio < cut))
+                    cap = float(getattr(self.cfg, "adaptive_anisotropy_max_cut", 0.5) or 0.5)
+                    if frac_cut <= cap:
+                        thr, why = cut, f"< {cut:.2f} (split, gap {gap:.2f})"
+                    else:
+                        self._status(f"  seeds: anisotropy split at {cut:.2f} would drop "
+                                     f"{frac_cut:.0%} of seeds (> {cap:.0%}) -- keeping the "
+                                     f"absolute floor; this frame is mostly edges")
             keep = ratio >= thr
             n_drop = int(pts.shape[0] - np.sum(keep))
             if n_drop:
                 self._status(f"  seeds: dropped {n_drop}/{pts.shape[0]} edge-like point(s) "
-                             f"(anisotropy < {thr:.2f}) - these slide along edges")
+                             f"(anisotropy {why}) - these slide along edges")
             pts, lmin, lmax = pts[keep], lmin[keep], lmax[keep]
         if not want_feats or pts.shape[0] == 0:
             return pts, [], SeedStats()

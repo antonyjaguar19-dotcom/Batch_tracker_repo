@@ -1376,6 +1376,9 @@ class AppState:
     # has a single pass). Off until measured on real footage.
     fuse_passes: bool = False
     fuse_age_tau: float = 30.0
+    # Raise the seeding anisotropy floor to the frame's own edge/corner split when the
+    # distribution is genuinely bimodal. See RunnerConfig.adaptive_anisotropy.
+    adaptive_anisotropy: bool = False
     # Coarse-to-fine NCC in pattern_refine. Output-identical to the single-level search
     # (0.0000px median difference), so this is purely speed; see RunnerConfig.refine_pyramid.
     refine_pyramid: bool = False
@@ -2441,6 +2444,7 @@ def _track_shots_tapnext(in_root, out_root, shot_tasks_map, state, grid, seed_co
                 fuse_passes=bool(getattr(state, "fuse_passes", False)),
                 fuse_age_tau=float(getattr(state, "fuse_age_tau", 30.0) or 30.0),
                 refine_pyramid=bool(getattr(state, "refine_pyramid", False)),
+                adaptive_anisotropy=bool(getattr(state, "adaptive_anisotropy", False)),
             )
             runner = BatchTrackerRunner(cfg, on_status=lambda m: logger(f"TRACK: {m}"))
             runner.run()

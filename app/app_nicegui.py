@@ -2039,6 +2039,17 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                     sw_refine.tooltip("After selection, re-track each point at NATIVE resolution with an NCC pattern box + "
                                       "affine (rotation/scale) refine, like a 3DE pattern/search box. Locks to the contrast pattern, "
                                       "sub-pixel; trims a track where it loses lock. Breaks the 256px precision ceiling.")
+                    sw_aniso = ui.switch("Adaptive edge rejection (per-shot)",
+                                         value=getattr(state, "adaptive_anisotropy", False),
+                                         on_change=lambda e: setattr(state, "adaptive_anisotropy", bool(e.value)))
+                    sw_aniso.tooltip("A point on an edge can only be located ACROSS it, never along it, so it "
+                                     "slides -- and a slide is long, smooth and jump-free, which is exactly what "
+                                     "the quality score rewards, so these survive to the export. The fixed floor "
+                                     "that rejects them cannot travel between plates. This measures the shot's own "
+                                     "edge-vs-corner distribution and cuts at the gap when there genuinely is one, "
+                                     "leaving the fixed floor alone when there is not. Never drops more than half "
+                                     "the seeds: a shot whose only structure IS edges gets flagged for review "
+                                     "instead of emptied.")
                     sw_pyr = ui.switch("Coarse-to-fine NCC search (speed)",
                                        value=getattr(state, "refine_pyramid", False),
                                        on_change=lambda e: setattr(state, "refine_pyramid", bool(e.value)))

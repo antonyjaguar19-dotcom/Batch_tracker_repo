@@ -951,6 +951,47 @@ def geometric_residuals(tracks: Dict[str, Track], width: int, height: int,
     return out
 
 
+def two_population_split(vals, min_gap: float = 0.05, min_n: int = 8
+                         ) -> Tuple[float, float]:
+    """Find a genuine bimodal split in `vals`. Returns (gap_size, cut_value); (0,0) if none.
+
+    "Largest gap" alone does NOT establish two populations. Any sample of a continuum has a
+    largest gap, and in a sparsely-sampled tail it is routinely several times the typical
+    spacing -- so a plain largest-gap rule fires on ordinary spread. It did exactly that on
+    bench/lab02, where every track is accurate to 0.06px: certainty ran 0.35-0.87 with a
+    0.075 gap at 0.79 (3.7x the median gap) and the gate dropped 20 of 23 tracks with nothing
+    wrong with any of them.
+
+    What separates two populations from one is the gap measured against how spread out each
+    SIDE is on its own. A continuum has a gap smaller than its own scatter; a real split has
+    a gap far larger than either side's scatter and stays that way as the sides grow.
+
+    Extracted from certainty_gate so the seeding anisotropy floor can use the same test
+    rather than growing a second, subtly different one.
+    """
+    vals = [float(v) for v in vals if v == v]
+    if not vals:
+        return 0.0, 0.0
+    sv = np.sort(np.array(vals, dtype=float))
+    gaps = np.diff(sv)
+    if not len(gaps) or len(sv) < min_n:
+        return 0.0, 0.0
+    gi = int(np.argmax(gaps))
+    gap = float(gaps[gi])
+    lo_side, hi_side = sv[:gi + 1], sv[gi + 1:]
+
+    def _spread(side: np.ndarray) -> float:
+        # A single-point side cannot vouch for itself; reading 0.0 would declare every
+        # isolated point a population.
+        return float(side.std()) if side.size >= 2 else float("nan")
+
+    known = [s for s in (_spread(lo_side), _spread(hi_side)) if not math.isnan(s)]
+    scatter = max(known) if known else float(np.median(gaps))
+    if gap >= min_gap and gap >= 2.0 * max(scatter, 1e-6) and min(len(lo_side), len(hi_side)) >= 2:
+        return gap, float((sv[gi] + sv[gi + 1]) * 0.5)
+    return 0.0, 0.0
+
+
 def aperture_report(aperture: Dict[str, float], n_tracks: int, hi: float = 0.5,
                     warn_frac: float = 0.35, log: Optional[Callable] = None) -> Dict[str, float]:
     """Summarise how much of a shot is aperture-limited, and say so when it is a lot.
@@ -1110,28 +1151,7 @@ def certainty_gate(tracks: Dict[str, Track], certainty: Dict[str, float], cfg,
     # focus split has a gap far larger than either side's scatter (soft 0.30 +/-0.03 versus
     # sharp 0.85 +/-0.03 -> gap 0.5, unmistakable) and stays unmistakable when the sharp
     # cluster is a tenth of the tracks.
-    split_gap, gap_mid = 0.0, 0.0
-    if vals:
-        a = np.array(vals, dtype=float)
-        sv = np.sort(a)
-        gaps = np.diff(sv)
-        # Below ~8 samples "two populations" is not a claim the numbers can support.
-        if len(gaps) and len(sv) >= 8:
-            gi = int(np.argmax(gaps))
-            gap = float(gaps[gi])
-            lo_side, hi_side = sv[:gi + 1], sv[gi + 1:]
-            # Scatter WITHIN each side. A single-point side has no scatter of its own, so it
-            # cannot vouch for itself -- fall back to the whole set's spacing scale instead of
-            # reading 0.0 and declaring every isolated point a population.
-            def _spread(side: np.ndarray) -> float:
-                return float(side.std()) if side.size >= 2 else float("nan")
-            s_lo, s_hi = _spread(lo_side), _spread(hi_side)
-            known = [s for s in (s_lo, s_hi) if not math.isnan(s)]
-            scatter = max(known) if known else float(np.median(gaps))
-            # Two populations only when the gap dominates the scatter inside them.
-            if gap >= 0.05 and gap >= 2.0 * max(scatter, 1e-6) and min(len(lo_side), len(hi_side)) >= 2:
-                split_gap = gap
-                gap_mid = float((sv[gi] + sv[gi + 1]) * 0.5)
+    split_gap, gap_mid = two_population_split(vals)
 
     if rel > 0.0 and vals:
         a = np.array(vals, dtype=float)
