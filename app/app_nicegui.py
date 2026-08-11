@@ -1830,17 +1830,6 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                      on_change=lambda e: setattr(state, "use_sam3_matte", bool(e.value)))
                 sw_matte.tooltip("Feed SAM3 per-frame masks into SynthEyes so trackers avoid masked regions. Off = track full frame.")
 
-                sw_seref = ui.switch("Sub-pixel pattern refine on SynthEyes tracks",
-                                     value=getattr(state, "refine_syntheyes", False),
-                                     on_change=lambda e: setattr(state, "refine_syntheyes", bool(e.value)))
-                sw_seref.tooltip("Run the same native-resolution NCC/ECC pattern lock over the finished "
-                                 "SynthEyes export that the TAPNext path already gets, then gate on the "
-                                 "certainty and seed-identity it measures. Against ground truth on raw "
-                                 "tracker input it pulls the median to ~0.11px. Two costs: it is the slow "
-                                 "stage (tens of minutes on a 4K shot), and it DROPS tracks that never "
-                                 "lock, so the delivered count changes. Leave off unless you have compared "
-                                 "a refined and an unrefined export on your own plate.")
-
                 sw_3de = ui.switch("Auto-create .3de project", value=state.auto_3de,
                                    on_change=lambda e: setattr(state, "auto_3de", bool(e.value)))
                 sw_3de.tooltip("After export, build a 3DEqualizer .3de project from the 2D tracks. Needs the 3DE4 exe below.")

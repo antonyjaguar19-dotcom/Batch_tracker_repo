@@ -1212,8 +1212,14 @@ def filter_tracks(tracks: Dict[str, Track], T: int, width: int, height: int, cfg
                   log: Optional[Callable] = None) -> Dict[str, Track]:
     """Score -> gate -> spread -> cap, on an already-exported set of tracks.
 
-    Entry point for backends that produce finished tracks rather than candidate arrays
-    (SynthEyes), so both paths end up with the same solve-ready selection.
+    Entry point for a backend that produces finished tracks rather than candidate arrays.
+
+    NO CALLER as of 2026-08-11: the SynthEyes path was its only one, and that path is now
+    masking-only by decision -- SynthEyes output is published as tracked, because it has its
+    own tracker and its own notion of a good track, and grading it with measurements derived
+    from the TAPNext path mixed two policies without a number to justify either. Kept intact
+    rather than deleted so reinstating it is a call site again, not a rewrite; the TAPNext
+    path uses the same stages individually (quality_gate / select_spread / defragment).
     """
     if not tracks:
         return tracks
