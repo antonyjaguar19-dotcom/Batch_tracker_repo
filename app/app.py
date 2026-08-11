@@ -56,8 +56,36 @@ def _add_to_sys_path(path_str: str):
         sys.path.insert(0, path_str)
         print(f"DEBUG: Added to sys.path: {path_str}")
 
+
+# Directories that hold OLD COPIES of live modules. The loaders below rglob the repo for a
+# filename, and Path.rglob walks in directory order -- so `backup/...` is reached before
+# `pipeline/...` and an archived copy wins. That is not hypothetical: on 2026-08-11 Analyze
+# failed with "Local Qwen2.5-VL model folder not found" while the 7B weights sat correctly in
+# pipeline/qwen/models, because the loader had picked backup/ui_redesign_20260806/, whose
+# sibling models/ does not exist. sam3_runner.py had the same exposure, so Mask would have
+# loaded an archived runner too.
+#
+# Filename-based discovery is deliberate here (the embeddable interpreter's ._pth blocks
+# normal path setup, see the module docstring) -- so the fix is to exclude the archives, not
+# to stop searching.
+_SHADOW_DIRS = ("venv", "site-packages", "backup", ".git", "__pycache__")
+
+
+def _is_shadow_copy(path) -> bool:
+    """True for a hit that is an archived/vendored duplicate rather than the live module."""
+    parts = [q.lower() for q in Path(path).parts]
+    return any(d in parts for d in _SHADOW_DIRS)
+
+
 def _bootstrap_paths():
-    """Recursively find critical modules (core, SAM3, Qwen) and fix sys.path."""
+    """Recursively find critical modules (core, SAM3, Qwen) and fix sys.path.
+
+    Every search here goes through _is_shadow_copy. A stale copy under backup/ sorts BEFORE
+    the live one under pipeline/ and silently wins -- measured 2026-08-11: Analyze died with
+    "Local Qwen2.5-VL model folder not found" while the 7B weights sat correctly in
+    pipeline/qwen/models, because the backup copy resolves models/ relative to itself. Mask
+    had the same exposure through sam3_runner.py.
+    """
     _add_to_sys_path(os.getcwd())
 
     candidates = [
@@ -77,6 +105,7 @@ def _bootstrap_paths():
         if not found_core:
             try:
                 for p in root.rglob("io_parsers.py"):
+                    if _is_shadow_copy(p): continue
                     if p.parent.name == "core":
                         package_root = str(p.parent.parent)
                         _add_to_sys_path(package_root)
@@ -137,12 +166,12 @@ def _load_tracker_direct():
         if not r.exists(): continue
         if tracker_path is None:
             for h in r.rglob("tracker_core.py"):
-                if "venv" in str(h) or "site-packages" in str(h): continue
+                if _is_shadow_copy(h): continue
                 tracker_path = h
                 break
         if meta_path is None:
             for h in r.rglob("video_meta.py"):
-                if "venv" in str(h) or "site-packages" in str(h): continue
+                if _is_shadow_copy(h): continue
                 meta_path = h
                 break
         if tracker_path is not None and meta_path is not None:
@@ -283,11 +312,10 @@ def _load_sam3_direct():
     sam3_path = None
     for r in roots:
         if not r.exists(): continue
-        hits = list(r.rglob("sam3_runner.py"))
-        for h in hits:
-            if "venv" not in str(h) and "site-packages" not in str(h):
-                sam3_path = h
-                break
+        for h in r.rglob("sam3_runner.py"):
+            if _is_shadow_copy(h): continue
+            sam3_path = h
+            break
         if sam3_path: break
         
     if not sam3_path:
@@ -333,7 +361,7 @@ def _load_qwen_robustly():
     for r in roots:
         if not r.exists(): continue
         for p in r.rglob("run_qwen2_shot_describer.py"):
-            if "venv" in str(p): continue
+            if _is_shadow_copy(p): continue
             found = p
             break
         if found: break
