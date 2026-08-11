@@ -43,6 +43,47 @@ if be.disable_console_quickedit():
 from nicegui import ui, run, app as nicegui_app  # noqa: E402
 
 
+# Settings that per-shot auto-tune also writes. A control bound to one of these with a plain
+# setattr is DEAD whenever auto_tune is on -- which is the default: tracker_core._auto_tune
+# runs after the config is built and setattr()s every key shot_profile.tune() returns, so the
+# slider's value is overwritten before it is ever used.
+#
+# Measured on SH016 (sharp=0.042, texture 18.3): whatever the Pattern box slider was set to,
+# auto-tune replaced it with 41, and the NCC hold slider with 0.52.
+#
+# RunnerConfig.auto_tune_overrides is the existing mechanism for "the user meant this" and it
+# works -- the same call with the override recorded keeps 21 and 0.80. The UI simply never
+# wrote to it. `_ui_set` does, so a moved slider wins over the plate measurement, which is
+# what the auto_tune docstring has always claimed.
+#
+# The key list is derived from shot_profile at import, not hardcoded, so a newly tuned
+# parameter is protected the day it is added rather than the day someone notices.
+def _auto_tuned_keys() -> set:
+    try:
+        import inspect
+        import re as _re
+        from app import shot_profile as _sp
+        src = inspect.getsource(_sp.tune)
+        return set(_re.findall(r'out\[[\'"](\w+)[\'"]\]', src))
+    except Exception:
+        return {"feature_quality", "min_feature_dist", "min_track_certainty",
+                "refine_bandpass", "refine_ncc_hold", "refine_ncc_lost", "refine_patch_px"}
+
+
+_AUTO_TUNED = _auto_tuned_keys()
+
+
+def _ui_set(state, field: str, value) -> None:
+    """Set an AppState field from a control, and defend it from auto-tune if need be."""
+    setattr(state, field, value)
+    if field in _AUTO_TUNED:
+        ov = getattr(state, "auto_tune_overrides", None)
+        if ov is None:
+            ov = {}
+            state.auto_tune_overrides = ov
+        ov[field] = value
+
+
 # -----------------------------------------------------------------------------
 # State (single-user local tool -> one shared AppState)
 # -----------------------------------------------------------------------------
@@ -1925,7 +1966,7 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
 
                     ui.label("Lock hold strength (anti-flicker)")
                     hold = ui.slider(min=0.2, max=0.6, value=float(getattr(state, "refine_ncc_hold", 0.45)), step=0.05).props("label-always")
-                    hold.on_value_change(lambda e: setattr(state, "refine_ncc_hold", float(e.value or 0.45)))
+                    hold.on_value_change(lambda e: _ui_set(state, "refine_ncc_hold", float(e.value or 0.45)))
                     hold.tooltip("It takes a strong match to trust a point, but only this much to KEEP trusting it. "
                                  "Without the gap between the two, a match hovering near the cutoff drops the point "
                                  "for single frames on grainy footage. Lower = holds on longer. A frame held this "
@@ -2061,7 +2102,7 @@ with ui.left_drawer(value=True, fixed=False).props("width=340 bordered").classes
                                    "frames it does run.")
                     ui.label("Pattern box (px · odd)")
                     refine_patch = ui.slider(min=15, max=61, value=int(getattr(state, "refine_patch_px", 31)), step=2).props("label-always")
-                    refine_patch.on_value_change(lambda e: setattr(state, "refine_patch_px", int(e.value or 31)))
+                    refine_patch.on_value_change(lambda e: _ui_set(state, "refine_patch_px", int(e.value or 31)))
                     refine_patch.tooltip("Pattern-box size for the NCC lock. Larger = more stable on low contrast, less local; smaller = tighter to fine detail.")
             tap_box.bind_visibility_from(backend_sel, "value",
                                          backward=lambda v: v in ("tapnext", "both"))
