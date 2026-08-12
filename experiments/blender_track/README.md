@@ -50,23 +50,40 @@ while True:
 print(i,'frames')"
 ```
 
-Then the bot for the guide, then the hybrid, then score:
+Then the bot for the guide, then Blender. **Use these two `--set` flags** — they are what
+the measurements in `FINDINGS.md` were taken with:
 
 ```bat
-runtime\python311\python.exe bench\run_bench.py --shot experiments\blender_track\out\SH004 --tag guide
+REM ~139s. Refines OFF because Blender does that job, and spacing opened up so the
+REM guide is dense: at the default 60 this shot exports 28 tracks, at 15 it exports 122.
+runtime\python311\python.exe bench\run_bench.py --shot experiments\blender_track\out\SH004 ^
+    --tag dense_raw --set track_spacing_px=15 --set moving_tile=0 --set pattern_refine=0
 
+REM ~26s
 runtime\python311\python.exe experiments\blender_track\run_blender_hybrid.py ^
     --plate experiments\blender_track\out\SH004\plate --name SH004 ^
-    --reuse-tapnext experiments\blender_track\out\SH004\runs\guide\SH004__tapnext.txt --tag repl
-
-runtime\python311\python.exe tools\eval_refs.py refs\SH004_lk ^
-    --bot experiments\blender_track\out\SH004__repl__blender.txt ^
-    --baseline experiments\blender_track\out\SH004\runs\guide\SH004__tapnext.txt
+    --reuse-tapnext experiments\blender_track\out\SH004\runs\dense_raw\SH004__tapnext.txt ^
+    --tag dense
 ```
+
+`tools\eval_refs.py refs\SH004_lk` will run against the result, but read `first_step`
+before believing any row: at 122 tracks the proximity pairing starts matching a reference
+to a *neighbouring* feature, and a 12px first-step means the pairing is wrong, not the
+track. See `FINDINGS.md`.
 
 Drop `--reuse-tapnext` to have the runner call the bot itself. That builds a `RunnerConfig`
 directly rather than going through the shipping `AppState` mapping, so the two-step form
 above is preferred when the numbers matter.
+
+### Tune it
+
+```bat
+runtime\python311\python.exe experiments\blender_track\sweep.py --shot bench\synth\lab02
+```
+
+Ten Blender configurations against exact ground truth, ~3 min, no GPU. As measured, the
+**defaults already win** — Affine, Perspective, `PREV_FRAME` and bigger pattern boxes are
+all worse. Re-run it after changing `KIND_GEOM` in `bl_track.py`.
 
 ### Watch it
 
@@ -104,6 +121,8 @@ Then:
 | `--no-replant` | how much of the track span comes from resuming dead tracks |
 | `--no-backward` | whether late-seeded tracks are covering the head of the shot |
 | `--source seeder` | the raw seeder with no guide at all — no TAPNext pass needed |
+| `--motion-model`, `--pattern-scale`, `--search-scale`, `--pattern-match` | what `sweep.py` sweeps |
+| `--max-guide-dev PX` | truncate where Blender and TAPNext disagree. **Measured as harmful** against a raw guide — it trims the better of the two. Off by default; see `FINDINGS.md` |
 
 ## If it fails
 

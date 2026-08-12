@@ -4,9 +4,11 @@ Question asked: the bot already seeds with TAPNext and re-acquires after occlusi
 if the per-frame *measurement* in between were done by Blender's movie-clip tracker
 instead of the bot's own refine chain?
 
-Answer: **the mechanism works end to end, headless, and the numbers are in.** On exact
-synthetic ground truth the hybrid is slightly *better* than the shipping bot; on the one
-usable real-plate reference it is a tie. Nothing in `app/` was modified.
+Answer: **it replaces them.** On exact synthetic ground truth Blender takes raw TAPNext
+from 2.71px to 0.05px, where the bot's own two refine stages reach 0.06px — so the
+expensive half of the bot run can be dropped rather than added to. On SH004 that is 165s
+instead of 580s, for 122 tracks instead of 40 and 10.8x the exported point-samples.
+Nothing in `app/` was modified.
 
 The split under test:
 
@@ -99,6 +101,89 @@ the expected shape: replant does not rescue a track that was already clean, it e
 ones that died partway. Whether the resumed segments are *accurate* is not established —
 neither reference could measure it.
 
+## Blender replaces both refine stages — the result that matters
+
+The bot spends most of a run refining: on SH004, `moving_tile_refine` took 5.5 min and
+`pattern_refine` 1.9 min of a 9.7 min run. Asking Blender to do that job instead, on
+`bench/synth/lab02` with exact ground truth:
+
+| run | mean_err | p90 | worst | tracks over 1px |
+|---|---|---|---|---|
+| bot, **refines off** (`moving_tile=0 pattern_refine=0`) | **2.71px** | 5.02 | 6.66 | **23 / 23** |
+| bot, full refine chain | 0.06px | 0.11 | 0.12 | 0 / 23 |
+| **Blender tracking that same raw guide** | **0.05px** | **0.07** | 0.13 | 0 / 23 |
+
+Raw TAPNext is unusable on its own (every track over 1px). The bot's own refine chain
+takes it to 0.06px. Blender takes the *same raw input* to 0.05px — it is a complete
+substitute for both stages, not an addition to them.
+
+That changes what the hybrid costs. It no longer needs the expensive bot run it was
+seeded from:
+
+### SH004, 2560x1440, 160 frames — the same shot, three ways
+
+| | bot, as shipped | bot raw, dense | **hybrid** (dense raw guide + Blender) |
+|---|---|---|---|
+| time | 580s | 139s | **139 + 26 = 165s** |
+| tracks | 40 | 122 | **122** |
+| median track length | 20 frames | 134 | **152 / 160** |
+| median span (first→last) | 20 frames | 134 | **160** |
+| point-samples exported | 1457 | — | **15697** |
+| full-length tracks | 2 | 38 | 27 |
+
+**3.5x faster, 3x the tracks, 10.8x the usable point-samples.** The shipping run's 40
+tracks have a median length of *20 frames* on a 160-frame shot, because `defragment` split
+16 of them into short continuous runs (28 → 40 in the log). The hybrid's tracks carry
+gaps instead of being cut into pieces, which is what 3DE ASCII is for.
+
+Two things the dense guide needed, both config, no code:
+
+- `track_spacing_px=15` (default 60, scaled by plate width → 80px at 2560). Spacing was the
+  binding constraint, not quality: the log reads `1278 past quality bar -> 28 after
+  spacing`. At 15 it is `-> 122`.
+- `moving_tile=0 pattern_refine=0`, since Blender is doing that work.
+
+## Blender-side tuning is already at its optimum
+
+`sweep.py` runs ten configurations against exact ground truth. Every "smarter" option is
+worse than the plain defaults:
+
+| config | mean_err | p90 | worst |
+|---|---|---|---|
+| **default** (Loc/LocScale per class, KEYFRAME, brute, corr 0.75) | 0.050 | **0.080** | **0.100** |
+| `locscale`, `srch_big`, `corr_high` | 0.050 | 0.080 | 0.100–0.110 |
+| `affine` | 0.050 | 0.100 | 0.300 |
+| `prevframe` | 0.060 | 0.090 | 0.150 |
+| `perspective` | 0.060 | 0.100 | 0.360 |
+| `affine_prev` | 0.060 | 0.150 | 0.440 |
+| `pat_big` | 0.070 | 0.110 | 0.210 |
+
+The pattern is consistent: **every extra degree of freedom costs accuracy.** Affine and
+Perspective have the freedom to explain a bad match by deforming the patch, and their worst
+tracks are 3–4x the default's. `PREV_FRAME` matching drifts, as expected. A bigger pattern
+box averages the feature away. Nothing here is worth changing.
+
+## The disagreement gate does not work, and why
+
+Two independent trackers on one feature is a quality signal neither engine has alone, so
+`--max-guide-dev` truncates a track where Blender and TAPNext stop agreeing. Measured on
+SH004 against the dense raw guide:
+
+| threshold | tracks cut | median length after |
+|---|---|---|
+| off | 0 | 152 |
+| 8px | 104 / 122 | 52 |
+| 15px | 77 | 71 |
+| 25px | 45 | 93 |
+| 40px | 27 | 139 |
+
+It destroys the run at every useful setting. The reason is structural: the guide is *raw*
+TAPNext, which the bench measures at 2.71px mean and 6.66px worst — so when the two
+disagree, the guide is usually the one that is wrong, and the gate trims the better
+measurement. It would need a refined guide to arbitrate, and the refine is exactly what
+this arrangement removed. **Left off by default**, kept because the negative result is worth
+having written down.
+
 ## Two traps, both measured
 
 **1. `scene.frame_set()` does not move the frame the tracker reads.**
@@ -134,12 +219,18 @@ that could otherwise read as a fix for something real.
 
 ## What this does not settle
 
-- **The hybrid is additive, not a replacement.** It needs a full bot TAPNext run first, for
-  seeds and for the guide. On SH004 that is 580s of bot plus 18s of Blender — the 18s is
-  not a speed win over the 580s, it is 18s spent on top. A Blender pass that *replaced* the
-  two refine stages would be the interesting version, and is not what was measured.
+- **Whether the longer tracks are right.** The hybrid's median span is 152 frames against
+  the shipping bot's 20, and the bench says its localisation is good — but the bench has no
+  occlusion and no movers. A track that stays long *because it is drifting through an
+  occluder* would look exactly like this in the span table. The one clean real-plate
+  reference pairing cannot separate them.
 - **Occlusion accuracy.** Replant demonstrably extends spans; nothing here shows the
   resumed segments land on the right feature.
+- **Dense output makes `eval_refs` less reliable, not more.** At 122 tracks the
+  proximity pairing starts matching a reference to a *neighbouring* feature: the dense run
+  scores 4/5 instead of 2/5, but the new rows carry 12–16px first-step, which is the
+  signature of a wrong pairing rather than a wrong track. Read `first_step` before
+  believing any `mean_err` on this reference set.
 - **Parallax and movers.** Neither the bench (one plane) nor the surviving SH004 reference
   touches it.
 - **Mask gating.** The hybrid ignores SAM3 mattes entirely. Every gating decision the bot
@@ -155,14 +246,25 @@ runtime\python311\python.exe experiments\blender_track\run_blender_hybrid.py ^
     --tag kind --out bench\synth\lab02\runs\bl_kind\lab02__tapnext.txt
 runtime\python311\python.exe bench\score_synth.py bench\synth\lab02 --run bl_kind --baseline base
 
-REM real plate, from frames
-runtime\python311\python.exe bench\run_bench.py --shot experiments\blender_track\out\SH004 --tag guide
+REM Blender vs the bot's own refine chain, on exact truth
+runtime\python311\python.exe bench\run_bench.py --shot bench\synth\lab02 --tag raw ^
+    --set moving_tile=0 --set pattern_refine=0
+runtime\python311\python.exe experiments\blender_track\run_blender_hybrid.py ^
+    --plate bench\synth\lab02\plate --name lab02 ^
+    --reuse-tapnext bench\synth\lab02\runs\raw\lab02__tapnext.txt ^
+    --tag rawseed --out bench\synth\lab02\runs\bl_raw\lab02__tapnext.txt
+runtime\python311\python.exe bench\score_synth.py bench\synth\lab02 --run bl_raw --baseline base
+
+REM the tuning sweep (10 configurations, ~3 min, no GPU)
+runtime\python311\python.exe experiments\blender_track\sweep.py --shot bench\synth\lab02
+
+REM real plate: dense raw guide + Blender. This is the configuration in the table above.
+runtime\python311\python.exe bench\run_bench.py --shot experiments\blender_track\out\SH004 ^
+    --tag dense_raw --set track_spacing_px=15 --set moving_tile=0 --set pattern_refine=0
 runtime\python311\python.exe experiments\blender_track\run_blender_hybrid.py ^
     --plate experiments\blender_track\out\SH004\plate --name SH004 ^
-    --reuse-tapnext experiments\blender_track\out\SH004\runs\guide\SH004__tapnext.txt --tag repl
-runtime\python311\python.exe tools\eval_refs.py refs\SH004_lk ^
-    --bot experiments\blender_track\out\SH004__repl__blender.txt ^
-    --baseline experiments\blender_track\out\SH004\runs\guide\SH004__tapnext.txt
+    --reuse-tapnext experiments\blender_track\out\SH004\runs\dense_raw\SH004__tapnext.txt ^
+    --tag dense
 ```
 
 Every run must print `seed round-trip : max <n>px PASS`. If it says FAIL, stop — the
@@ -175,5 +277,6 @@ trackers are not on the features they were given and no other number means anyth
 | `run_blender_hybrid.py` | the e2e: bot seeder/guide -> Blender -> 3DE export, with the round-trip check |
 | `bl_track.py` | runs inside Blender; seeds, tracks, replants. Imports nothing from this repo |
 | `blio.py` | plate access, pixel<->clip coordinates, the Blender subprocess call |
+| `sweep.py` | tunes the Blender side against exact ground truth, one row per config |
 | `render_overlay.py` | burns hybrid + guide over the plate; in-gap points drawn hollow |
 | `README.md` | how to run it |

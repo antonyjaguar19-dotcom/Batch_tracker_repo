@@ -93,6 +93,48 @@ def seeds_from_export(txt: str, w: int, h: int, n_frames: int, keep: int) -> lis
     return seeds
 
 
+def gate_against_guide(tracks: dict, guide: dict, max_dev: float, min_len: int
+                       ) -> tuple[dict, int, int]:
+    """Cut a track where Blender and TAPNext stop agreeing about where the feature is.
+
+    Two independent trackers on one feature is something neither engine has on its own,
+    and it is the cheapest real quality signal here: TAPNext is coarse but does not jump
+    to a different feature, Blender is precise but will happily lock onto a similar-looking
+    neighbour and then be confidently wrong forever. Where they diverge past `max_dev`,
+    one of them has left the feature -- so the track is TRUNCATED at that frame rather than
+    deleted, keeping the part both engines still agreed on.
+
+    This is a *disagreement* gate, not a correctness gate: it cannot tell which of the two
+    is wrong. The threshold must therefore sit well above the guide's own error (2.7px on
+    the bench when the guide is unrefined), so it catches gross mistracks and nothing
+    subtle. Off by default.
+    """
+    out, trimmed, dropped = {}, 0, 0
+    for name, pts in tracks.items():
+        g = guide.get(name)
+        if not g:
+            out[name] = pts
+            continue
+        cut = None
+        for f in sorted(pts):
+            gp = g.get(f)
+            if gp is None:
+                continue
+            if abs(pts[f][0] - gp[0]) > max_dev or abs(pts[f][1] - gp[1]) > max_dev:
+                cut = f
+                break
+        if cut is None:
+            out[name] = pts
+            continue
+        kept = {f: p for f, p in pts.items() if f < cut}
+        trimmed += 1
+        if len(kept) >= min_len:
+            out[name] = kept
+        else:
+            dropped += 1
+    return out, trimmed, dropped
+
+
 def classify_seeds(plate: Plate, seeds: list[dict], quality: float, min_dist: int,
                    seed_count: int = 1200, min_aniso: float = 0.08) -> int:
     """Label every seed corner/blob/edge/dense with the repo's own classifier.
@@ -204,6 +246,18 @@ def main() -> int:
     ap.add_argument("--replant-gap", type=int, default=3)
     ap.add_argument("--replant-rounds", type=int, default=6)
     ap.add_argument("--correlation", type=float, default=0.75)
+    ap.add_argument("--pattern-match", default="KEYFRAME",
+                    choices=["KEYFRAME", "PREV_FRAME"])
+    ap.add_argument("--motion-model", default="",
+                    choices=["", "Loc", "LocRot", "LocScale", "LocRotScale", "Affine",
+                             "Perspective"])
+    ap.add_argument("--pattern-scale", type=float, default=1.0)
+    ap.add_argument("--search-scale", type=float, default=1.0)
+    ap.add_argument("--max-guide-dev", type=float, default=0.0,
+                    help="px; truncate a track where Blender and the guide disagree "
+                         "by more than this. 0 = off")
+    ap.add_argument("--min-len", type=int, default=24,
+                    help="drop a track left shorter than this by the disagreement gate")
     ap.add_argument("--blender", default="")
     ap.add_argument("--timeout", type=float, default=7200.0)
     args = ap.parse_args()
@@ -256,7 +310,11 @@ def main() -> int:
     bl_args = ["--clip", plate.path,
                "--seeds", seed_json, "--out", out_json,
                "--replant-gap", args.replant_gap, "--replant-rounds", args.replant_rounds,
-               "--correlation", args.correlation]
+               "--correlation", args.correlation,
+               "--pattern-match", args.pattern_match,
+               "--motion-model", args.motion_model,
+               "--pattern-scale", args.pattern_scale,
+               "--search-scale", args.search_scale]
     if args.flat_geom:
         bl_args.append("--flat-geom")
     if args.no_replant:
@@ -296,6 +354,13 @@ def main() -> int:
         gx, gy = pts[int(s["frame"])]
         worst = max(worst, abs(gx - sx), abs(gy - sy))
     print(f"  seed round-trip : max {worst:.4f}px  " + ("PASS" if worst < 0.01 else "FAIL"))
+
+    if args.max_guide_dev > 0 and guide_txt:
+        before = len(tracks)
+        tracks, trimmed, dropped = gate_against_guide(
+            tracks, read_3de(guide_txt), args.max_guide_dev, args.min_len)
+        print(f"  disagreement gate: {trimmed} track(s) cut at >{args.max_guide_dev:g}px "
+              f"from the guide, {dropped} left too short -> {len(tracks)}/{before}")
 
     out_txt = args.out or os.path.join(OUT_DIR, f"{name}__{args.tag}__blender.txt")
     n = write_3de(out_txt, tracks)

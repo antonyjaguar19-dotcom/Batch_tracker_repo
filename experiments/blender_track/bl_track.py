@@ -73,6 +73,13 @@ def parse_args():
                     help="frames to skip past the failure before resuming")
     ap.add_argument("--correlation", type=float, default=0.75)
     ap.add_argument("--pattern-match", default="KEYFRAME", choices=["KEYFRAME", "PREV_FRAME"])
+    # Sweepable so a tuning run is a command line, not an edit. `--motion-model` overrides
+    # the per-class choice for every track; empty = keep the per-class mapping.
+    ap.add_argument("--motion-model", default="",
+                    choices=["", "Loc", "LocRot", "LocScale", "LocRotScale", "Affine",
+                             "Perspective"])
+    ap.add_argument("--pattern-scale", type=float, default=1.0)
+    ap.add_argument("--search-scale", type=float, default=1.0)
     return ap.parse_args(argv)
 
 
@@ -206,6 +213,9 @@ def main():
     for s in seeds:
         kind = s.get("kind", "") or ""
         pat, srch, model = FLAT_GEOM if args.flat_geom else KIND_GEOM.get(kind, FLAT_GEOM)
+        pat = max(5, int(round(pat * args.pattern_scale)))
+        srch = max(pat + 4, int(round(srch * args.search_scale)))
+        model = args.motion_model or model
         t = clip.tracking.tracks.new(name=s["id"], frame=int(s["frame"]))
         t.motion_model = model
         t.use_brute = True
@@ -220,7 +230,10 @@ def main():
         # name, so the caller's id and geometry are carried alongside the track object
         # rather than on it. Order is the identity here.
         made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch})
-    log("seeded %d tracks" % len(made))
+    log("seeded %d tracks  (model=%s match=%s corr=%.2f pat_x%.2f srch_x%.2f%s)"
+        % (len(made), args.motion_model or "per-class", args.pattern_match,
+           args.correlation, args.pattern_scale, args.search_scale,
+           " flat" if args.flat_geom else ""))
 
     # --------------------------------------------------------------- forward / backward
     by_frame = {}
