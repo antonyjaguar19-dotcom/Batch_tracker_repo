@@ -18,13 +18,14 @@ for _p in (ROOT, HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+from plate_io import Plate  # noqa: E402  (sets OPENCV_IO_ENABLE_OPENEXR before cv2)
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from app.compare_tracks import load_tracks  # noqa: E402
 from run_hybrid import tapnext_seeds  # noqa: E402
+from sylab import OUT_DIR  # noqa: E402
 
 # BGR
 KIND_COLOR = {
@@ -43,46 +44,47 @@ FROZEN_EPS = 0.01   # px; SynthEyes' held-coord tail repeats a position exactly
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mp4", default=r"D:\Jefrin\IN\SH004.mp4")
-    ap.add_argument("--tracks", default=os.path.join(HERE, "out", "SH004__hybrid.txt"))
-    ap.add_argument("--out", default=os.path.join(HERE, "out", "SH004__hybrid_overlay.mp4"))
+    ap.add_argument("--plate", default=r"D:\Jefrin\IN\SH004.mp4",
+                    help="movie file, or a folder of frames")
+    ap.add_argument("--tracks", default="")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--seeds", type=int, default=400)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--fps", type=float, default=24.0)
     args = ap.parse_args()
 
-    tracks = load_tracks(args.tracks)
+    plate = Plate(args.plate, ifl_dir=OUT_DIR)
+    tracks_path = args.tracks or os.path.join(OUT_DIR, f"{plate.name}__hybrid.txt")
+    out_path = args.out or os.path.join(
+        OUT_DIR, os.path.splitext(os.path.basename(tracks_path))[0] + "_overlay.mp4")
+
+    tracks = load_tracks(tracks_path)
     if not tracks:
-        print(f"no tracks in {args.tracks}")
+        print(f"no tracks in {tracks_path}")
         return 1
 
     # Seed classes, in the same order the names were generated (HYB0000..).
     try:
-        _pts, kinds, _w, _h, _t = tapnext_seeds(args.mp4, 400, 0.02, 12)
+        _seeds, kinds = tapnext_seeds(plate, args.seeds, 0.02, 12, 1)
     except Exception as e:
         print(f"(could not recover seed classes: {e})")
         kinds = []
     kind_of = {f"HYB{i:04d}": k for i, k in enumerate(kinds)}
 
-    cap = cv2.VideoCapture(args.mp4)
-    if not cap.isOpened():
-        print(f"could not open {args.mp4}")
-        return 1
-    W0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    scale = args.width / float(W0)
-    W, H = args.width, int(round(H0 * scale))
+    scale = args.width / float(plate.w)
+    W, H = args.width, int(round(plate.h * scale))
 
-    vw = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (W, H))
+    vw = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (W, H))
     if not vw.isOpened():
         print("could not open the writer")
         return 1
 
     fi = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
+    for f0 in range(plate.count):
+        frame = plate.frame(f0)
+        if frame is None:
             break
-        fi += 1                      # exported frame numbers are 1-based
+        fi = f0 + 1                  # exported frame numbers are 1-based
         img = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
 
         live = frozen = 0
@@ -112,7 +114,11 @@ def main() -> int:
                          col, 1, cv2.LINE_AA)
             cv2.circle(img, (px, py), 4, col, -1, cv2.LINE_AA)
 
-        bar = f"frame {fi:3d}   tracking {live:3d}   frozen {frozen:3d}   (SynthEyes Demo caps real tracking at 10 frames)"
+        # "held" = the point is present but has not moved since the previous frame. On a
+        # licensed run that is usually a genuinely static feature; a whole plate going held
+        # at once is the SynthEyes Demo frozen tail.
+        bar = (f"frame {fi:4d} / {plate.count}   moving {live:4d}   held {frozen:4d}   "
+               f"{os.path.basename(tracks_path)}")
         cv2.rectangle(img, (0, 0), (W, 30), (0, 0, 0), -1)
         cv2.putText(img, bar, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                     (255, 255, 255), 1, cv2.LINE_AA)
@@ -125,15 +131,15 @@ def main() -> int:
             cv2.putText(img, k, (28, y0 + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, c, 1, cv2.LINE_AA)
             y0 += 18
         cv2.circle(img, (16, y0), 5, FROZEN, 1, cv2.LINE_AA)
-        cv2.putText(img, "frozen (demo cap)", (28, y0 + 4), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(img, "held (not moving)", (28, y0 + 4), cv2.FONT_HERSHEY_SIMPLEX,
                     0.42, FROZEN, 1, cv2.LINE_AA)
 
         vw.write(img)
 
-    cap.release()
+    plate.close()
     vw.release()
-    size_mb = os.path.getsize(args.out) / 1e6
-    print(f"wrote {args.out}  ({fi} frames, {W}x{H}, {size_mb:.1f} MB)")
+    size_mb = os.path.getsize(out_path) / 1e6
+    print(f"wrote {out_path}  ({fi} frames, {W}x{H}, {size_mb:.1f} MB)")
     return 0
 
 

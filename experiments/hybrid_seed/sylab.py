@@ -24,6 +24,49 @@ OUT_DIR = os.path.join(HERE, "out")
 DIAG = os.path.join(OUT_DIR, "lab.diag")
 
 
+def wait_until_ready(eng, timeout: float = 120.0, quiet: bool = True) -> bool:
+    """Wait for a freshly launched SynthEyes to be able to RUN something.
+
+    The SyPy3 socket comes up well before the app is usable: a cold start leaves a
+    `SplashPopup` child window on the main window, and while it is up RunScriptFile does not
+    come back -- which looks exactly like a hang, on any script, including a two-line one.
+    Warm instances never show this, which is why it only bites the first run after a launch.
+
+    Returns True when the splash is gone (or was never there).
+    """
+    import ctypes
+    u = ctypes.windll.user32
+    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    said = False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = []
+
+        def _cb(hh, _l):
+            c = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(hh, c, 64)
+            if c.value == "SplashPopup" and u.IsWindowVisible(hh):
+                found.append(hh)
+            return True
+
+        try:
+            for h in eng._syntheyes_top_windows():
+                u.EnumChildWindows(h, EnumProc(_cb), 0)
+        except Exception:
+            return True
+        if not found:
+            return True
+        if not said and not quiet:
+            print("   waiting for the SynthEyes splash to clear...", flush=True)
+            said = True
+        for hh in found:                 # nudge it; it also times out on its own
+            u.PostMessageW(hh, 0x0010, 0, 0)          # WM_CLOSE
+        time.sleep(1.0)
+    if not quiet:
+        print("   WARNING: the SynthEyes splash never cleared; scripts may hang.", flush=True)
+    return False
+
+
 def connect(quiet: bool = True):
     log = (lambda m: None) if quiet else (lambda m: print(f"SE: {m}", flush=True))
     settings = {
@@ -39,6 +82,7 @@ def connect(quiet: bool = True):
         raise SystemExit("SyPy3 not found")
     if not eng.connect_or_launch():
         raise SystemExit("could not connect to SynthEyes")
+    wait_until_ready(eng, quiet=quiet)
     eng.set_writable_folder(OUT_DIR)
     return eng
 

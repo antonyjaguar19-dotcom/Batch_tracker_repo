@@ -1,0 +1,29 @@
+//SIZZLET LabFrameWalk
+// No trackers at all: just walk the frames and touch the image once per frame.
+// If this alone is slow, the cost is SynthEyes decoding the plate, not tk.Run().
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+frame = start
+tk = new ob.trk
+tk.nm = "WALKPROBE"
+tk.kind = 0
+tk.size = 0.02
+tk.asp = 1.0
+tk.srchu = 0.015
+tk.srchv = 0.020
+tk.isSel = 2
+tk.key = Point(0.0,0.0)
+tk.isEnabled = 1
+
+n = 0
+for (f = start; f <= stop; f++)
+    frame = f
+    vec = tk.AvgImgColor()
+    n = n + 1
+end
+printf("walked %d frames\n", n)
+closeout()

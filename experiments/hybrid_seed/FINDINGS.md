@@ -18,7 +18,26 @@ Measured on SynthEyes 2026.2.4679, plate `D:\Jefrin\IN\SH004.mp4` (2560x1440, 16
 | Seed lands where asked | **max round-trip error 0.001px** over 122 seeds (`check_roundtrip.py`) |
 | Track them | works — `tk.Run()` once per frame |
 | Export | works — the engine's existing Sizzle export, 122/122 tracks |
-| Speed | ~1,400 tracker-frames/s; 122 trackers x 160 frames in 13.1s |
+| Speed | **unknown — see the correction below** |
+
+### Correction: the throughput number here was wrong
+
+An earlier version of this file claimed ~1,400 tracker-frames/s (122 trackers x 160 frames
+in 13.1s). **That figure is not real.** Under the Demo cap most trackers were dead by frame
+10, and `tk.Run()` on a dead tracker is a no-op, so the timer was mostly measuring nothing
+happening. The true cost of tracking has not been measured on this box.
+
+Two related things came out of chasing it, and both are now handled in the code:
+
+- **Tracker geometry must be specified in pixels, not normalised units.** `size` / `srchu` /
+  `srchv` are fractions of the plate, so a fixed set of numbers makes every tracker twice as
+  wide on a 4K plate as on a 2K one, and area-match cost grows with the square of that.
+  `KIND_GEOM_PX` in `run_hybrid.py` is in pixels and converted per plate.
+- **A whole shot in one `RunScriptFile` call is a bad idea.** On SH016 (4096x2160, 127
+  frames) SynthEyes went to the Windows "Ghost" not-responding class and then dropped the
+  socket (`WinError 10054`). Tracking is now done in bounded chunks (`--frames-per-call`),
+  every call is time-limited (`--chunk-timeout`), and a hang is reported with the frame
+  range in flight instead of blocking forever.
 
 The whole path is Sizzle plus SyPy3. It never enters the Features room, so it does **not**
 need `_click_panel_button`, does not take the mouse pointer, and is not subject to the
@@ -147,7 +166,33 @@ Expected on a licensed SynthEyes: tracks running the full 160 frames, at which p
 `eval_refs` becomes meaningful and the per-kind geometry can be tested against
 `--flat-geom`.
 
+## Third finding: this dev box's SynthEyes stopped working entirely
+
+Late in the session, after several force-kills following the 4K hang, **every** Sizzle script
+began hanging on this machine — including `szl/inspect.szl`, a two-line read-only script that
+had been completing in 0.0s all day, and including on a freshly launched instance. A fresh
+launch leaves a visible `SplashPopup` child window that never clears, so SynthEyes is not
+finishing its own start-up.
+
+That is a machine/licence state problem, not a code one, but it has a direct consequence
+worth being explicit about:
+
+**What is verified, and what is not.** The Python side of the experiment suite is verified
+— the seeder, plate handling, probe verdict logic, round-trip comparison and the licence
+check were all run and behaved correctly (`check_licence.py` correctly returned DEMO/exit 2;
+the mid-shot probe correctly returned FAIL with a passing control; the re-acquire probe
+correctly returned INCONCLUSIVE rather than a false FAIL). The **rewritten SynthEyes path**
+— chunked tracking, the bounded-call hang guard, the shot-load verification, the splash
+wait, and the whole `--reacquire` resume path — could **not** be re-run end to end after the
+rewrite, because by then this box would not execute any Sizzle at all. Its first real test
+will be the prod run.
+
+The code is defensive about exactly this: every call is time-bounded and the plate load is
+verified, so a bad state should produce a named error rather than a hang or a silent wrong
+answer.
+
 ## Next step
 
-Restore the SynthEyes licence, then re-run the four commands above. Everything else is
-already in place.
+Run `RunHybridExperiment.bat` on the licensed box (see `README.md`). It hard-stops if the
+licence is not active, and answers the mid-shot-creation and re-acquisition questions before
+producing any numbers.
