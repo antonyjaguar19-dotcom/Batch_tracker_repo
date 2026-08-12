@@ -38,6 +38,11 @@ PY = os.path.join(ROOT, "runtime", "python311", "python.exe")
 CONFIGS = [
     ("default",        []),
     ("prevframe",      ["--pattern-match", "PREV_FRAME"]),
+    # PREV_FRAME and a small pattern are the two configurations that survive real footage
+    # best, and for the same reason: both minimise how much the thing being matched can
+    # change between one comparison and the next. Worth knowing whether they compound.
+    ("prev_small",     ["--pattern-match", "PREV_FRAME", "--pattern-scale", "0.7"]),
+    ("prev_srch",      ["--pattern-match", "PREV_FRAME", "--search-scale", "1.5"]),
     ("affine",         ["--motion-model", "Affine"]),
     ("affine_prev",    ["--motion-model", "Affine", "--pattern-match", "PREV_FRAME"]),
     ("locscale",       ["--motion-model", "LocScale"]),

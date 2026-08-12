@@ -34,6 +34,36 @@ from blio import read_3de  # noqa: E402
 import numpy as np  # noqa: E402
 
 
+def drift_vs_guide(path: str, guide_path: str) -> dict:
+    """How far the track wanders from the identity channel, over every shared frame.
+
+    Deaths alone are a trap as a quality metric: anything that makes a tracker refuse to
+    give up scores better on deaths while quietly sliding off the feature, and a track that
+    stays alive on the wrong thing is worse than one that dies honestly. TAPNext is the only
+    independent opinion available about WHICH feature this is (~2.7px, but it does not
+    jump), so distance from it bounds how far a surviving track can have wandered.
+
+    Not an error measurement -- the guide is too coarse for that. A change that leaves the
+    median flat while cutting deaths is genuinely more robust; one that lifts the p90 or the
+    wandered fraction is buying its deaths back with drift.
+    """
+    tracks, guide = read_3de(path), read_3de(guide_path)
+    d = []
+    for name, pts in tracks.items():
+        g = guide.get(name)
+        if not g:
+            continue
+        for f, (x, y) in pts.items():
+            gp = g.get(f)
+            if gp is not None:
+                d.append(np.hypot(x - gp[0], y - gp[1]))
+    if not d:
+        return {}
+    d = np.asarray(d)
+    return {"n": len(d), "median": float(np.median(d)), "p90": float(np.percentile(d, 90)),
+            "wandered": float((d > 6.0).mean())}
+
+
 def stats(path: str, n_frames: int = 0) -> dict:
     tracks = read_3de(path)
     if not tracks:
@@ -90,6 +120,9 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=0,
                     help="shot length; inferred from the export when omitted, which "
                          "UNDERSTATES it if no track reaches the last frame")
+    ap.add_argument("--guide", default="",
+                    help="the TAPNext export these were seeded from. Adds a drift column, "
+                         "so a change that cuts deaths by refusing to let go is visible")
     args = ap.parse_args()
 
     print(HEADER)
@@ -99,6 +132,12 @@ def main() -> int:
             print(f"{os.path.basename(p)}: missing")
             continue
         print(line(stats(p, args.frames)))
+        if args.guide:
+            d = drift_vs_guide(p, args.guide)
+            if d:
+                print(f"{'':<46}drift vs guide: median {d['median']:.2f}px  "
+                      f"p90 {d['p90']:.2f}px  over 6px {100 * d['wandered']:.1f}%  "
+                      f"({d['n']} frames)")
     print("\ndeaths/t = internal gaps per track; clean = tracks with none; "
           "med_run = unbroken frames")
     return 0
