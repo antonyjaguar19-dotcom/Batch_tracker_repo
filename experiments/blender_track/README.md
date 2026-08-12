@@ -42,12 +42,8 @@ The plate must be a **folder of frames**. If yours is a movie, extract it first 
 and the bot then read identical pixels, instead of two different decoders:
 
 ```bat
-runtime\python311\python.exe -c "import cv2,os; d=r'experiments\blender_track\out\SH004\plate'; os.makedirs(d,exist_ok=True); c=cv2.VideoCapture(r'D:\Jefrin\IN\SH004.mp4'); i=0
-while True:
-    ok,f=c.read()
-    if not ok: break
-    i+=1; cv2.imwrite(os.path.join(d,'%06d.png'%i),f)
-print(i,'frames')"
+runtime\python311\python.exe experiments\blender_track\extract_frames.py ^
+    --mp4 D:\Jefrin\IN\SH004.mp4 --out experiments\blender_track\out\SH004
 ```
 
 Then the bot for the guide, then Blender. **Use these two `--set` flags** — they are what
@@ -84,6 +80,26 @@ runtime\python311\python.exe experiments\blender_track\sweep.py --shot bench\syn
 Ten Blender configurations against exact ground truth, ~3 min, no GPU. As measured, the
 **defaults already win** — Affine, Perspective, `PREV_FRAME` and bigger pattern boxes are
 all worse. Re-run it after changing `KIND_GEOM` in `bl_track.py`.
+
+### Check the reappearances
+
+The thing to distrust. A track that resumes on the wrong feature is *longer*, so every span
+number gets better while the output gets worse:
+
+```bat
+runtime\python311\python.exe experiments\blender_track\check_replants.py ^
+    --plate experiments\blender_track\out\SH004\plate ^
+    --tracks experiments\blender_track\out\SH004__dense__blender.txt --sheet
+```
+
+`--sheet` writes a contact sheet — before the gap | after the gap | best match nearby, worst
+first — so a bad reappearance can be seen rather than inferred.
+
+**Run `--selfcheck 4` on any new plate before believing the numbers.** It punches synthetic
+gaps into *continuous* tracks, where the correct answer is known to be ~0px, so anything
+below ~95% "on the feature" means the checker is wrong on that footage, not the tracker.
+The first version of this metric failed exactly that test at 45%, because it was measuring
+repetitive texture rather than the replant.
 
 ### Watch it
 
@@ -142,5 +158,8 @@ output. Common ones:
 | `run_blender_hybrid.py` | the whole thing: seeds/guide -> Blender -> 3DE export |
 | `bl_track.py` | the inside-Blender worker (seed, track, replant) |
 | `blio.py` | plate access, coordinates, the Blender call |
+| `extract_frames.py` | movie -> PNG frames laid out as a bench shot |
+| `check_replants.py` | did the disappeared tracks come back on the same feature |
+| `sweep.py` | tunes the Blender side against exact ground truth |
 | `render_overlay.py` | the video |
 | `FINDINGS.md` | what has actually been measured, and what has not |

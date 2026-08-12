@@ -243,6 +243,8 @@ def main() -> int:
     ap.add_argument("--flat-geom", action="store_true")
     ap.add_argument("--no-replant", action="store_true")
     ap.add_argument("--no-backward", action="store_true")
+    ap.add_argument("--replant-absolute", action="store_true",
+                    help="control: resume at the guide's position, not its displacement")
     ap.add_argument("--replant-gap", type=int, default=3)
     ap.add_argument("--replant-rounds", type=int, default=6)
     ap.add_argument("--correlation", type=float, default=0.75)
@@ -319,6 +321,8 @@ def main() -> int:
         bl_args.append("--flat-geom")
     if args.no_replant:
         bl_args.append("--no-replant")
+    if args.replant_absolute:
+        bl_args.append("--replant-absolute")
     if args.no_backward:
         bl_args.append("--no-backward")
 

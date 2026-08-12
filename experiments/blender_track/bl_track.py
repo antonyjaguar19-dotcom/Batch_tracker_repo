@@ -71,6 +71,16 @@ def parse_args():
     ap.add_argument("--replant-rounds", type=int, default=6)
     ap.add_argument("--replant-gap", type=int, default=3,
                     help="frames to skip past the failure before resuming")
+    ap.add_argument("--replant-search-scale", type=float, default=2.0,
+                    help="widen the search box on a resume marker by this factor")
+    ap.add_argument("--keep-replant-seed", action="store_true",
+                    help="export the resume frame itself. It is an ESTIMATE, not a "
+                         "measurement -- the frame after it is the first real match -- so "
+                         "it is dropped by default")
+    ap.add_argument("--replant-absolute", action="store_true",
+                    help="resume at the guide's own position instead of applying its "
+                         "displacement to Blender's last good one. This is the original "
+                         "behaviour and is measurably worse; kept as the control")
     ap.add_argument("--correlation", type=float, default=0.75)
     ap.add_argument("--pattern-match", default="KEYFRAME", choices=["KEYFRAME", "PREV_FRAME"])
     # Sweepable so a tuning run is a command line, not an edit. `--motion-model` overrides
@@ -229,7 +239,8 @@ def main():
         # MovieTrackingTrack takes no ID properties, and tracks.new() may uniquify the
         # name, so the caller's id and geometry are carried alongside the track object
         # rather than on it. Order is the identity here.
-        made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch})
+        made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch,
+                     "replanted": set()})
     log("seeded %d tracks  (model=%s match=%s corr=%.2f pat_x%.2f srch_x%.2f%s)"
         % (len(made), args.motion_model or "per-class", args.pattern_match,
            args.correlation, args.pattern_scale, args.search_scale,
@@ -256,9 +267,18 @@ def main():
     # --------------------------------------------------------------- replant
     # A Blender tracker that loses correlation is finished -- it has no notion of the
     # feature coming back. TAPNext does: it carries a position through the occlusion. So
-    # where the local tracker dies, the guide says where the feature went, a marker is
-    # planted there, and the SAME track resumes. The frames in between stay empty, which
-    # is a legal gap in 3DE ASCII, not a deletion.
+    # where the local tracker dies, the guide says where the feature went, the track is
+    # resumed there, and the frames in between stay empty -- a legal gap in 3DE ASCII, not
+    # a deletion.
+    #
+    # What the guide supplies is the DISPLACEMENT across the gap, not the position. By the
+    # time a track dies the two trajectories have drifted apart: measured on SH004, Blender
+    # and the guide sit a median 6px apart on the last frame before the gap, p90 35px, max
+    # 242px. Planting at the guide's absolute position therefore teleported the track onto
+    # whatever the guide was following, and threw away the better of the two localisations
+    # -- the replants came back on the right feature 13% of the time, against 45% for the
+    # guide's own gaps. Adding the guide's motion to Blender's last good position keeps
+    # Blender's accuracy and borrows only the part TAPNext is actually better at.
     replants = 0
     if not args.no_replant:
         guide = {s["id"]: s.get("guide") or {} for s in seeds}
@@ -268,7 +288,8 @@ def main():
                 fr = live_frames(r["t"])
                 if not fr or fr[-1] >= n_frames:
                     continue
-                rf = fr[-1] + max(1, args.replant_gap)
+                fa = fr[-1]
+                rf = fa + max(1, args.replant_gap)
                 g = guide.get(r["id"]) or {}
                 uv = g.get(str(rf))
                 # Walk forward to the first guided frame at or after the resume point: the
@@ -278,18 +299,32 @@ def main():
                     uv = g.get(str(rf))
                 if uv is None or rf > n_frames:
                     continue
-                groups.setdefault(rf, []).append(r)
+                base = g.get(str(fa))
+                if base is not None and not args.replant_absolute:
+                    # Guide DISPLACEMENT applied to Blender's own last good position.
+                    m_last = r["t"].markers.find_frame(fa)
+                    uv = [m_last.co[0] + (uv[0] - base[0]),
+                          m_last.co[1] + (uv[1] - base[1])]
+                    if not (0.0 < uv[0] < 1.0 and 0.0 < uv[1] < 1.0):
+                        continue                     # displacement pushed it off the plate
+                groups.setdefault(rf, []).append((r, uv))
             if not groups:
                 break
             n_this = 0
             for rf in sorted(groups):
                 grp = []
-                for r in groups[rf]:
-                    uv = (guide.get(r["id"]) or {})[str(rf)]
+                for r, uv in groups[rf]:
                     m = r["t"].markers.insert_frame(int(rf),
                                                     co=(float(uv[0]), float(uv[1])))
                     m.mute = False
-                    set_geom(m, r["pat"], r["srch"], w, h)
+                    # A wider search box on the resume marker only. With KEYFRAME matching
+                    # Blender finds frame rf+1 by matching the track's ORIGINAL pattern
+                    # inside this box, centred on the estimate -- so the box has to be big
+                    # enough to contain the estimate's own error, which has a long tail
+                    # (median 2.75px, but tens of px on the worst gaps). That first matched
+                    # frame is what re-acquires the feature; the estimate itself never is.
+                    set_geom(m, r["pat"], int(r["srch"] * args.replant_search_scale), w, h)
+                    r["replanted"].add(int(rf))
                     grp.append(r["t"])
                 track_group(ctx, grp, rf, backwards=False)
                 n_this += len(grp)
@@ -299,8 +334,14 @@ def main():
     # --------------------------------------------------------------- hand back
     out = {"width": w, "height": h, "frames": n_frames, "replants": replants, "tracks": []}
     for r in made:
+        # The resume frame is the guide's estimate of where the feature went, never a
+        # measurement of it. Exporting it publishes that estimate as if it were tracked
+        # data, and it is the single worst point in the track; the frame after it is the
+        # first one Blender actually matched. Dropping it costs one frame per gap.
+        drop = set() if args.keep_replant_seed else r["replanted"]
         pts = [[int(m.frame), float(m.co[0]), float(m.co[1])]
-               for m in r["t"].markers if not m.mute and 1 <= m.frame <= n_frames]
+               for m in r["t"].markers
+               if not m.mute and 1 <= m.frame <= n_frames and m.frame not in drop]
         pts.sort()
         out["tracks"].append({"id": r["id"], "kind": r["kind"], "pts": pts})
     with open(args.out, "w", encoding="utf-8") as f:

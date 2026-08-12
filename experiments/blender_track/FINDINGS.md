@@ -184,6 +184,98 @@ measurement. It would need a refined guide to arbitrate, and the refine is exact
 this arrangement removed. **Left off by default**, kept because the negative result is worth
 having written down.
 
+## Do the disappeared tracks come back on the right feature?
+
+This was the open question above, and the answer is **partly, and it needed a bug fixed
+first**. Longer tracks are worthless if the resumed half is following something else, and
+nothing in the span table can tell the two apart.
+
+`check_replants.py` measures it without touching the guide — the guide is where the resume
+position came from, so checking against it would confirm anything. For each internal gap it
+takes the patch on the last frame before it, searches the neighbourhood of the resume
+position on the first frame after it, and reports how far the best match is from where the
+track actually resumed. Each gap is paired with a **control** on the same track over the
+same number of frames with no gap in it, so "NCC 0.65" is read against what that plate
+scores over that separation anyway.
+
+The metric is self-checked on every plate (`--selfcheck L` punches synthetic gaps into
+*continuous* tracks, where the answer is known to be ~0px):
+
+| plate | self-check "on the feature" | median offset |
+|---|---|---|
+| SH004 | 100% | 0.35px |
+| SH016 | 98% | 0.17px |
+| SH008 | 100% | 0.19px |
+
+### The bug: the resume teleported the track
+
+The first version planted the resumed marker at **the guide's absolute position**. By the
+time a track dies the two trajectories have long since diverged — measured on SH004, Blender
+and the guide sit a median **6px** apart on the last frame before the gap, p90 **35px**, max
+**242px**. So every replant threw away Blender's localisation and jumped onto whatever
+TAPNext happened to be following.
+
+Applying the guide's **displacement** to Blender's own last good position instead:
+
+| SH004 | on the feature | clearly wrong | median offset | NCC vs control |
+|---|---|---|---|---|
+| guide's absolute position | 13% | 57% | 7.35px | 0.579 vs 0.851 |
+| **guide's displacement** | **41%** | **22%** | **2.75px** | **0.812 vs 0.873** |
+
+`--replant-absolute` keeps the old behaviour as the control.
+
+A second change — widening the search box on the resume marker and **not exporting the
+resume frame itself**, since it is an estimate rather than a measurement — came out
+**neutral** (44% / 25% / 2.89px, inside the noise). It is kept anyway, because publishing an
+estimate as though it were tracked data is wrong whether or not it moves the number, but it
+is not an improvement and is not claimed as one.
+
+### Where it stands, on three shots
+
+| | SH004 2560x1440 | SH016 4096x2160 | SH008 1920x1080 |
+|---|---|---|---|
+| frames | 160 | 127 | 258 |
+| tracks | 122 | 228 | 137 |
+| gaps measured | 168 | 225 | 249 |
+| unjudgeable (repetitive texture) | 48% | 39% | 27% |
+| **reappearance on the feature** | 44% | **26%** | **47%** |
+| off by 1.5–6px | 31% | 35% | 28% |
+| **clearly on the wrong thing** | 25% | **39%** | 25% |
+| median offset | 2.89px | 4.13px | 1.82px |
+| NCC across gap vs control | 0.78 / 0.83 | 0.65 / 0.86 | 0.75 / 0.88 |
+
+**So: no, reappearance is not working reliably.** Roughly a quarter to a half of gaps resume
+on the right feature and a quarter to two-fifths resume on the wrong one. SH016 is the worst
+of the three — a 4K plate where the NCC across a gap (0.65) falls far below its own control
+(0.86), meaning the resumed patch genuinely does not look like the one that disappeared.
+
+It is still much better than what it is built on. The same measurement on the raw TAPNext
+guide's own gaps:
+
+| | SH004 | SH016 | SH008 |
+|---|---|---|---|
+| guide, on the feature | 45% | 17% | 14% |
+| guide, clearly wrong | 18% | 60% | 62% |
+| guide, median offset | 3.50px | 12.93px | 16.40px |
+| **hybrid, median offset** | **2.89px** | **4.13px** | **1.82px** |
+
+The hybrid roughly halves to a quarters the offset on the two hard shots. But note the
+comparison is against the **raw** guide: the bot's own re-acquisition logic lives in
+`pattern_refine` (`refine_ncc_reacquire`), which this configuration switches off. The
+shipping bot with refines on produced **zero gaps** on SH004 — it does not re-acquire so
+much as decline to, letting `defragment` split the track into short continuous runs instead
+(median 20 frames). That is the honest comparison: the bot avoids the problem, the hybrid
+attempts it and gets it right about half the time.
+
+### What would fix it
+
+The resume position is a pure prediction — guide displacement, never checked against the
+plate. The obvious next step is to snap it to the NCC peak of the pre-gap patch before
+tracking on, which is exactly what `refine_ncc_reacquire` does inside the bot. That cannot
+be done inside `bl_track.py` (Blender's Python has no cheap pixel access at 4K), so it needs
+the replant loop moved out of Blender and into the orchestrator, with Blender re-invoked per
+round. Not attempted here.
+
 ## Two traps, both measured
 
 **1. `scene.frame_set()` does not move the frame the tracker reads.**
