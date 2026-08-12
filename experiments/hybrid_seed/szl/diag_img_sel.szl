@@ -1,0 +1,32 @@
+//SIZZLET LabDiagImgSel
+// Three questions in one pass:
+//   1. is image data actually reachable at this frame (AvgImgColor returns something)?
+//   2. does marking trackers selected change what RunTrackersFwd does?
+//   3. does calling RunTrackersFwd repeatedly help?
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+frame = start
+Scene.SetFrame(start)
+tk = ob.trk[1]
+vec = tk.AvgImgColor()
+printf("img at f=%d: color=(%.4f,%.4f,%.4f)\n", frame, vec.x, vec.y, vec.z)
+
+for (t2 in ob.trk)
+    t2.isSel = 1
+    t2.isSelected = 1
+    t2.isDone = 0
+    t2.isBackward = 0
+end
+printf("selected trackers = %d\n", #Scene.selectedTrk)
+
+Scene.playRate = 1
+Scene.SetFrame(start + 1)
+frame = start + 1
+Scene.RunTrackersFwd()
+printf("pass1: valid=%d\n", tk.valid)
+Scene.RunTrackersFwd()
+printf("pass2: valid=%d\n", tk.valid)
+closeout()

@@ -1,0 +1,19 @@
+//SIZZLET LabTrackNoSetFrame
+// Same as track_tkrun.szl but WITHOUT Scene.SetFrame -- if the numbers match, the
+// per-frame redraw can be skipped and the full-shot loop gets much cheaper.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+tk = ob.trk[2]
+frame = start
+printf("f=%d valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+last = start + 5
+for (f = start; f < last; f++)
+    frame = f + 1
+    rv = tk.Run()
+    printf("f=%d run-> valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+end
+closeout()

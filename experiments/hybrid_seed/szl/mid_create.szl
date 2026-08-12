@@ -1,0 +1,50 @@
+//SIZZLET LabMidCreate
+// Isolate: does creation-at-a-mid-shot-frame fail, or creation-anywhere-but-frame-0?
+// C = control, created at start.  D = created at 80 with Scene.SetFrame first.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+Scene.SetFrame(start)
+frame = start
+tc = new ob.trk
+tc.nm = "CTRL_C"
+tc.kind = 0
+tc.size = 0.02
+tc.asp = 1.0
+tc.srchu = 0.015
+tc.srchv = 0.020
+tc.smooth = 20
+tc.autokey = 20
+tc.isSel = 2
+tc.key = Point(0.1,0.3)
+tc.isEnabled = 1
+tc.Run()
+printf("C at start: valid=%d main=%d\n", tc.valid, tc.mainFrame)
+
+Scene.SetFrame(80)
+frame = 80
+td = new ob.trk
+td.nm = "CTRL_D"
+td.kind = 0
+td.size = 0.02
+td.asp = 1.0
+td.srchu = 0.015
+td.srchv = 0.020
+td.smooth = 20
+td.autokey = 20
+td.isSel = 2
+td.mainFrame = 80
+td.key = Point(0.1,0.3)
+frame = start
+td.isEnabled = 0
+frame = 80
+td.isEnabled = 1
+td.Run()
+printf("D at 80: valid=%d main=%d u=%.5f v=%.5f\n", td.valid, td.mainFrame, td.u, td.v)
+
+frame = 81
+td.Run()
+printf("D at 81: valid=%d u=%.5f v=%.5f\n", td.valid, td.u, td.v)
+closeout()

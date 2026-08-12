@@ -1,0 +1,18 @@
+//SIZZLET LabInspect
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+printf("ntrk=%d start=%d stop=%d w=%d h=%d\n", #ob.trk, start, stop, shot.width, shot.height)
+for (tk in ob.trk)
+    cnt = 0
+    for (frame = start; frame <= stop; frame++)
+        if (tk.valid)
+            cnt = cnt + 1
+        end
+    end
+    frame = start
+    printf("%s valid=%d back=%d done=%d en=%d main=%d u=%.4f v=%.4f\n", tk.nm, cnt, tk.isBackward, tk.isDone, tk.isEnabled, tk.mainFrame, tk.u, tk.v)
+end
+closeout()

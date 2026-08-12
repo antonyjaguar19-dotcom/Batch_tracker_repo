@@ -1,0 +1,34 @@
+//SIZZLET LabWatchCliff
+// Walk one freshly-made tracker across the frame-10 cliff, printing everything that
+// might explain it: Run()'s own return value, validity, position, done flag.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+printf("shot start=%d stop=%d\n", start, stop)
+printf("playstart=%d playstop=%d\n", Scene.playStart, Scene.playStop)
+
+frame = start
+tk = new ob.trk
+tk.nm = "CLIFF"
+tk.kind = 0
+tk.size = 0.02
+tk.asp = 1.0
+tk.srchu = 0.015
+tk.srchv = 0.020
+tk.smooth = 20
+tk.autokey = 20
+tk.isSel = 2
+tk.key = Point(-0.0781,0.3361)
+tk.isEnabled = 1
+rv = tk.Run()
+printf("f=%2d rv=%d valid=%d done=%d u=%.5f v=%.5f\n", frame, rv, tk.valid, tk.isDone, tk.u, tk.v)
+
+for (f = start + 1; f <= start + 16; f++)
+    frame = f
+    rv = tk.Run()
+    printf("f=%2d rv=%d valid=%d done=%d u=%.5f v=%.5f\n", f, rv, tk.valid, tk.isDone, tk.u, tk.v)
+end
+closeout()

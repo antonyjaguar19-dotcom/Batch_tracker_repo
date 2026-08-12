@@ -1,0 +1,23 @@
+//SIZZLET LabTrackTkRun
+// Is tk.Run() the per-frame track step (rather than Scene.RunTrackersFwd)?
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+tk = ob.trk[1]
+frame = start
+printf("f=%d valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+
+last = start + 5
+if (last > stop)
+    last = stop
+end
+for (f = start; f < last; f++)
+    frame = f + 1
+    Scene.SetFrame(f + 1)
+    rv = tk.Run()
+    printf("f=%d run-> valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+end
+closeout()

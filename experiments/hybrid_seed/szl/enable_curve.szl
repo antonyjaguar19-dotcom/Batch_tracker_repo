@@ -1,0 +1,42 @@
+//SIZZLET LabEnableCurve
+// Is the 10-frame cliff the tracker's isEnabled channel turning itself off?
+// Print isEnabled alongside valid, before and after tracking.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+frame = start
+tk = new ob.trk
+tk.nm = "ENCURVE"
+tk.kind = 0
+tk.size = 0.02
+tk.asp = 1.0
+tk.srchu = 0.015
+tk.srchv = 0.020
+tk.smooth = 20
+tk.autokey = 20
+tk.isSel = 2
+tk.key = Point(-0.0781,0.3361)
+tk.isEnabled = 1
+
+printf("BEFORE tracking:\n")
+for (f = start; f <= start + 16; f = f + 4)
+    frame = f
+    printf("  f=%2d enabled=%d valid=%d\n", f, tk.isEnabled, tk.valid)
+end
+
+frame = start
+x = tk.Run()
+for (f = start + 1; f <= start + 16; f++)
+    frame = f
+    x = tk.Run()
+end
+
+printf("AFTER tracking:\n")
+for (f = start; f <= start + 16; f++)
+    frame = f
+    printf("  f=%2d enabled=%d valid=%d\n", f, tk.isEnabled, tk.valid)
+end
+closeout()

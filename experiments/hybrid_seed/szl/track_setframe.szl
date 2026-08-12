@@ -1,0 +1,31 @@
+//SIZZLET LabTrackSetFrame
+// Variant A: step with Scene.SetFrame (loads the image at the new frame) before
+// RunTrackersFwd, instead of only assigning the Sizzle `frame` global.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+last = start + 20
+if (last > stop)
+    last = stop
+end
+Scene.playRate = 1
+Scene.SetFrame(start)
+frame = start
+for (f = start; f < last; f++)
+    Scene.SetFrame(f + 1)
+    frame = f + 1
+    Scene.RunTrackersFwd()
+end
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+printf("after variantA last=%d\n", last)
+for (tk in ob.trk)
+    cnt = 0
+    for (frame = start; frame <= stop; frame++)
+        if (tk.valid)
+            cnt = cnt + 1
+        end
+    end
+    printf("%s valid=%d\n", tk.nm, cnt)
+end
+closeout()

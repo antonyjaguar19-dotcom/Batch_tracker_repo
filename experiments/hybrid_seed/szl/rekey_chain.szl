@@ -1,0 +1,48 @@
+//SIZZLET LabRekeyChain
+// The cliff is 10 frames from the tracker's key, on every parameter setting. If that is
+// really "10 frames per key", then dropping a fresh key at the tracker's own tracked
+// position every few frames should walk it through the whole shot.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+frame = start
+tk = new ob.trk
+tk.nm = "REKEY"
+tk.kind = 0
+tk.size = 0.02
+tk.asp = 1.0
+tk.srchu = 0.015
+tk.srchv = 0.020
+tk.smooth = 20
+tk.autokey = 20
+tk.isSel = 2
+tk.key = Point(-0.0781,0.3361)
+tk.isEnabled = 1
+x = tk.Run()
+
+step = 8
+lastok = start
+for (f = start + 1; f <= stop; f++)
+    frame = f
+    x = tk.Run()
+    if (tk.valid)
+        lastok = f
+        if (((f - start) % step) == 0)
+            tk.key = Point(tk.u, tk.v)
+        end
+    end
+end
+
+cnt = 0
+for (frame = start; frame <= stop; frame++)
+    if (tk.valid)
+        cnt = cnt + 1
+    end
+end
+printf("rekey every %d -> lastvalid=%d validframes=%d of %d\n", step, lastok, cnt, stop - start + 1)
+frame = stop
+printf("end pos u=%.5f v=%.5f valid=%d\n", tk.u, tk.v, tk.valid)
+closeout()

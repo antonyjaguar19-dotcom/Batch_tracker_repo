@@ -1,0 +1,28 @@
+//SIZZLET LabImgChanges
+// Every tracker freezes after ~10 frames. Is that the tracker giving up, or is SynthEyes
+// handing it the same image over and over? Sample the image itself at spread frames:
+// a constant colour means the plate is not advancing.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+tk = ob.trk[1]
+
+// A: move only the Sizzle `frame` global
+for (i = 0; i < 9; i++)
+    f = start + i * 19
+    frame = f
+    vec = tk.AvgImgColor()
+    printf("A f=%3d color=%.5f,%.5f,%.5f\n", f, vec.x, vec.y, vec.z)
+end
+
+// B: same frames, but push the app's current frame too
+for (i = 0; i < 9; i++)
+    f = start + i * 19
+    Scene.SetFrame(f)
+    frame = f
+    vec = tk.AvgImgColor()
+    printf("B f=%3d color=%.5f,%.5f,%.5f\n", f, vec.x, vec.y, vec.z)
+end
+closeout()

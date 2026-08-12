@@ -1,0 +1,28 @@
+//SIZZLET LabTrackFull
+// Track every tracker across the whole shot: frame-major outer loop so each frame's
+// image is touched once, tk.Run() per tracker (that call, not RunTrackersFwd, is what
+// actually advances a tracker on 2026.2.4679).
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+
+for (f = start + 1; f <= stop; f++)
+    frame = f
+    for (tk in ob.trk)
+        tk.Run()
+    end
+end
+
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+printf("tracked start=%d stop=%d ntrk=%d\n", start, stop, #ob.trk)
+for (tk in ob.trk)
+    cnt = 0
+    for (frame = start; frame <= stop; frame++)
+        if (tk.valid)
+            cnt = cnt + 1
+        end
+    end
+    printf("%s valid=%d\n", tk.nm, cnt)
+end
+closeout()

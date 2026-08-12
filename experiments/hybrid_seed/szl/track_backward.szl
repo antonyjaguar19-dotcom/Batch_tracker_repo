@@ -1,0 +1,64 @@
+//SIZZLET LabTrackBackward
+// A staggered seed enters mid-shot, so the hybrid needs BOTH directions from its key
+// frame. Does tk.Run() walk backwards, and does tk.isBackward matter?
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+mid = 80
+
+// A: plain descending Run(), isBackward left at 0.
+// Creation follows tkgrid.szl's mid-shot pattern: key isEnabled=0 at the shot start,
+// then =1 at the creation frame, otherwise the tracker never becomes valid.
+frame = mid
+tk = new ob.trk
+tk.nm = "BWDTEST_A"
+tk.kind = 0
+tk.size = 0.02
+tk.asp = 1.0
+tk.srchu = 0.015
+tk.srchv = 0.020
+tk.smooth = 20
+tk.autokey = 20
+tk.isSel = 2
+tk.key = Point(0.1,0.3)
+frame = start
+tk.isEnabled = 0
+frame = mid
+tk.isEnabled = 1
+tk.Run()
+printf("A seeded at %d: valid=%d u=%.5f v=%.5f\n", mid, tk.valid, tk.u, tk.v)
+for (f = mid; f > mid - 6; f--)
+    frame = f - 1
+    tk.Run()
+    printf("A f=%d valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+end
+
+// B: same, but flagged backward first
+frame = mid
+tb = new ob.trk
+tb.nm = "BWDTEST_B"
+tb.kind = 0
+tb.size = 0.02
+tb.asp = 1.0
+tb.srchu = 0.015
+tb.srchv = 0.020
+tb.smooth = 20
+tb.autokey = 20
+tb.isSel = 2
+tb.key = Point(0.1,0.3)
+frame = start
+tb.isEnabled = 0
+frame = mid
+tb.isEnabled = 1
+tb.isBackward = 1
+tb.Run()
+printf("B seeded at %d: valid=%d\n", mid, tb.valid)
+for (f = mid; f > mid - 6; f--)
+    frame = f - 1
+    tb.Run()
+    printf("B f=%d valid=%d u=%.5f v=%.5f\n", frame, tb.valid, tb.u, tb.v)
+end
+closeout()

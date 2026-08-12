@@ -1,0 +1,56 @@
+//SIZZLET LabSweep
+// Every injected tracker dies at exactly frame 10, on a plate with no cut there and with
+// the image confirmed advancing. Sweep the tracker fields to find which one caps it.
+// Each variant is the same seed point, tracked 40 frames; report the last valid frame.
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+stop = shot.stop
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+
+su = -0.0781
+sv = 0.3361
+nf = 40
+
+function TryOne(nm, size, srchu, srchv, smooth, autokey, kind, keyEnd)
+    local tk
+    local f
+    local lastok
+    frame = start
+    tk = new ob.trk
+    tk.nm = nm
+    tk.kind = kind
+    tk.size = size
+    tk.asp = 1.0
+    tk.srchu = srchu
+    tk.srchv = srchv
+    tk.smooth = smooth
+    tk.autokey = autokey
+    tk.isSel = 2
+    tk.key = Point(su, sv)
+    tk.isEnabled = 1
+    if (keyEnd)
+        frame = stop
+        tk.isEnabled = 1
+        frame = start
+    end
+    tk.Run()
+    lastok = -1
+    for (f = start; f <= start + nf; f++)
+        frame = f
+        tk.Run()
+        if (tk.valid)
+            lastok = f
+        end
+    end
+    printf("%-12s size=%.3f srch=%.3f/%.3f sm=%d ak=%d kind=%d keyEnd=%d -> lastvalid=%d\n", nm, size, srchu, srchv, smooth, autokey, kind, keyEnd, lastok)
+end
+
+TryOne("base",     0.020, 0.015, 0.020, 20, 20, 0, 0)
+TryOne("keyEnd",   0.020, 0.015, 0.020, 20, 20, 0, 1)
+TryOne("noauto",   0.020, 0.015, 0.020,  0,  0, 0, 0)
+TryOne("bigauto",  0.020, 0.015, 0.020, 200, 200, 0, 0)
+TryOne("bigpatch", 0.040, 0.050, 0.050, 20, 20, 0, 0)
+TryOne("kind1",    0.020, 0.015, 0.020, 20, 20, 1, 0)
+TryOne("kind2",    0.020, 0.015, 0.020, 20, 20, 2, 0)
+closeout()

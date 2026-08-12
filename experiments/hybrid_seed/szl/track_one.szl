@@ -1,0 +1,17 @@
+//SIZZLET LabTrackOne
+// One frame of tracking, reported inline: does RunTrackersFwd move anything at all?
+ob = Scene.activeObj
+shot = ob.shot
+start = shot.start
+openout("D:/Jefrin/batch_tracker_v001_starter/experiments/hybrid_seed/out/lab.diag")
+tk = ob.trk[1]
+frame = start
+printf("before: f=%d valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+Scene.playRate = 1
+Scene.SetFrame(start + 1)
+frame = start + 1
+printf("at f=%d BEFORE run: valid=%d\n", frame, tk.valid)
+Scene.RunTrackersFwd()
+printf("at f=%d AFTER  run: valid=%d u=%.5f v=%.5f\n", frame, tk.valid, tk.u, tk.v)
+printf("scene frame now = %d\n", Scene.frame)
+closeout()
