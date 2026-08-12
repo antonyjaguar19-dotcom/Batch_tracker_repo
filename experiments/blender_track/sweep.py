@@ -43,6 +43,8 @@ CONFIGS = [
     # change between one comparison and the next. Worth knowing whether they compound.
     ("prev_small",     ["--pattern-match", "PREV_FRAME", "--pattern-scale", "0.7"]),
     ("prev_srch",      ["--pattern-match", "PREV_FRAME", "--search-scale", "1.5"]),
+    ("scale_geom",     ["--scale-geom"]),
+    ("prev_scale",     ["--pattern-match", "PREV_FRAME", "--scale-geom"]),
     ("affine",         ["--motion-model", "Affine"]),
     ("affine_prev",    ["--motion-model", "Affine", "--pattern-match", "PREV_FRAME"]),
     ("locscale",       ["--motion-model", "LocScale"]),

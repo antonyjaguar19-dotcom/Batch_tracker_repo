@@ -56,6 +56,58 @@ KIND_GEOM = {
 }
 FLAT_GEOM = KIND_GEOM[""]
 
+# Pattern size derived from the seed's OWN measured scale, which is what the bot does
+# (app/track_meta.py policy_for). The table above gives every corner the same 21px box
+# whether the feature responds at 3px or 15px; a box far larger than the feature is mostly
+# background diluting the correlation peak, and one far smaller has too little to match on.
+# (multiplier, min, max) per class core.
+#
+# The bot's own constants (corner 2.0/[21,41], blob 3.0/[31,61], edge 2.0/[25,45]) were
+# tried first and made Blender WORSE: 2.02 deaths/track against 1.91 for the flat per-class
+# table on SH008. Measured cause -- with scale_px in {3,5,9,15} those clamps only ever
+# enlarge (median 25 unchanged, max 21->47), and every measurement here says Blender wants
+# SMALLER boxes: `pat_small` (x0.7) beat the default on both real plates while `pat_big`
+# was near the bottom. The bot's numbers are tuned for its own matcher -- native-res NCC
+# with ECC polish and re-referencing -- not for Blender's.
+#
+# So the multipliers below keep the bot's IDEA (size the box from the feature's own scale)
+# with clamps set from what Blender actually measures best at.
+SCALE_RULE = {
+    "corner": (2.0, 11, 27),
+    "blob":   (2.5, 17, 37),
+    "edge":   (2.0, 15, 31),
+}
+# Search box as a margin ADDED to the pattern, preserving the per-class margins implied by
+# KIND_GEOM above (corner/blob 20px, edge 36px -- an edge slides along itself and needs
+# room across it). "dense-" refuses the wider margin: a repetitive neighbourhood is exactly
+# where a bigger box lets a rival peak in.
+SEARCH_MARGIN = {"corner": 20, "blob": 20, "edge": 36, "": 20}
+DENSE_MARGIN_CAP = 20
+
+
+def _odd(v: float, lo: int, hi: int) -> int:
+    """Pattern boxes are centred on the point, so they must be odd."""
+    n = int(round(v))
+    n = max(lo, min(hi, n))
+    return n if n % 2 == 1 else n + 1
+
+
+def geom_for(kind: str, scale_px: float, flat: bool):
+    """(pattern_px, search_px, motion_model) for one seed."""
+    pat, srch, model = FLAT_GEOM if flat else KIND_GEOM.get(kind, FLAT_GEOM)
+    if flat or scale_px <= 0:
+        return pat, srch, model
+    core = kind.split("-")[-1]
+    rule = SCALE_RULE.get(core)
+    if rule is None:                      # "flat" seeds have no meaningful scale
+        return pat, srch, model
+    mult, lo, hi = rule
+    pat = _odd(mult * scale_px + 1, lo, hi)
+    margin = SEARCH_MARGIN.get(core, 20)
+    if kind.startswith("dense-"):
+        margin = min(margin, DENSE_MARGIN_CAP)
+    return pat, pat + margin, model
+
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
@@ -66,6 +118,9 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--flat-geom", action="store_true",
                     help="one pattern/search size for every seed: the control")
+    ap.add_argument("--scale-geom", action="store_true",
+                    help="size each pattern from the seed's own measured feature scale "
+                         "instead of a per-class constant")
     ap.add_argument("--no-replant", action="store_true")
     ap.add_argument("--no-backward", action="store_true")
     ap.add_argument("--replant-rounds", type=int, default=6)
@@ -222,7 +277,8 @@ def main():
     made = []
     for s in seeds:
         kind = s.get("kind", "") or ""
-        pat, srch, model = FLAT_GEOM if args.flat_geom else KIND_GEOM.get(kind, FLAT_GEOM)
+        pat, srch, model = geom_for(kind, float(s.get("scale", 0.0)) if args.scale_geom
+                                    else 0.0, args.flat_geom)
         pat = max(5, int(round(pat * args.pattern_scale)))
         srch = max(pat + 4, int(round(srch * args.search_scale)))
         model = args.motion_model or model
@@ -241,10 +297,14 @@ def main():
         # rather than on it. Order is the identity here.
         made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch,
                      "replanted": set()})
-    log("seeded %d tracks  (model=%s match=%s corr=%.2f pat_x%.2f srch_x%.2f%s)"
+    pats = [r["pat"] for r in made]
+    log("seeded %d tracks  (model=%s match=%s corr=%.2f pat_x%.2f srch_x%.2f%s%s)"
         % (len(made), args.motion_model or "per-class", args.pattern_match,
            args.correlation, args.pattern_scale, args.search_scale,
-           " flat" if args.flat_geom else ""))
+           " flat" if args.flat_geom else "",
+           " scale-geom" if args.scale_geom else ""))
+    log("pattern px: min %d median %d max %d" % (min(pats), sorted(pats)[len(pats) // 2],
+                                                 max(pats)))
 
     # --------------------------------------------------------------- forward / backward
     by_frame = {}

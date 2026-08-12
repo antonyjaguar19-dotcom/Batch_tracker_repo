@@ -181,6 +181,12 @@ def classify_seeds(plate: Plate, seeds: list[dict], quality: float, min_dist: in
         feats, _, _ = _measure(gray, pts)
         for s, fe in zip(group, feats):
             s["kind"] = classify_seed(fe, stats, min_aniso)
+            # The feature's own scale, in px: the block size (3/5/9/15) at which it
+            # responds most strongly. This was measured and thrown away -- only `kind`
+            # was kept -- while the bot sizes every pattern box from it (policy_for in
+            # app/track_meta.py). A per-class constant gives a 3px corner and a 15px blob
+            # the same box.
+            s["scale"] = float(fe.scale_px)
             n += 1
     return n
 
@@ -241,6 +247,8 @@ def main() -> int:
     ap.add_argument("--min-dist", type=int, default=12)
     ap.add_argument("--stagger", type=int, default=1)
     ap.add_argument("--flat-geom", action="store_true")
+    ap.add_argument("--scale-geom", action="store_true",
+                    help="size each pattern from the seed's measured feature scale")
     ap.add_argument("--no-replant", action="store_true")
     ap.add_argument("--no-backward", action="store_true")
     ap.add_argument("--replant-absolute", action="store_true",
@@ -319,6 +327,8 @@ def main() -> int:
                "--search-scale", args.search_scale]
     if args.flat_geom:
         bl_args.append("--flat-geom")
+    if args.scale_geom:
+        bl_args.append("--scale-geom")
     if args.no_replant:
         bl_args.append("--no-replant")
     if args.replant_absolute:
