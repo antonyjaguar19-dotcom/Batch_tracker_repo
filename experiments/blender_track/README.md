@@ -71,15 +71,33 @@ Drop `--reuse-tapnext` to have the runner call the bot itself. That builds a `Ru
 directly rather than going through the shipping `AppState` mapping, so the two-step form
 above is preferred when the numbers matter.
 
-### Tune it
+### Tune it — two sweeps, and you need both
 
 ```bat
+REM precision: ten configurations vs exact ground truth, ~3 min, no GPU
 runtime\python311\python.exe experiments\blender_track\sweep.py --shot bench\synth\lab02
+
+REM robustness: the same configurations scored on deaths per track, on a real plate
+runtime\python311\python.exe experiments\blender_track\sweep.py ^
+    --plate experiments\blender_track\out\SH016\plate --name SH016 --frames 127 ^
+    --guide experiments\blender_track\out\SH016\runs\dense_raw\SH016__tapnext.txt
 ```
 
-Ten Blender configurations against exact ground truth, ~3 min, no GPU. As measured, the
-**defaults already win** — Affine, Perspective, `PREV_FRAME` and bigger pattern boxes are
-all worse. Re-run it after changing `KIND_GEOM` in `bl_track.py`.
+On **precision** the defaults win — Affine, Perspective, `PREV_FRAME` and bigger pattern
+boxes are all worse. That result is real but narrow: on `lab02` every configuration kept
+23/23 tracks for 100/100 frames, so it cannot see a tracker getting lost, which is the
+dominant failure on real footage (1.0–2.3 deaths per track against the guide's 0.3).
+
+**Robustness needs no ground truth** — a death is a hole in the export — so any extracted
+plate works as a bench:
+
+```bat
+runtime\python311\python.exe experiments\blender_track\track_stats.py ^
+    experiments\blender_track\out\SH006__dense__blender.txt --frames 312
+```
+
+A configuration that wins one sweep and loses the other badly is not an improvement. Re-run
+both after changing `KIND_GEOM` or the tracking loop in `bl_track.py`.
 
 ### Check the reappearances
 
@@ -160,6 +178,7 @@ output. Common ones:
 | `blio.py` | plate access, coordinates, the Blender call |
 | `extract_frames.py` | movie -> PNG frames laid out as a bench shot |
 | `check_replants.py` | did the disappeared tracks come back on the same feature |
-| `sweep.py` | tunes the Blender side against exact ground truth |
+| `track_stats.py` | deaths per track and run length, straight off an export, no truth needed |
+| `sweep.py` | tunes the Blender side: precision vs ground truth, robustness vs deaths |
 | `render_overlay.py` | the video |
 | `FINDINGS.md` | what has actually been measured, and what has not |

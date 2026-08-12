@@ -1,16 +1,23 @@
-"""Tune the Blender side against exact ground truth, one row per configuration.
+"""Tune the Blender side, one row per configuration. Two modes, and both are needed.
 
-Every setting here is a guess until it is measured, and the guesses are not obviously
-right: `Loc` cannot follow a plate that scales, `KEYFRAME` matching resists drift but
-fails when the patch stops looking like its keyframe, a bigger search box survives fast
-motion but invites a jump to the wrong peak. This runs them all on a bench shot whose
-ground truth is exact and prints the numbers side by side.
+**Precision** (`--shot <bench shot>`) scores against exact ground truth.
+
+**Robustness** (`--plate <dir> --guide <txt>`) scores deaths per track on a real plate,
+which needs no ground truth at all -- a death is a hole in the export.
+
+The second mode exists because the first cannot see the failure that matters most. On
+`bench/synth/lab02` every one of the configurations below kept 23/23 tracks for 100/100
+frames: one clean plane with uniformly good features gives nothing to get lost on. That
+sweep's verdict ("the defaults win") is therefore a statement about sub-pixel accuracy
+ONLY, and was wrongly read as meaning Blender-side tuning was exhausted. On real plates
+Blender dies 1.0-2.3 times per track while the TAPNext guide dies 0.3 times.
 
     runtime\\python311\\python.exe experiments\\blender_track\\sweep.py --shot bench\\synth\\lab02
+    runtime\\python311\\python.exe experiments\\blender_track\\sweep.py ^
+        --plate experiments\\blender_track\\out\\SH016\\plate --name SH016 ^
+        --guide experiments\\blender_track\\out\\SH016\\runs\\dense_raw\\SH016__tapnext.txt
 
-`--shot` must be a bench shot (holds `plate/`, `gt.json` and a `runs/base` to seed from).
-Each configuration is ~15s, so the whole default sweep is a couple of minutes and needs
-no GPU.
+A config that wins on one and loses badly on the other is not an improvement; read both.
 """
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 PY = os.path.join(ROOT, "runtime", "python311", "python.exe")
 
 # name -> extra flags for run_blender_hybrid. The first entry is the current default, so
@@ -49,12 +58,68 @@ def run(cmd: list[str]) -> str:
     return (p.stdout or "") + (p.stderr or "")
 
 
+def robust_sweep(args, picked) -> int:
+    """Score deaths per track on a real plate. No ground truth involved."""
+    from track_stats import stats
+
+    out_dir = os.path.join(HERE, "out", "sweep")
+    os.makedirs(out_dir, exist_ok=True)
+    rows = []
+    for cname, flags in picked:
+        out = os.path.join(out_dir, f"{args.name}__{cname}__blender.txt")
+        txt = run([PY, os.path.join(HERE, "run_blender_hybrid.py"),
+                   "--plate", args.plate, "--name", args.name,
+                   "--reuse-tapnext", args.guide, "--tag", "sw_" + cname,
+                   "--out", out] + flags)
+        rt = re.search(r"round-trip : max ([\d.]+)px\s+(\w+)", txt)
+        if not rt or rt.group(2) != "PASS" or not os.path.isfile(out):
+            print(f"  {cname:<16} FAILED (round-trip or run)")
+            continue
+        s = stats(out, args.frames)
+        s["name"] = cname
+        rows.append(s)
+        print(f"  {cname:<16} deaths/t {s['deaths_per_track']:.2f}  "
+              f"clean {s['clean']:>4}  med_run {s['median_run']:.0f}  "
+              f"cover {100 * s['coverage']:.1f}%")
+
+    if not rows:
+        return 1
+    rows.sort(key=lambda r: (r["deaths_per_track"], -r["median_run"]))
+    print(f"\n{args.name}: {len(rows)} configurations, sorted by deaths per track\n")
+    print(f"{'config':<16}{'trk':>5}{'deaths/t':>10}{'clean':>7}{'med_run':>9}"
+          f"{'span':>8}{'cover%':>9}")
+    print("-" * 64)
+    for r in rows:
+        print(f"{r['name']:<16}{r['tracks']:>5}{r['deaths_per_track']:>10.2f}"
+              f"{r['clean']:>7}{r['median_run']:>9.0f}{r['median_span']:>8.0f}"
+              f"{100 * r['coverage']:>9.1f}")
+    if os.path.isfile(args.guide):
+        g = stats(args.guide, args.frames)
+        print("-" * 64)
+        print(f"{'[tapnext guide]':<16}{g['tracks']:>5}{g['deaths_per_track']:>10.2f}"
+              f"{g['clean']:>7}{g['median_run']:>9.0f}{g['median_span']:>8.0f}"
+              f"{100 * g['coverage']:>9.1f}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shot", default=os.path.join("bench", "synth", "lab02"))
     ap.add_argument("--baseline", default="base", help="bot run to seed from and compare to")
     ap.add_argument("--only", default="", help="comma-separated config names")
+    ap.add_argument("--plate", default="", help="robustness mode: a real plate's frames dir")
+    ap.add_argument("--guide", default="", help="robustness mode: the bot export to seed from")
+    ap.add_argument("--name", default="", help="robustness mode: shot name")
+    ap.add_argument("--frames", type=int, default=0)
     args = ap.parse_args()
+
+    if args.plate:
+        if not (args.guide and args.name):
+            print("robustness mode needs --guide and --name too")
+            return 1
+        picked = [c for c in CONFIGS
+                  if not args.only or c[0] in {s.strip() for s in args.only.split(",")}]
+        return robust_sweep(args, picked)
 
     shot_dir = os.path.abspath(args.shot)
     name = os.path.basename(shot_dir)

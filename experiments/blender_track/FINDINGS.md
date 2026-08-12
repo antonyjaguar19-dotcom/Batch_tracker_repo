@@ -143,10 +143,36 @@ Two things the dense guide needed, both config, no code:
   spacing`. At 15 it is `-> 122`.
 - `moving_tile=0 pattern_refine=0`, since Blender is doing that work.
 
-## Blender-side tuning is already at its optimum
+## Blender-side tuning: precision is optimal, robustness was never tested
 
-`sweep.py` runs ten configurations against exact ground truth. Every "smarter" option is
-worse than the plain defaults:
+**Correction.** An earlier version of this file concluded from the sweep below that
+Blender-side tuning was exhausted. That was wrong, and the table itself shows why: every
+one of the ten configurations kept **23/23 tracks for 100/100 frames**. `med_len` is 100 in
+nine rows out of ten.
+
+`bench/synth/lab02` is one plane with uniformly good features and nothing occluding, so
+no configuration could get lost there — there was nothing to get lost on. The sweep measures
+**sub-pixel accuracy only**. On that it is sound, and the defaults do win. It says nothing
+whatsoever about a tracker losing its grip, which is the dominant failure on real footage:
+
+| | deaths/track | clean tracks | median unbroken run |
+|---|---|---|---|
+| SH006, Blender | **2.32** | 115 / 600 | **18 frames** of 312 |
+| SH006, TAPNext guide | 0.34 | 469 / 600 | 56 |
+| SH016, Blender | 1.06 | 105 / 228 | 33 of 127 |
+| SH016, TAPNext guide | 0.27 | 177 / 228 | 58 |
+| SH008, Blender | 1.91 | 29 / 137 | 23 of 258 |
+| SH004, Blender | 2.02 | 38 / 122 | 26 of 160 |
+
+TAPNext dies roughly **seven times less often** than Blender and holds two to three times
+the unbroken run. That is the shape of the two engines: Blender localises ~50x better
+(0.05px vs 2.71px) and loses its grip ~7x more.
+
+Robustness needs **no ground truth** — a death is a hole in the export — so `track_stats.py`
+scores it straight off any real plate, and `sweep.py --plate/--guide` sweeps configurations
+against it. That instrument did not exist when the "tuning is exhausted" claim was made.
+
+### The precision sweep (what it does prove)
 
 | config | mean_err | p90 | worst |
 |---|---|---|---|
@@ -161,7 +187,10 @@ worse than the plain defaults:
 The pattern is consistent: **every extra degree of freedom costs accuracy.** Affine and
 Perspective have the freedom to explain a bad match by deforming the patch, and their worst
 tracks are 3–4x the default's. `PREV_FRAME` matching drifts, as expected. A bigger pattern
-box averages the feature away. Nothing here is worth changing.
+box averages the feature away.
+
+For *precision*, nothing here is worth changing. Whether any of them survives real footage
+better is a separate question this table cannot answer — see the robustness sweep above.
 
 ## The disagreement gate does not work, and why
 
@@ -243,6 +272,13 @@ is not an improvement and is not claimed as one.
 | **clearly on the wrong thing** | 25% | **39%** | 25% |
 | median offset | 2.89px | 4.13px | 1.82px |
 | NCC across gap vs control | 0.78 / 0.83 | 0.65 / 0.86 | 0.75 / 0.88 |
+
+SH006 (3840x2160, 312 frames, 600 tracks) is the worst case by a distance: **1488 deaths**,
+a median unbroken run of **18 frames**, and only 6 tracks reaching full length. Its
+throughput also collapsed to 48 tracker-frames/s against 450–600 on the other shots, because
+every replant round costs its own operator calls — so on that shot **deaths are the dominant
+runtime cost as well as the dominant quality problem**, and fixing robustness should buy
+roughly an order of magnitude of speed alongside the quality.
 
 **So: no, reappearance is not working reliably.** Roughly a quarter to a half of gaps resume
 on the right feature and a quarter to two-fifths resume on the wrong one. SH016 is the worst
@@ -369,6 +405,9 @@ trackers are not on the features they were given and no other number means anyth
 | `run_blender_hybrid.py` | the e2e: bot seeder/guide -> Blender -> 3DE export, with the round-trip check |
 | `bl_track.py` | runs inside Blender; seeds, tracks, replants. Imports nothing from this repo |
 | `blio.py` | plate access, pixel<->clip coordinates, the Blender subprocess call |
-| `sweep.py` | tunes the Blender side against exact ground truth, one row per config |
+| `sweep.py` | tunes the Blender side: precision vs exact truth, robustness vs deaths |
+| `track_stats.py` | deaths per track / run length off any export, no ground truth needed |
+| `check_replants.py` | did a disappeared track come back on the same feature |
+| `extract_frames.py` | movie -> PNG frames laid out as a bench shot |
 | `render_overlay.py` | burns hybrid + guide over the plate; in-gap points drawn hollow |
 | `README.md` | how to run it |
