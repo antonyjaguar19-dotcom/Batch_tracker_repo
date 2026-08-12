@@ -249,6 +249,10 @@ def main() -> int:
     ap.add_argument("--flat-geom", action="store_true")
     ap.add_argument("--scale-geom", action="store_true",
                     help="size each pattern from the seed's measured feature scale")
+    ap.add_argument("--no-frame-step", action="store_true",
+                    help="control: hand the whole shot to Blender in one call, no leash")
+    ap.add_argument("--leash", type=float, default=20.0,
+                    help="px; bound how far a track may wander from the guide. 0 = off")
     ap.add_argument("--no-replant", action="store_true")
     ap.add_argument("--no-backward", action="store_true")
     ap.add_argument("--replant-absolute", action="store_true",
@@ -256,7 +260,7 @@ def main() -> int:
     ap.add_argument("--replant-gap", type=int, default=3)
     ap.add_argument("--replant-rounds", type=int, default=6)
     ap.add_argument("--correlation", type=float, default=0.75)
-    ap.add_argument("--pattern-match", default="KEYFRAME",
+    ap.add_argument("--pattern-match", default="PREV_FRAME",
                     choices=["KEYFRAME", "PREV_FRAME"])
     ap.add_argument("--motion-model", default="",
                     choices=["", "Loc", "LocRot", "LocScale", "LocRotScale", "Affine",
@@ -324,7 +328,10 @@ def main() -> int:
                "--pattern-match", args.pattern_match,
                "--motion-model", args.motion_model,
                "--pattern-scale", args.pattern_scale,
-               "--search-scale", args.search_scale]
+               "--search-scale", args.search_scale,
+               "--leash", args.leash]
+    if args.no_frame_step:
+        bl_args.append("--no-frame-step")
     if args.flat_geom:
         bl_args.append("--flat-geom")
     if args.scale_geom:

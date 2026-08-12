@@ -37,6 +37,10 @@ PY = os.path.join(ROOT, "runtime", "python311", "python.exe")
 # every other row reads as a delta from what the experiment already does.
 CONFIGS = [
     ("default",        []),
+    # The old defaults, kept as controls now that stepping + leash + PREV_FRAME shipped.
+    ("old_default",    ["--no-frame-step", "--pattern-match", "KEYFRAME"]),
+    ("no_leash",       ["--leash", "0"]),
+    ("keyframe",       ["--pattern-match", "KEYFRAME"]),
     ("prevframe",      ["--pattern-match", "PREV_FRAME"]),
     # PREV_FRAME and a small pattern are the two configurations that survive real footage
     # best, and for the same reason: both minimise how much the thing being matched can

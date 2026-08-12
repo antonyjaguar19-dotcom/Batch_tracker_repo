@@ -25,8 +25,10 @@ the frame, one call. Replanting is therefore grouped by resume frame, not done p
 -- one operator call per distinct frame instead of one per track.
 """
 import json
+import math
 import os
 import sys
+import time
 
 import bpy
 
@@ -118,6 +120,12 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--flat-geom", action="store_true",
                     help="one pattern/search size for every seed: the control")
+    ap.add_argument("--no-frame-step", action="store_true",
+                    help="control: hand the whole shot to Blender in one call, with no "
+                         "checkpoint between frames and therefore no leash")
+    ap.add_argument("--leash", type=float, default=20.0,
+                    help="px; clamp how far a track may sit from the guide. 0 = off, "
+                         "which makes stepping a pure refactor of sequence mode")
     ap.add_argument("--scale-geom", action="store_true",
                     help="size each pattern from the seed's own measured feature scale "
                          "instead of a per-class constant")
@@ -137,7 +145,14 @@ def parse_args():
                          "displacement to Blender's last good one. This is the original "
                          "behaviour and is measurably worse; kept as the control")
     ap.add_argument("--correlation", type=float, default=0.75)
-    ap.add_argument("--pattern-match", default="KEYFRAME", choices=["KEYFRAME", "PREV_FRAME"])
+    # PREV_FRAME by default. On precision alone KEYFRAME wins (0.050px vs 0.060px) and that
+    # is what the bench sweep reported, but on real plates KEYFRAME dies 2.6-2.9x more
+    # often: it matches against the seed patch forever, so appearance drift eventually
+    # breaks correlation. PREV_FRAME always compares against a nearly identical image. Its
+    # cost is accumulated drift, which is exactly what --leash bounds -- ungoverned it
+    # pushed drift p90 from 58px to 79px, with the leash it is capped at the leash.
+    ap.add_argument("--pattern-match", default="PREV_FRAME",
+                    choices=["KEYFRAME", "PREV_FRAME"])
     # Sweepable so a tuning run is a command line, not an edit. `--motion-model` overrides
     # the per-class choice for every track; empty = keep the per-class mapping.
     ap.add_argument("--motion-model", default="",
@@ -222,8 +237,8 @@ def _select(track, on):
     track.select_search = on
 
 
-def track_group(ctx, group, frame, backwards=False):
-    """One operator call: advance every track in `group` from `frame` to failure or end."""
+def track_group(ctx, group, frame, backwards=False, sequence=True):
+    """One operator call. `sequence` tracks to failure or end; otherwise a single frame."""
     win, area, region, clip, scene = ctx
     for t in clip.tracking.tracks:
         _select(t, False)
@@ -242,7 +257,82 @@ def track_group(ctx, group, frame, backwards=False):
     space.clip_user.frame_current = int(frame)
     with bpy.context.temp_override(window=win, area=area, region=region,
                                    space_data=space, edit_movieclip=clip, scene=scene):
-        bpy.ops.clip.track_markers(backwards=backwards, sequence=True)
+        bpy.ops.clip.track_markers(backwards=backwards, sequence=sequence)
+
+
+def track_stepped(ctx, records, n_frames, guide, args, backwards=False):
+    """Advance every track ONE frame at a time, with a checkpoint between frames.
+
+    `sequence=True` hands the whole shot to Blender and gets it back at the end, which is
+    the fastest way to run and the reason drift goes unnoticed: nothing looks at the track
+    until it has already died. Measured on SH004, by the time a track dies it sits a median
+    6px from the guide, p90 35px, max 242px -- it was tracking a different object, for many
+    frames, confidently.
+
+    Stepping costs one operator call per FRAME, not per track: every live track is selected
+    into the same call, so a 312-frame shot is 312 calls whatever the track count. In
+    return, there is a point between every pair of frames where Python can see each track's
+    new position -- which is where the leash, adaptive search and hysteresis all hook in.
+
+    With `--leash 0` this is a pure refactor and must reproduce the sequence-mode output;
+    that equivalence is the correctness test for the loop itself.
+    """
+    win, area, region, clip, scene = ctx
+    step = -1 if backwards else 1
+    frames = (range(n_frames, 1, -1) if backwards else range(1, n_frames))
+
+    # A track is live from its seed frame until it fails. Held as a dict so the per-frame
+    # cost is proportional to what is still running, not to the shot's track count.
+    live = {}
+    for r in records:
+        live.setdefault(r["t"].markers[0].frame, []).append(r)
+    running = []
+    clamped = deaths = entered = calls = 0
+
+    for f in frames:
+        newly = live.pop(f, [])
+        entered += len(newly)
+        running.extend(newly)
+        running = [r for r in running if r["alive"]]
+        if not running:
+            if not live:
+                break
+            continue
+
+        track_group(ctx, [r["t"] for r in running], f, backwards=backwards, sequence=False)
+        calls += 1
+        nxt = f + step
+
+        for r in running:
+            m = r["t"].markers.find_frame(nxt, exact=True)
+            if m is None or m.mute:
+                r["alive"] = False
+                deaths += 1
+                continue
+            if args.leash <= 0.0:
+                continue
+            g = guide.get(r["id"]) or {}
+            gp = g.get(str(nxt))
+            if gp is None:
+                continue
+            # Leash in PIXELS, on a normalised coordinate system, so the two axes convert
+            # separately -- a plate is not square and one shared factor would make the
+            # leash tighter vertically than horizontally.
+            dx = (m.co[0] - gp[0]) * r["w"]
+            dy = (m.co[1] - gp[1]) * r["h"]
+            d = math.hypot(dx, dy)
+            if d <= args.leash:
+                continue
+            # Pull back to the leash length rather than snapping onto the guide. The guide
+            # is the coarse channel (2.71px mean on the bench, worse on real plates), so
+            # snapping would trade Blender's localisation for TAPNext's. Clamping keeps
+            # every sub-pixel gain Blender still has while bounding how far it can have
+            # wandered from the feature TAPNext says this is.
+            k = args.leash / d
+            m.co = (gp[0] + dx * k / r["w"], gp[1] + dy * k / r["h"])
+            clamped += 1
+
+    return deaths, clamped, entered, calls
 
 
 def main():
@@ -296,7 +386,7 @@ def main():
         # name, so the caller's id and geometry are carried alongside the track object
         # rather than on it. Order is the identity here.
         made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch,
-                     "replanted": set()})
+                     "replanted": set(), "alive": True, "w": w, "h": h})
     pats = [r["pat"] for r in made]
     log("seeded %d tracks  (model=%s match=%s corr=%.2f pat_x%.2f srch_x%.2f%s%s)"
         % (len(made), args.motion_model or "per-class", args.pattern_match,
@@ -307,22 +397,44 @@ def main():
                                                  max(pats)))
 
     # --------------------------------------------------------------- forward / backward
+    guide = {s["id"]: s.get("guide") or {} for s in seeds}
     by_frame = {}
     for r in made:
         by_frame.setdefault(r["t"].markers[0].frame, []).append(r["t"])
 
-    for fr in sorted(by_frame):
-        track_group(ctx, by_frame[fr], fr, backwards=False)
-    log("forward pass done (%d start frames)" % len(by_frame))
-
-    if not args.no_backward:
-        # Seeds are staggered, so a seed born at frame 90 has nothing before it. The
-        # backward pass is what makes a late seed cover the head of the shot; it is the
-        # same idea as the bot's own backward TAPNext passes.
+    if not args.no_frame_step:
+        t0 = time.time()
+        d, c, e, n = track_stepped(ctx, made, n_frames, guide, args, backwards=False)
+        log("forward pass stepped: %d calls, %d tracks entered, %d deaths, %d clamps, %.1fs"
+            % (n, e, d, c, time.time() - t0))
+        if not args.no_backward:
+            # The BACKWARD pass stays in sequence mode. Stepping it produced an immediate
+            # death for all 72 tracks that entered, and a probe shows why the loop cannot
+            # trust its own death test in that direction: `sequence=False` does not create
+            # exactly one marker per call. Seeded at frame 40, three forward single-steps
+            # left markers at 39..44 -- five new, one of them BEFORE the seed. So "no marker
+            # at f-1" is not evidence the track failed there.
+            # Forward stepping is verified exactly equivalent to sequence mode (identical
+            # tracks, deaths, spans and drift with --leash 0), and forward is where drift
+            # accumulates over a long shot, so the leash goes there. Stepping the backward
+            # pass needs the single-step semantics understood first.
+            for fr in sorted(by_frame):
+                if fr > 1:
+                    track_group(ctx, by_frame[fr], fr, backwards=True)
+            log("backward pass done (sequence mode)")
+    else:
         for fr in sorted(by_frame):
-            if fr > 1:
-                track_group(ctx, by_frame[fr], fr, backwards=True)
-        log("backward pass done")
+            track_group(ctx, by_frame[fr], fr, backwards=False)
+        log("forward pass done (%d start frames)" % len(by_frame))
+
+        if not args.no_backward:
+            # Seeds are staggered, so a seed born at frame 90 has nothing before it. The
+            # backward pass is what makes a late seed cover the head of the shot; it is the
+            # same idea as the bot's own backward TAPNext passes.
+            for fr in sorted(by_frame):
+                if fr > 1:
+                    track_group(ctx, by_frame[fr], fr, backwards=True)
+            log("backward pass done")
 
     # --------------------------------------------------------------- replant
     # A Blender tracker that loses correlation is finished -- it has no notion of the
