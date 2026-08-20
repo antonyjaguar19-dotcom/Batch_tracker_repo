@@ -33,7 +33,13 @@ def clip_info(context, clip):
     path = bpy.path.abspath(clip.filepath)
     # Blender resolves `//plate/...` against the .blend, not against cwd. Sending the raw
     # string would give the sidecar a path that does not exist on any drive.
-    if os.path.isfile(path):
+    #
+    # Then: for an IMAGE SEQUENCE, `clip.filepath` names one numbered still and the sidecar
+    # wants the folder. For a MOVIE it names the movie, and taking the dirname throws the
+    # plate away -- SH002.mp4 became "D:\Jefrin\IN", which is a folder full of unrelated
+    # mp4s and no image sequence at all. `clip.source` is Blender's own answer to which
+    # kind this is, so ask it rather than guessing from the path.
+    if clip.source == "SEQUENCE" and os.path.isfile(path):
         path = os.path.dirname(path)
     sd = context.space_data
     return {"path": path, "width": clip.size[0], "height": clip.size[1],

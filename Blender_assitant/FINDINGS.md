@@ -285,3 +285,36 @@ imageio-ffmpeg, pillow, pandas, all pinned to the bot's `requirements.txt`.
 **Not installed, deliberately: `ultralytics` (AGPL-3.0) and transformers/accelerate.** They
 exist only for SAM 3 masking and Qwen analysis, both out of scope — which is what keeps
 this addon's dependency tree commercially clean rather than merely its intent.
+
+---
+
+## M2d — movies, not just image sequences (2026-08-20)
+
+First run on a real artist clip failed with `no image sequence found under: D:\Jefrin\IN`.
+
+`clip.filepath` means two different things depending on what was loaded. For an image
+sequence it names one numbered still and the sidecar wants the containing folder; for a
+movie it names the movie itself. `clip_info()` took `os.path.dirname()` whenever the path
+was a file, so `D:\Jefrin\IN\SH002.mp4` became `D:\Jefrin\IN` — a folder holding a dozen
+unrelated mp4s and no image sequence at all.
+
+Fixed by asking Blender instead of inferring: `clip.source` is `SEQUENCE` or `MOVIE`, and
+only `SEQUENCE` gets the dirname.
+
+**Verified on the real clip, SH002.mp4, 3840x2160, 180 frames:**
+
+```
+spread: 15px @1920 -> 30px at this plate width (3840)
+tracks: 5976 seeded -> 4155 past motion filter -> 4155 past mask gate
+        -> 2893 past quality bar -> 183 after spacing
+kinds: edge 49, blob 28, corner 22, flat 41, dense 10
+150 seeds (target) in 296.7s
+```
+
+Worth noting for expectations: **4K/180 frames is ~5 minutes**, against 160 s for
+2.5K/160. And `spread_min_dist_px` is quoted against 1920, so 15 becomes 30 px at 3840 —
+the density dial scales with the plate rather than staying absolute.
+
+Every measurement in this project until now came from a folder of PNGs, because that is
+what the bench and the extracted shots are. The movie path had never been exercised from
+the addon.
