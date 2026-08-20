@@ -8,7 +8,7 @@ viewport still looks fine.
 
 import bpy
 
-from . import prefs, three_de
+from . import prefs, three_de, track_core
 
 
 def _clip(context):
@@ -20,10 +20,12 @@ def warnings_for(context, clip):
     """Conditions that silently corrupt a result, in the order they bite."""
     out = []
     sd = context.space_data
-    size = getattr(sd.clip_user, "proxy_render_size", "PROXY_100")
-    if clip.use_proxy and size != "PROXY_100":
+    # 'FULL' is the original footage. 'PROXY_100' is a rendered 100%-size proxy file, which
+    # is a re-encode -- so it is NOT the safe value, despite the name.
+    size = getattr(sd.clip_user, "proxy_render_size", track_core.FULL_RES)
+    if clip.use_proxy and size != track_core.FULL_RES:
         p = prefs.get(context)
-        if p is not None and p.force_full_res:
+        if p is None or p.force_full_res:   # matches the preference default
             out.append(("INFO", "Proxy %s is on; jobs will run at full res" % size))
         else:
             out.append(("ERROR", "Proxy %s -- tracking precision is reduced" % size))
@@ -53,6 +55,14 @@ class CLIP_PT_btr_main(bpy.types.Panel):
         box.label(text="%d x %d, %d frames"
                   % (clip.size[0], clip.size[1], clip.frame_duration))
         box.label(text="%d tracks" % len(three_de.active_tracks(clip)))
+        # Version and clip kind, on screen, because both have already cost a debugging
+        # round. Blender keeps a disabled addon's submodules in sys.modules, so installing
+        # a new zip and re-enabling can leave the OLD code running until a restart -- with
+        # nothing anywhere to say so. And SEQUENCE vs MOVIE decides how the plate path is
+        # sent to the sidecar; getting it wrong sent a folder instead of a file.
+        from . import bl_info                                          # noqa: PLC0415
+        box.label(text="v%d.%d.%d   source: %s"
+                  % (bl_info["version"] + (clip.source,)))
 
         for level, msg in warnings_for(context, clip):
             layout.label(text=msg, icon="ERROR" if level == "ERROR" else "INFO")

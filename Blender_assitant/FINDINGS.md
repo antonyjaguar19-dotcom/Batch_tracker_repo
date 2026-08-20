@@ -318,3 +318,45 @@ the density dial scales with the plate rather than staying absolute.
 Every measurement in this project until now came from a folder of PNGs, because that is
 what the bench and the extracted shots are. The movie path had never been exercised from
 the addon.
+
+---
+
+## M2e — two things found while chasing a stale addon (2026-08-20)
+
+The movie-path fix from M2d was correct, and the same error came back. It was not the fix.
+
+### Blender keeps a disabled addon's submodules
+
+Installing a new zip and re-enabling does **not** reload `ops_seed`, `track_core` and the
+rest — they stay in `sys.modules`, so the OLD code keeps running with nothing anywhere to
+say so. **A restart is required.** Verified separately that the packaged 0.1.1 computed the
+right path all along:
+
+```
+[src] source     : 'MOVIE'
+[src] SENT TO SIDECAR: D:\Jefrin\IN\SH002.mp4
+[src] installed addon version: (0, 1, 1)
+```
+
+The panel now prints `v0.1.3   source: MOVIE`, so "which code is actually loaded" and
+"which kind of clip is this" are both answerable by looking, rather than by a round trip.
+
+### `PROXY_100` is not full resolution
+
+Measured enum: `['PROXY_25','PROXY_50','PROXY_75','PROXY_100','FULL']`, default `FULL`.
+
+**`FULL` is the original footage. `PROXY_100` is a rendered 100 %-size proxy FILE** — still
+a re-encode, and one that may not exist. `FullResolution` was setting `PROXY_100`, i.e. the
+proxy guard written to protect precision would itself have tracked against a re-encode.
+
+Now verified as a round trip, with an artist's 50 % proxy simulated:
+
+```
+warnings   : INFO  Proxy PROXY_50 is on; jobs will run at full res
+during job : use_proxy=False  size=FULL
+restored   : use_proxy=True   size=PROXY_50
+```
+
+Both of these are the same shape as the recipe bug in M2c: **code that looked right, ran
+without error, and quietly did the wrong thing.** None of the three would have been caught
+by a position-accuracy check.

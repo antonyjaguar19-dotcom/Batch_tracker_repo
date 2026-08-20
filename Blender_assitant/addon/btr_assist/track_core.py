@@ -132,13 +132,22 @@ def _select(track, on):
 
 # ---------------------------------------------------------------- proxy guard
 
+#: The original footage. NOT `PROXY_100` -- that is a rendered 100%-size PROXY FILE, which
+#: is still a re-encode and may not even exist. Measured on 5.2 the enum is
+#: ['PROXY_25','PROXY_50','PROXY_75','PROXY_100','FULL'] and the default is 'FULL'.
+FULL_RES = "FULL"
+
+
 class FullResolution:
-    """Force PROXY_100 for the duration of a job, then put the artist's setting back.
+    """Force the original footage for the duration of a job, then restore the artist's setting.
 
     A 50%% proxy may run tracking against half-resolution pixels, which halves precision
     invisibly -- the viewport looks identical and the exported numbers are quietly worse.
     No experiment in this project has ever run with a proxy, so rather than measure the
     damage the addon simply refuses to work in that state. See FINDINGS.md, test F.
+
+    `clip.use_proxy = False` is the decisive one; the render size is set as well so the
+    state is unambiguous while the job runs.
     """
 
     def __init__(self, clip, space, enabled=True):
@@ -151,7 +160,7 @@ class FullResolution:
         self.was = (self.clip.use_proxy,
                     self.space.clip_user.proxy_render_size)
         self.clip.use_proxy = False
-        self.space.clip_user.proxy_render_size = "PROXY_100"
+        self.space.clip_user.proxy_render_size = FULL_RES
         return self
 
     def __exit__(self, *exc):
