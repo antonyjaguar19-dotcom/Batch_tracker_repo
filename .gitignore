@@ -20,3 +20,14 @@ backup/
 
 # Generated bench shots (rendered frames + exports; rebuilt by bench/make_synth.py)
 bench/synth/
+
+# Vendored third-party trackers cloned for evaluation (MFT is CC BY-NC-SA, NonCommercial)
+experiments/*/vendor/
+
+# Blender_assitant: downloaded runtime, weights and vendored tapnet (Apache-2.0)
+# `runtime/` above is a bare pattern and already covers Blender_assitant/runtime/.
+Blender_assitant/weights/
+Blender_assitant/vendor/
+Blender_assitant/dist/
+Blender_assitant/logs/
+Blender_assitant/config/paths.json
