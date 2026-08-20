@@ -22,16 +22,16 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 1, 3),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
     "category": "Tracking",
 }
 
-from . import ops_3de, ops_seed, panel, prefs
+from . import ops_3de, ops_assist, ops_seed, panel, prefs
 
-MODULES = (prefs, ops_3de, ops_seed, panel)
+MODULES = (prefs, ops_3de, ops_seed, ops_assist, panel)
 
 
 def register():

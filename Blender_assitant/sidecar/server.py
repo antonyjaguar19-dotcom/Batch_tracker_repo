@@ -126,6 +126,79 @@ def job_seed(payload):
     return fn
 
 
+def job_reacquire(payload):
+    """Where should each dead track be resumed? One CoTracker pass covers all of them.
+
+    Queries are the ARTIST'S original seed positions, so CoTracker is following the same
+    feature the artist chose rather than something a detector picked.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        if not reqs:
+            raise ValueError("no tracks to re-acquire")
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+
+        out_dir = os.path.join(ASSIST, "logs", "reacq", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        lo = max(1, min(int(r["query_frame"]) for r in reqs))
+        hi = min(int(plate.count), int(params.get("frame_hi") or plate.count))
+        job.say("re-acquiring %d track(s) over frames %d-%d" % (len(reqs), lo, hi))
+
+        queries = [(int(r["query_frame"]), float(r["query_x"]), float(r["query_y"]))
+                   for r in reqs]
+        res = cotrack.track_points(plate, queries, lo, hi,
+                                   max_side=int(params.get("max_side", 768)),
+                                   on_status=job.say)
+
+        resumes, misses = [], []
+        for j, r in enumerate(reqs):
+            tm, vm = res["tracks"][j], res["vis"][j]
+            lg = int(r["last_good_frame"])
+            rp = cotrack.resume_position(
+                tm, vm, lg, (float(r["last_good_x"]), float(r["last_good_y"])),
+                gap=int(r.get("gap", 3)),
+                max_search=int(params.get("max_search", 200)))
+            if rp is None:
+                misses.append({"id": r["id"],
+                               "reason": "CoTracker never calls it visible again "
+                                         "after frame %d" % lg})
+                continue
+            f, (x, y) = rp
+            occluded = sum(1 for ff in range(lg, f) if not vm.get(ff, True))
+            resumes.append({"id": r["id"], "frame": int(f), "x": x, "y": y,
+                            "last_good_frame": lg,
+                            "gap_frames": int(f - lg),
+                            "occluded_frames": int(occluded),
+                            "guide_dx": tm[f][0] - tm[lg][0],
+                            "guide_dy": tm[f][1] - tm[lg][1]})
+        job.say("%d resume(s), %d without one" % (len(resumes), len(misses)))
+        cotrack.free()
+        return {"resumes": resumes, "misses": misses,
+                "width": plate.w, "height": plate.h, "scale": res["scale"]}
+    return fn
+
+
 # ------------------------------------------------------------------ HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -184,16 +257,17 @@ class Handler(BaseHTTPRequestHandler):
                                              os._exit(0)), daemon=True).start()
             return None
 
-        if self.path == "/jobs/seed":
+        if self.path in ("/jobs/seed", "/jobs/reacquire"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
                     "code": "BUSY",
                     "message": "a %s job is already running (%s)" % (b.kind, b.stage)}})
-            job = Job("seed")
+            kind = self.path.rsplit("/", 1)[1]
+            job = Job(kind)
             with JOBS_LOCK:
                 JOBS[job.id] = job
-            run_job(job, job_seed(payload))
+            run_job(job, (job_seed if kind == "seed" else job_reacquire)(payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

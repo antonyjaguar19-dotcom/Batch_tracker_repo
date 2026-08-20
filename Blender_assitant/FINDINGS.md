@@ -387,3 +387,87 @@ path sent : D:\Jefrin\IN\SH002.mp4
 
 Note the module name: an extension is `bl_ext.user_default.<id>`, not `<id>`. Also delete
 `__pycache__` when replacing files in place, or Blender can load stale bytecode.
+
+---
+
+## M3 — the artist loop, with CoTracker re-acquiring (2026-08-20)
+
+Requested shape: **the artist places the seed, Blender tracks, CoTracker gets it back, Blender
+tracks on, repeat.** No other model in the loop.
+
+### Licence, recorded once
+
+CoTracker is **CC-BY-NC 4.0** — verified against the source, not memory
+(`facebookresearch/co-tracker` README: *"The majority of CoTracker is licensed under
+CC-BY-NC"*). NonCommercial restricts **use**, not merely distribution, so unlike a GPL
+component "in-house only" does not make it commercial-safe. Raised twice, reaffirmed by the
+tool's owner; the decision is theirs. Code and weights live under `vendor/` and `weights/`,
+both gitignored, so nothing NC-licensed enters the repository.
+
+(The same README notes **LocoTrack is Apache-2.0** — a permissive alternative in the same
+family, if the licence ever needs to go away.)
+
+### CoTracker is cheap enough to run per-death
+
+3 points across 60 frames of a 3840x2160 plate: **5.2 s**, at `max_side=768` (a 5x
+reduction). It reports per-frame **visibility**, which is the occlusion signal Blender does
+not have.
+
+That changes the design: the headless prototype needed a dense throwaway motion field of
+hundreds of tracks to predict a return. CoTracker answers directly for the artist's own
+points, so no field is built at all.
+
+Two things carried in from earlier measurements:
+- **Resume by the guide's DISPLACEMENT, not its absolute position** — 41 % on-feature
+  against 13 %, because by the time a track dies the two trajectories have drifted apart
+  (median 6 px, p90 35 px, max 242 px).
+- **A coarse guide is fine.** The existing TAPNext guide runs at 256 px and Blender still
+  refines to sub-pixel, because a resume only has to land inside a widened search box.
+
+### End to end, SH002.mp4, 12 seeds, 2 rounds
+
+```
+coord round-trip (uv <-> image px, y flip): max 0.000119 px  PASS
+round 0: tracked in 4.5s, deaths 3, spans [1, 3, 13, 180 x9]
+  CoTracker: 3 resume(s), 0 miss(es)
+    USER_08 died f13 -> resume f16, 0 occluded
+round 1: tracked in 3.3s, deaths 3, spans [2, 7, 23, 180 x9]
+    USER_08 died f25 -> resume f28, 0 occluded
+round 2: spans [4, 9, 40, 180 x9]
+```
+
+The mechanism works: every dead track was re-acquired, every round, and Blender extended it
+(USER_08: 13 → 25 → 40 frames).
+
+**But read `0 occluded`.** CoTracker never called any of these points hidden. They did not
+die to an occluder — they died to blur and low contrast, on arbitrary grid positions no
+artist would choose. Re-acquisition succeeds and the track dies again immediately, so the
+loop crawls forward ~12 frames per round on a feature that is simply not trackable.
+
+Hence `min_resume_len` (default 12, from the headless prototype): if a resumed segment
+survives fewer frames than that, stop re-acquiring **that** track. A bad feature needs a
+hand, not a retry.
+
+### What is proven and what is not
+
+Proven: the plumbing. Seed → Blender → death detection → CoTracker query at the artist's own
+point → displacement resume → Blender continues → repeat, with the coordinate round trip
+(y-up clip space vs y-down image space) gated at 0.001 px.
+
+**Not proven: whether a resume lands on the RIGHT feature.** Every point here died to blur,
+so none of them tested an occlusion crossing, which is the case the feature exists for. The
+standing measurement for autonomous re-acquisition on this footage is **315.73 px against
+hand tracks, 26–47 % on-feature** — that number was produced by a different method, and
+CoTracker has not been scored against hand tracks here at all.
+
+That is why resumes arrive **muted** and the panel states the failure rate at the point of
+decision. Scoring CoTracker properly needs `eval_vs_manual.py` against the artist's own hand
+tracks on a shot with a real occlusion.
+
+### Float32, not a bug
+
+The coordinate gate first failed at `0.000069 px` against a `1e-6` threshold. Blender stores
+`marker.co` as float32, so a round trip carries ~7e-5 px on a 3840-wide plate — storage
+precision. The bar is now 0.001 px, which still catches everything real: a y-flip is
+thousands of px, a dropped half-pixel centre is 0.5, a resolution mismatch is a fixed
+fraction of the width.

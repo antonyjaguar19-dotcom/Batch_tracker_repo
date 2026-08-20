@@ -137,3 +137,12 @@ def shutdown(assist_root):
         _request(info, "/shutdown", {}, timeout=5.0)
     except SidecarError:
         pass
+
+
+def start_reacquire(assist_root, clip_info, requests, params=None):
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/reacquire",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)
