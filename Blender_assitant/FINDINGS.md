@@ -360,3 +360,30 @@ restored   : use_proxy=True   size=PROXY_50
 Both of these are the same shape as the recipe bug in M2c: **code that looked right, ran
 without error, and quietly did the wrong thing.** None of the three would have been caught
 by a position-accuracy check.
+
+### The reinstall never happened
+
+Two rounds were spent on a fix that was already correct. The installed extension was still
+**0.1.0**, and none of the fixes were on disk:
+
+```
+C:\Users\jefrin\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\btr_assist
+  "version": (0, 1, 0)          <- installed 15:01, before any fix
+  clip.source == "SEQUENCE"     : absent
+```
+
+Checking the install directory should have been the FIRST move, not the third. "Reinstall
+and restart" is an instruction whose completion nobody can see — including the person who
+followed it. `grep '"version"' <install dir>/__init__.py` is one command and answers it.
+
+Verified after copying 0.1.3 in, by enabling the real installed extension rather than the
+source tree:
+
+```
+enabled: bl_ext.user_default.btr_assist version (0, 1, 3)
+panel line: v0.1.3   source: MOVIE
+path sent : D:\Jefrin\IN\SH002.mp4
+```
+
+Note the module name: an extension is `bl_ext.user_default.<id>`, not `<id>`. Also delete
+`__pycache__` when replacing files in place, or Blender can load stale bytecode.
