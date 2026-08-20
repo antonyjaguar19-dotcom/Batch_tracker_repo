@@ -45,11 +45,24 @@ TORCH_INDEX = "https://download.pytorch.org/whl/cu121"
 TORCH_PINS = ["torch==2.5.1+cu121", "torchvision==0.20.1+cu121"]
 # Pinned to what the bot runs today (requirements.txt:49-53). A sidecar on a different
 # torch than the code it imports is a debugging session nobody asked for.
-OTHER_PINS = ["numpy", "opencv-python-headless==4.13.0.92", "scipy"]
-# opencv is PINNED to the repo's version. Left open it installed 5.0.0, and the sidecar
-# imports app.* code written against 4.x -- a major-version drift inside an import the
-# sidecar cannot see failing cleanly.
-
+OTHER_PINS = [
+    "numpy==2.4.4",
+    "opencv-python-headless==4.13.0.92",
+    "scipy==1.17.1",
+    "pillow==12.2.0",
+    "einops==0.8.2",          # vendored tapnet/tapnext_torch.py imports it
+    "timm==1.0.27",
+    "imageio-ffmpeg==0.6.0",  # frame extraction when the plate is a movie
+    "pandas==3.0.3",
+]
+# Pinned to the bot's own requirements.txt, because the sidecar imports the bot's code and
+# a version drift lands inside an import it cannot see fail cleanly. Left unpinned, pip
+# installed opencv 5.0.0 -- a major version ahead of the 4.x that `app.*` is written
+# against.
+#
+# Deliberately NOT installed: ultralytics (AGPL-3.0) and transformers/accelerate. They are
+# only needed for SAM 3 masking and Qwen analysis, both out of scope here -- which is
+# exactly what keeps this addon commercially clean.
 TAPNET_REPO = "https://github.com/google-deepmind/tapnet"
 TAPNEXT_CKPT_URL = ("https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt")
 TAPNEXT_CKPT_NAME = "tapnextpp_ckpt.pt"

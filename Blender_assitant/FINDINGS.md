@@ -226,3 +226,62 @@ ships a `._pth` that blocks the automatic sys.path entries — the same mechanis
   that nothing will ever ask to stop.
 - **One job at a time.** There is one A4000; a second request gets 409 with a readable
   message rather than an OOM.
+
+---
+
+## M2c — auto-seed runs end to end (2026-08-20)
+
+First real job, SH004 (2560x1440, 160 frames), `target=150 spacing_px=15`:
+
+```
+plate 2560x1440  160 frames
+spread: 15px @1920 -> 20px at this plate width (2560)
+tracks: 2578 seeded -> 2456 past motion filter -> 2456 past mask gate
+        -> 1278 past quality bar -> 122 after spacing
+classified 122 of 122 seeds
+kinds: blob 14, corner 17, dense-blob 2, dense-corner 2, dense-edge 1, edge 34, flat 52
+auto-seed done in 160.5s
+```
+
+Then those seeds through the addon's own tracking loop:
+
+```
+seed round-trip: max 0.000076 px  PASS
+forward: 159 calls, 122 entered, 33 deaths, 517 clamps
+backward: 21 calls (sequence mode)
+122 tracks, mean length 137.5/160
+```
+
+**122 tracks is the number the headless hybrid recorded on this shot**, and the spacing log
+reproduces `1278 past quality bar -> 122` exactly. The pipeline is the measured one.
+
+### Three bugs, and what they have in common
+
+All three were in the ~40 lines of glue between the sidecar and code that already worked.
+
+1. **`Plate(path, ifl_dir)`** takes two arguments, and its attributes are `.w` / `.h` /
+   `.count`, not `width`/`height`/`frames`. Failed loudly on the first call.
+2. **`classify_seeds()` labels its argument in place and returns a COUNT**, not the list.
+   Rebinding its result replaced 122 seeds with the integer 122 — `TypeError` one line
+   later, which was lucky; a function that returned a list of the wrong thing would have
+   run to completion.
+3. **The recipe was silently not applied.** The first version set `RunnerConfig` class
+   attributes, and `track_spacing_px` is not a RunnerConfig field at all — it is an
+   `AppState` knob that `app.py:2424` maps to **`spread_min_dist_px`**. Setting a
+   non-existent attribute on a dataclass raises nothing and changes nothing, so the run
+   would have used the default 40 and produced a fraction of the tracks while looking
+   entirely healthy.
+
+Number 3 is the one worth remembering: **it is the only one that would not have crashed.**
+The fix is to pass the recipe as named constructor arguments, which fail on a typo, rather
+than as monkeypatched defaults, which do not. `spread: 15px @1920 -> 20px at this plate
+width` in the log is now the proof the setting arrived.
+
+### Dependencies the sidecar actually needs
+
+TAPNext died on `No module named 'einops'`. `OTHER_PINS` now carries einops, timm,
+imageio-ffmpeg, pillow, pandas, all pinned to the bot's `requirements.txt`.
+
+**Not installed, deliberately: `ultralytics` (AGPL-3.0) and transformers/accelerate.** They
+exist only for SAM 3 masking and Qwen analysis, both out of scope — which is what keeps
+this addon's dependency tree commercially clean rather than merely its intent.
