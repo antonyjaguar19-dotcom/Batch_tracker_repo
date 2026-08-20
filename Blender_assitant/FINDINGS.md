@@ -495,3 +495,62 @@ That test immediately found a second, cosmetic one: **three user-visible strings
 `%%`** (`"26-47%% land correctly"`) copied from format-string habit into plain literals,
 which Blender renders verbatim. Plus a stale preference description still promising
 `PROXY_100` after that was corrected to `FULL`.
+
+---
+
+## M3a — the whole-clip window was the bug (2026-08-20)
+
+Reported from a live session: a track reached frame 72 and "CoTracker is not re-acquiring".
+
+It was not failing. Querying the running sidecar showed a job **still running after 566
+seconds**, with the GPU at **99 % and 16080 of 16376 MiB used**. It was thrashing, not hung.
+
+Cause: the re-acquire job fed CoTracker the **entire clip** — all 312 frames — to answer
+"where did this one point go after frame 72". Offline CoTracker attends across the whole
+sequence and adds a support grid, so cost climbs steeply with length, and none of that
+length was needed. The question only concerns the frames just after the failure.
+
+### Three changes
+
+1. **Window, not clip.** `[last_good - 2, last_good + 120]` instead of `[1, n_frames]`.
+2. **Query at the last good frame**, using Blender's own position there, rather than at the
+   artist's original seed. Blender matched that point by correlation on every frame up to
+   it, so it is the same feature measured better — and it keeps the window short instead of
+   forcing it back to frame 1.
+3. **Forward only.** Backward tracking doubled the cost to answer a question Blender had
+   already settled.
+
+Plus a refusal (`BTR_COTRACKER_MAX_FRAMES`, 160): a job that never returns is worse than one
+that says why.
+
+That refusal immediately caught the next problem — **tracks do not all die together.** Deaths
+at frame 1 and frame 91 give a 211-frame window on a 312-frame clip, which is the original
+bug again. So requests are now grouped by where they died and each group gets its own short
+pass: total work scales with the number of distinct failure points, not with the shot.
+
+### Same clip, same length, after
+
+```
+round 0:  4.8s track, 5 deaths, spans [  1,  4,  26,  31,  91, 312]
+round 1:  5.6s track, 4 deaths, spans [  3,  8, 106, 171, 310, 312]
+round 2:  6.9s track, 2 deaths, spans [  3,  8, 172, 201, 310, 312]
+round 3: 11.0s track, 0 deaths, spans [  3,  8, 172, 301, 310, 312]
+```
+
+USER_05 went **91 → 108 → 205 → 301 of 312 frames** across three resumes. USER_03 went
+26 → 301. Whole run in well under a minute, against nine minutes that never finished.
+
+**And the first real occlusion crossing:** USER_05's last resume reported **6 occluded
+frames** — CoTracker called the point hidden and resumed it after. Every earlier test
+reported `0 occluded`, i.e. blur deaths rather than occlusions.
+
+Two honest refusals in the same run: USER_00 and USER_01 (dead at frames 5 and 10) came back
+as *"CoTracker never calls it visible again"*. They were junk grid points on a blurred
+region. Refusing beats inventing a position.
+
+### Still not measured
+
+Whether a resume lands on the RIGHT feature. Spans growing proves a resume was *trackable*,
+which is exactly what `FINDINGS_REPORT.md` §8.4 warns is not the same thing — that mistake
+produced a clean-looking file in which the resumes were 315.73 px out. Scoring this needs
+hand tracks through an occlusion.

@@ -114,6 +114,18 @@ def track_points(plate, queries_px, frame_lo, frame_hi, max_side=768, on_status=
 
     scale = min(1.0, float(max_side) / float(max(plate.w, plate.h)))
     w, h = int(round(plate.w * scale)), int(round(plate.h * scale))
+
+    # Offline CoTracker attends across the whole clip and adds a support grid, so cost grows
+    # steeply with frame count. Measured the hard way: 312 frames at 768 px filled a 16 GB
+    # A4000 (16080 / 16376 MiB) and had not finished after nine minutes. Refuse rather than
+    # thrash -- a job that never returns is worse than one that says why.
+    budget = int(os.environ.get("BTR_COTRACKER_MAX_FRAMES", "160"))
+    if n > budget:
+        raise RuntimeError(
+            "CoTracker window is %d frames; the practical limit here is %d. "
+            "Re-acquisition only needs the frames just after the failure -- reduce "
+            "search_len, or raise BTR_COTRACKER_MAX_FRAMES if you have the VRAM." % (n, budget))
+
     say("CoTracker: decoding %d frames at %dx%d (scale %.3f)" % (n, w, h, scale))
 
     import cv2                                                        # noqa: PLC0415

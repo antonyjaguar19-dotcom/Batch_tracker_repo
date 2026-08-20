@@ -161,19 +161,79 @@ def job_reacquire(payload):
             raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
                                % (cw, ch, plate.w, plate.h))
 
-        lo = max(1, min(int(r["query_frame"]) for r in reqs))
-        hi = min(int(plate.count), int(params.get("frame_hi") or plate.count))
-        job.say("re-acquiring %d track(s) over frames %d-%d" % (len(reqs), lo, hi))
+        # A WINDOW around the deaths, not the whole clip.
+        #
+        # Feeding CoTracker all 312 frames to answer "where did this one point go" saturated
+        # a 16 GB A4000 (16080 / 16376 MiB, 99 % util) and ran for over nine minutes without
+        # finishing. Offline CoTracker attends across the whole clip and adds a support
+        # grid, so cost climbs steeply with length -- and none of it is needed. The question
+        # only concerns the frames just after the failure.
+        #
+        # The query is placed at each track's LAST GOOD frame using Blender's own position
+        # there, not at the artist's original seed. Blender matched that point by
+        # correlation on every frame up to it, so it is the same feature, measured better --
+        # and it keeps the window short instead of forcing it back to frame 1.
+        lead = int(params.get("lead", 2))
+        search_len = int(params.get("search_len", 120))
+        budget = int(params.get("max_frames", 160))
+        frame_hi = min(int(plate.count), int(params.get("frame_hi") or plate.count))
 
-        queries = [(int(r["query_frame"]), float(r["query_x"]), float(r["query_y"]))
-                   for r in reqs]
-        res = cotrack.track_points(plate, queries, lo, hi,
-                                   max_side=int(params.get("max_side", 768)),
-                                   on_status=job.say)
+        # Tracks do not all die together. One window spanning every death is as long as the
+        # shot -- deaths at frame 1 and frame 91 give a 211-frame window on a 312-frame clip,
+        # which is the thing that saturated the GPU. So group the requests by WHERE they
+        # died and run one short pass per group; each pass is ~120 frames whatever the clip
+        # length, and the total work scales with the number of distinct failure points
+        # rather than with the shot.
+        order = sorted(reqs, key=lambda r: int(r["last_good_frame"]))
+        groups, cur = [], []
+        for r in order:
+            trial = cur + [r]
+            lo = max(1, int(trial[0]["last_good_frame"]) - lead)
+            hi = min(frame_hi, int(trial[-1]["last_good_frame"]) + search_len)
+            if cur and (hi - lo + 1) > budget:
+                groups.append(cur)
+                cur = [r]
+            else:
+                cur = trial
+        if cur:
+            groups.append(cur)
+        job.say("%d track(s) died at %d distinct point(s) -> %d CoTracker pass(es)"
+                % (len(reqs), len(set(int(r["last_good_frame"]) for r in reqs)),
+                   len(groups)))
+
+        # The query is placed at each track's LAST GOOD frame using Blender's own position
+        # there, not at the artist's original seed. Blender matched that point by
+        # correlation on every frame up to it, so it is the same feature measured better --
+        # and it keeps the window short instead of forcing it back to frame 1.
+        per_req = {}
+        for gi, grp in enumerate(groups):
+            lo = max(1, int(grp[0]["last_good_frame"]) - lead)
+            hi = min(frame_hi, int(grp[-1]["last_good_frame"]) + search_len)
+            if hi - lo + 1 < 2:
+                continue
+            job.say("pass %d/%d: %d track(s), frames %d-%d"
+                    % (gi + 1, len(groups), len(grp), lo, hi))
+            queries = [(int(r["last_good_frame"]), float(r["last_good_x"]),
+                        float(r["last_good_y"])) for r in grp]
+            sub = cotrack.track_points(plate, queries, lo, hi,
+                                       max_side=int(params.get("max_side", 768)),
+                                       # Forward only: the question is where it comes BACK.
+                                       # Backward doubles the cost and answers a question
+                                       # Blender has already settled.
+                                       backward=False,
+                                       on_status=job.say)
+            for j, r in enumerate(grp):
+                per_req[r["id"]] = (sub["tracks"][j], sub["vis"][j])
+        res = {"scale": None}
 
         resumes, misses = [], []
-        for j, r in enumerate(reqs):
-            tm, vm = res["tracks"][j], res["vis"][j]
+        for r in reqs:
+            got = per_req.get(r["id"])
+            if got is None:
+                misses.append({"id": r["id"],
+                               "reason": "no frames left after the failure to look at"})
+                continue
+            tm, vm = got
             lg = int(r["last_good_frame"])
             rp = cotrack.resume_position(
                 tm, vm, lg, (float(r["last_good_x"]), float(r["last_good_y"])),
@@ -195,7 +255,7 @@ def job_reacquire(payload):
         job.say("%d resume(s), %d without one" % (len(resumes), len(misses)))
         cotrack.free()
         return {"resumes": resumes, "misses": misses,
-                "width": plate.w, "height": plate.h, "scale": res["scale"]}
+                "width": plate.w, "height": plate.h, "passes": len(groups)}
     return fn
 
 
