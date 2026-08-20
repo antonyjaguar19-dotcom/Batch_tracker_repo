@@ -22,12 +22,19 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
     "category": "Tracking",
 }
+
+# Blender 4.2+ extensions are described by blender_manifest.toml, and the extension loader
+# STRIPS `bl_info` off the module after import -- so `from . import bl_info` raises
+# ImportError at draw() time, once per redraw. This copy is taken while the module is still
+# executing and survives. The literal above stays literal so build.py's version_from_source
+# regex keeps the manifest and the source from disagreeing.
+VERSION = bl_info["version"]
 
 from . import ops_3de, ops_assist, ops_seed, panel, prefs
 

@@ -471,3 +471,27 @@ The coordinate gate first failed at `0.000069 px` against a `1e-6` threshold. Bl
 precision. The bar is now 0.001 px, which still catches everything real: a y-flip is
 thousands of px, a dropped half-pixel centre is 0.5, a resolution mismatch is a fixed
 fraction of the width.
+
+### A panel that raises does so on every redraw
+
+`from . import bl_info` inside `draw()` raised `ImportError` in the artist's session:
+Blender 4.2+ extensions are described by `blender_manifest.toml`, and the extension loader
+does not guarantee `bl_info` survives on the module. The failure repeats on **every
+redraw**, so one bad label buries the console and makes the whole addon look broken.
+
+Fixes: `VERSION = bl_info["version"]` is captured while the module is still executing (the
+literal stays literal, so `build.py`'s `version_from_source` regex still keeps the manifest
+and the source from disagreeing), and `_version_str()` falls back rather than raising —
+nothing inside `draw()` may throw.
+
+**The gap that let it through:** the earlier check enabled the addon and listed registered
+classes, and passed. It never called `draw()`. `tests/test_panels_draw.py` now calls every
+panel's `draw()` against the **installed** extension, with and without a selection, using a
+recording stub layout (`cls()` cannot make a Panel — `bpy_struct.__new__` refuses — and
+Blender will not hand out a UILayout headless). It tests the Python in `draw()`, which is
+where this lived; it does not test Blender's layout engine and does not pretend to.
+
+That test immediately found a second, cosmetic one: **three user-visible strings contained
+`%%`** (`"26-47%% land correctly"`) copied from format-string habit into plain literals,
+which Blender renders verbatim. Plus a stale preference description still promising
+`PROXY_100` after that was corrected to `FULL`.

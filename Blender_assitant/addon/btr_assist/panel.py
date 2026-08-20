@@ -16,6 +16,17 @@ def _clip(context):
     return getattr(sd, "clip", None)
 
 
+def _version_str():
+    """Never raise inside draw(). A panel that throws does so on EVERY redraw, which buries
+    the console and makes the addon look broken even when only the label is."""
+    import sys
+    pkg = sys.modules.get(__package__)
+    v = getattr(pkg, "VERSION", None)
+    if not v:
+        v = getattr(pkg, "bl_info", {}).get("version") if pkg else None
+    return ".".join(str(int(x)) for x in v) if v else "?"
+
+
 def warnings_for(context, clip):
     """Conditions that silently corrupt a result, in the order they bite."""
     out = []
@@ -60,9 +71,7 @@ class CLIP_PT_btr_main(bpy.types.Panel):
         # a new zip and re-enabling can leave the OLD code running until a restart -- with
         # nothing anywhere to say so. And SEQUENCE vs MOVIE decides how the plate path is
         # sent to the sidecar; getting it wrong sent a folder instead of a file.
-        from . import bl_info                                          # noqa: PLC0415
-        box.label(text="v%d.%d.%d   source: %s"
-                  % (bl_info["version"] + (clip.source,)))
+        box.label(text="v%s   source: %s" % (_version_str(), clip.source))
 
         for level, msg in warnings_for(context, clip):
             layout.label(text=msg, icon="ERROR" if level == "ERROR" else "INFO")
@@ -161,7 +170,7 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
             rev = layout.box()
             rev.label(text="%d marker(s) awaiting review" % n_muted, icon="ERROR")
             rev.label(text="Look at the plate at the resume")
-            rev.label(text="frame. 26-47%% land correctly.")
+            rev.label(text="frame. 26-47% land correctly.")
             row = rev.row(align=True)
             row.operator("clip.btr_confirm_resumes", text="Keep", icon="CHECKMARK").action = "KEEP"
             row.operator("clip.btr_confirm_resumes", text="Drop", icon="X").action = "DROP"

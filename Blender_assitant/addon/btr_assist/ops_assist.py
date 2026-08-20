@@ -366,7 +366,7 @@ class CLIP_OT_btr_confirm_resumes(bpy.types.Operator):
     bl_idname = "clip.btr_confirm_resumes"
     bl_label = "Confirm resumes"
     bl_description = ("Keep or drop the muted resumed segments on the selected tracks. "
-                      "Look at the plate first -- only 26-47%% land on the right feature")
+                      "Look at the plate first -- only 26-47% land on the right feature")
 
     action: bpy.props.EnumProperty(
         items=[("KEEP", "Keep", "Un-mute the resumed segment"),

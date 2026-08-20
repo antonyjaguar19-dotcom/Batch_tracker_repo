@@ -141,7 +141,7 @@ FULL_RES = "FULL"
 class FullResolution:
     """Force the original footage for the duration of a job, then restore the artist's setting.
 
-    A 50%% proxy may run tracking against half-resolution pixels, which halves precision
+    A 50% proxy may run tracking against half-resolution pixels, which halves precision
     invisibly -- the viewport looks identical and the exported numbers are quietly worse.
     No experiment in this project has ever run with a proxy, so rather than measure the
     damage the addon simply refuses to work in that state. See FINDINGS.md, test F.

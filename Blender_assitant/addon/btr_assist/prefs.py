@@ -57,9 +57,9 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         description="Spawn the sidecar automatically instead of requiring a button press")
     force_full_res: BoolProperty(
         name="Force full resolution while tracking", default=True,
-        description="A 50%% proxy halves tracking precision invisibly. With this on, the "
-                    "addon sets PROXY_100 for the duration of a job and restores your "
-                    "setting afterwards")
+        description="A 50% proxy halves tracking precision invisibly. With this on, the "
+                    "addon uses the original footage for the duration of a job and "
+                    "restores your setting afterwards")
 
     def draw(self, context):
         layout = self.layout
