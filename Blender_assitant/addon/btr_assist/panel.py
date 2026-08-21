@@ -165,22 +165,23 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
         if p is not None:
             op.verify_pattern = p.verify_pattern
             op.min_match = p.min_match
+            op.confirm_resumes = p.confirm_resumes
         if not n_sel:
             layout.label(text="Select your markers first", icon="INFO")
 
         if p is not None:
             sub = layout.column(align=True)
+            sub.prop(p, "confirm_resumes", text="Confirm each re-acquire")
             sub.prop(p, "verify_pattern", text="Must match my pattern")
             row = sub.row()
             row.enabled = p.verify_pattern
             row.prop(p, "min_match", text="Min match")
 
         box = layout.box()
-        box.label(text="Place your own seeds. Blender", icon="INFO")
-        box.label(text="tracks; CoTracker only says")
-        box.label(text="where a dead one went -- your")
-        box.label(text="pattern box decides if it is")
-        box.label(text="the same feature.")
+        box.label(text="Blender tracks. When it loses", icon="INFO")
+        box.label(text="the pattern, CoTracker skips to")
+        box.label(text="where your feature is back,")
+        box.label(text="snaps it, and asks you.")
 
         if n_muted:
             rev = layout.box()

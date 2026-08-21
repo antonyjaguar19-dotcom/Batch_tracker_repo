@@ -109,7 +109,7 @@ py = os.path.join(ASSIST, "runtime", "python311", "python.exe")
 client.ensure(root, py, 0, timeout=120)
 
 report = {{"rounds": [], "coord_roundtrip_px": worst}}
-resumed = {{}}
+resumed, continue_from, gave_up = {{}}, {{}}, set()
 for rnd in range(rounds + 1):
     t0 = time.time()
     st = {{}}
@@ -131,14 +131,26 @@ for rnd in range(rounds + 1):
         break
     reqs = []
     for tr, f0, f1 in dead:
+        if tr.name in gave_up:
+            continue
         s = seeds_px[tr.name]
-        m = tr.markers.find_frame(f1, exact=True)
-        lx, ly = marker_to_image_px(m, w, h)
+        cont = continue_from.get(tr.name)
+        if cont is not None and cont[0] > f1:
+            lf, lx, ly, g = int(cont[0]), float(cont[1]), float(cont[2]), 1
+        else:
+            m = tr.markers.find_frame(f1, exact=True)
+            lf, g = f1, gap
+            lx, ly = marker_to_image_px(m, w, h)
         reqs.append({{"id": tr.name, "query_frame": s[0], "query_x": s[1], "query_y": s[2],
-                     "last_good_frame": f1, "last_good_x": lx, "last_good_y": ly,
-                     "gap": gap, "pattern": patterns.get(tr.name),
+                     "last_good_frame": lf, "last_good_x": lx, "last_good_y": ly,
+                     "gap": g, "pattern": patterns.get(tr.name),
                      "search_px": search_px.get(tr.name, 0.0)}})
-        log("  dead: %s spans %d..%d of %d" % (tr.name, f0, f1, n_frames))
+        log("  dead: %s spans %d..%d of %d%s"
+            % (tr.name, f0, f1, n_frames,
+               "  (search continues from f%d)" % lf if lf != f1 else ""))
+    if not reqs:
+        log("every dead track has been given up on -- stopping")
+        break
 
     ci = {{"path": os.path.abspath(plate), "width": w, "height": h, "frames": n_frames}}
     r = client.start_reacquire(root, ci, reqs,
@@ -158,6 +170,10 @@ for rnd in range(rounds + 1):
         % (len(res["resumes"]), len(res["misses"])))
     for miss in res["misses"]:
         log("    miss %s: %s" % (miss["id"], miss["reason"]))
+        if miss.get("retry") and miss.get("tail_frame"):
+            continue_from[miss["id"]] = (miss["tail_frame"], miss["tail_x"], miss["tail_y"])
+        else:
+            gave_up.add(miss["id"])
     by = {{r_["id"]: r_ for r_ in records}}
     for rr in res["resumes"]:
         rec = by.get(rr["id"])
@@ -172,11 +188,13 @@ for rnd in range(rounds + 1):
             mk.search_min = (-sx, -sy); mk.search_max = (sx, sy)
         rec["alive"] = True; rec["seed_frame"] = int(rr["frame"])
         resumed.setdefault(rr["id"], []).append(int(rr["frame"]))
+        continue_from.pop(rr["id"], None)
         sc = rr.get("match_score")
-        log("    %s died f%d -> resume f%d at (%.1f, %.1f), %d occluded, match %s %s"
+        log("    %s searched from f%d -> back at f%d at (%.1f, %.1f), first over the "
+            "line f%s, %d frame(s) swept, %d occluded, match %s"
             % (rr["id"], rr["last_good_frame"], rr["frame"], rr["x"], rr["y"],
-               rr["occluded_frames"], "n/a" if sc is None else "%.2f" % sc,
-               rr.get("tried") or ""))
+               rr.get("first_match_frame"), rr.get("scanned") or 0,
+               rr["occluded_frames"], "n/a" if sc is None else "%.2f" % sc))
     report["rounds"][-1]["resumes"] = res["resumes"]
     report["rounds"][-1]["misses"] = res["misses"]
 

@@ -627,3 +627,83 @@ Whether an *approved* resume is on the right feature — only that a rejected on
 Nothing here is scored against hand tracks through an occlusion, so the resume still arrives
 **muted** and the Keep/Drop pass stays. The pattern check narrows what reaches that pass; it
 does not replace it.
+
+---
+
+## The re-acquire stopped at the frames where the feature was still covered (2026-08-21)
+
+Reported from use: "CoTracker is not re-acquiring the track when Blender loses the pattern —
+it should skip to the frame where the feature reappears, snap the point, and ask me."
+
+**The bug.** `resume_candidates` offered only the first **six frames CoTracker's visibility
+head flipped back to visible**, and the pattern check then ruled on exactly those. Through a
+real occlusion those are the frames where the feature is still covered: all six fail, the
+track is abandoned, and the artist is left to do it by hand while the feature is plainly back
+a dozen frames later. Visibility was gating which frames were allowed to be examined; it is
+now a report only.
+
+**What replaces it.** CoTracker supplies a predicted position for **every** frame after the
+failure (`cotrack.resume_path`), and `patmatch.find_reappearance` sweeps the whole window
+frame by frame — one decode per frame, every track still looking tested on it — taking the
+FIRST frame whose correlation against the artist's pattern crosses `min_match`, then the best
+of the next four. First, not best-overall: best-overall skips past a good return in favour of
+a marginally sharper frame fifty frames later, and every frame skipped is a frame the artist
+has to track by hand.
+
+Window raised 120 → 150 frames (still inside the 160-frame VRAM budget). A sweep that runs
+out of window hands back the guide's position at its end; the next round re-queries CoTracker
+from there and sweeps the next window, so an occlusion longer than one window is crossed in
+stages instead of ending the track.
+
+### Against the independent reference (`refs/SH004_lk`, closure 0.15–0.91 px)
+
+Death declared at frame 40, prediction path = LK truth pushed off by `jitter` px in a random
+direction — the guide error the sweep has to survive.
+
+| guide error | found | position vs LK (median / max) |
+|---|---|---|
+| 0 px | 5/5 | 1.12 / 4.54 px |
+| 8 px | 5/5 | 1.12 / 4.54 px |
+| 25 px | 5/5 | 1.12 / 4.54 px |
+| 60 px | 5/5 | 1.12 / 4.54 px |
+
+**Identical to two decimals at every jitter.** That is the property worth having: the resume
+no longer depends on CoTracker's accuracy, only on its rough vicinity — the correlation peak
+is where the feature is regardless of where the window was centred. Two tracks land at 0.44
+and 0.80 px, i.e. at the reference's own noise floor; ref014 at 4.54 px is a real
+disagreement, above its 0.91 px closure. Caveat: this measures **re-landing**, 4–7 frames
+after the death, not crossing a long occlusion — SH004 has no hand-tracked occlusion.
+
+### Synthetic occlusion, answer known by construction
+
+Feature covered by a different texture for six frames, then back and moving
+(`tests/test_patmatch.py`): found on **the frame it returns, never inside the occluder**,
+position **0.003 px**. A sweep that finds nothing reports how close it got and over which
+frames.
+
+### Two metrics measured and REJECTED
+
+* **Peak-to-second-peak ratio** as a "is this distinctive" gate. Looks obviously right; does
+  not work on this plate. Real correctly-tracked features score **0.93–0.99** (their
+  surroundings are repeating structure) while the flat-sky seed scores **0.72** — the metric
+  is inverted relative to what it would need to be.
+* **Patch contrast (std) as a gate.** A seed on flat sky (std 0.42) and a usable one (std
+  0.43) are indistinguishable by it, so refusing on contrast throws away real tracks. It is
+  reported as a **warning** instead — real artist-placed features on this plate measure std
+  40–64, so `std < 5` says "the score cannot mean much here" without vetoing anything.
+
+Both were caught by feeding them cases whose answer was already known. Neither reached the
+gate.
+
+### Confirm at the snap, not in a batch afterwards
+
+`confirm_resumes` (default ON) stops the run at each reappearance: the clip jumps to that
+frame, the marker is snapped and selected, and the operator waits — **Enter** tracks on,
+**D** drops it and stops re-acquiring that track, **A** accepts the rest, **Esc** stops. The
+question "is that my feature?" takes two seconds on the frame it happened; the same question
+in a batch afterwards, out of context, is what the old mute-everything pass was asking.
+
+With it on, the confirmed segment is no longer re-muted at the end — the artist has already
+answered. Only the resume frame itself is removed, because it is the guide's estimate rather
+than a measurement, which is exactly what `Keep` did by hand. With it off, nothing has been
+looked at and the old batch Keep/Drop behaviour is unchanged.

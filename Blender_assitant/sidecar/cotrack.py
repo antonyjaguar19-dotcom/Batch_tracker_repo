@@ -190,6 +190,39 @@ def resume_position(guide_track, guide_vis, last_good_frame, last_good_px, gap=3
     return got[0] if got else None
 
 
+def resume_path(guide_track, last_good_frame, last_good_px, gap=1, max_search=400,
+                frame_hi=None):
+    """The guide's predicted position for EVERY frame after the failure, not only the ones
+    it calls visible.
+
+    Same displacement rule as `resume_candidates`: the guide's motion applied to Blender's
+    last good position. The difference is what is left OUT -- nothing. `guide_vis` is a
+    threshold on the model's own visibility head, and using it to choose which frames may be
+    examined was the bug this replaces: through a real occlusion the first frames it flips
+    back to visible are still covered, and if the artist's pattern is then required to match
+    on exactly those frames, every one fails and the track is abandoned while the feature is
+    plainly back a dozen frames later. Visibility is now a report, not a gate; the pattern
+    score decides, and it needs every frame offered to it.
+
+    Returns [(frame, (x, y)), ...] in frame order.
+    """
+    g0 = guide_track.get(int(last_good_frame))
+    if g0 is None:
+        return []
+    out = []
+    f = int(last_good_frame) + max(1, int(gap))
+    limit_f = int(last_good_frame) + int(max_search)
+    if frame_hi is not None:
+        limit_f = min(limit_f, int(frame_hi))
+    while f <= limit_f:
+        g = guide_track.get(f)
+        if g is not None:
+            dx, dy = g[0] - g0[0], g[1] - g0[1]
+            out.append((f, (last_good_px[0] + dx, last_good_px[1] + dy)))
+        f += 1
+    return out
+
+
 def resume_candidates(guide_track, guide_vis, last_good_frame, last_good_px, gap=3,
                       max_search=200, limit=6):
     """The first `limit` frames the guide calls visible, each with a resume position.

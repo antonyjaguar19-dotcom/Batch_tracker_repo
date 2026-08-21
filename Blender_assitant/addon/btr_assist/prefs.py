@@ -69,6 +69,12 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         description="Correlate the pattern box you set -- the patch shown in the Track "
                     "panel preview -- against every candidate resume, at full plate "
                     "resolution, and refuse the ones that are not the same feature")
+    confirm_resumes: BoolProperty(
+        name="Confirm each re-acquire", default=True,
+        description="When a feature is found again, jump to that frame with the marker "
+                    "snapped onto it and wait for you: Enter tracks on, D drops it, A "
+                    "accepts the rest, Esc stops. Off runs straight through and leaves the "
+                    "batch muted for review at the end")
     min_match: FloatProperty(
         name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
         description="Correlation a candidate must reach against your pattern before it is "
@@ -84,6 +90,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "confirm_resumes")
         layout.prop(self, "verify_pattern")
         sub = layout.row()
         sub.enabled = self.verify_pattern

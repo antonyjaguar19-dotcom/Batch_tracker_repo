@@ -105,8 +105,20 @@ def match(plate, frame, patch, cx, cy, radius=32.0, offset=(0.0, 0.0)):
     Returns (x, y, score) -- the patch CENTRE's best position and its normalised
     correlation in [-1, 1] -- or None if the search window does not fit.
     """
-    import cv2                                                        # noqa: PLC0415
     img = _gray(plate.frame(int(frame) - 1))
+    if img is None:
+        return None
+    return match_in(img, patch, cx, cy, radius=radius, offset=offset)
+
+
+def match_in(img, patch, cx, cy, radius=32.0, offset=(0.0, 0.0)):
+    """`match` against an ALREADY DECODED grey frame.
+
+    Split out because the reappearance sweep is frame-major: one decode, every track that is
+    still looking tested against it. Per-track decoding re-read the same 4K frame once per
+    track and made a full-window search cost what it did not need to.
+    """
+    import cv2                                                        # noqa: PLC0415
     if img is None:
         return None
     ih, iw = img.shape
@@ -161,3 +173,86 @@ def best_candidate(plate, patch, offset, candidates, radius=32.0):
     if best is None:
         return None
     return best[0], best[1], best[2], best[3], tried
+
+
+def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
+    """When does each feature come back, and where?
+
+    This is the answer to "Blender lost it -- skip ahead to where it is again". Each job is
+
+        {"id", "patch", "offset", "radius", "path": [(frame, (x, y)), ...]}
+
+    where `path` is the guide's predicted position for EVERY frame after the failure, in
+    frame order. The sweep walks those frames ONCE, decoding each frame a single time and
+    testing every job still looking, and resolves a job at the FIRST frame whose correlation
+    against the artist's own patch reaches `min_match`.
+
+    First, not best. Best-over-the-whole-window would skip past a perfectly good return in
+    favour of a marginally sharper frame fifty frames later, and every frame it skipped is a
+    frame the artist has to track by hand. But the first frame over the line is often the
+    feature only half back, so once one passes, the next `settle` frames are also scored and
+    the best of that short run wins -- earliest return, best landing within it.
+
+    Jobs are processed in whatever order they are given and share the decode, so the cost is
+    one pass over the window regardless of how many tracks are looking.
+
+    Returns {id: {"frame", "x", "y", "score", "first_frame", "scanned", "best_seen",
+                  "best_frame"}} -- `frame` is None when the feature never came back, and
+    the `best_*` fields say how close it got, which is what makes a refusal readable.
+    """
+    say = on_status or (lambda m: None)
+    state = {}
+    for j in jobs:
+        state[j["id"]] = {"job": j, "path": dict(j["path"]), "done": False,
+                          "frame": None, "x": None, "y": None, "score": None,
+                          "first_frame": None, "settle_left": 0, "scanned": 0,
+                          "best_seen": -1.0, "best_frame": None}
+
+    frames = sorted({f for j in jobs for f, _ in j["path"]})
+    if not frames:
+        return {k: {kk: vv for kk, vv in v.items() if kk not in ("job", "path")}
+                for k, v in state.items()}
+
+    say("pattern sweep: %d frame(s) x %d track(s)" % (len(frames), len(jobs)))
+    for f in frames:
+        live = [s for s in state.values() if not s["done"] and f in s["path"]]
+        if not live:
+            continue
+        img = _gray(plate.frame(int(f) - 1))
+        if img is None:
+            continue
+        for s in live:
+            px, py = s["path"][f]
+            got = match_in(img, s["job"]["patch"], px, py,
+                           radius=s["job"].get("radius", 32.0),
+                           offset=s["job"]["offset"])
+            s["scanned"] += 1
+            if got is None:
+                continue
+            x, y, sc = got
+            if sc > s["best_seen"]:
+                s["best_seen"], s["best_frame"] = sc, int(f)
+            if s["first_frame"] is None:
+                if sc < min_match:
+                    continue
+                # First crossing: remember it, then keep looking for `settle` more frames
+                # in case the feature is still emerging.
+                s["first_frame"] = int(f)
+                s["frame"], s["x"], s["y"], s["score"] = int(f), x, y, sc
+                s["settle_left"] = int(settle)
+                continue
+            if sc > s["score"]:
+                s["frame"], s["x"], s["y"], s["score"] = int(f), x, y, sc
+            s["settle_left"] -= 1
+            if s["settle_left"] <= 0:
+                s["done"] = True
+        if all(s["done"] for s in state.values()):
+            break
+
+    out = {}
+    for k, s in state.items():
+        out[k] = {"frame": s["frame"], "x": s["x"], "y": s["y"], "score": s["score"],
+                  "first_frame": s["first_frame"], "scanned": s["scanned"],
+                  "best_seen": None if s["best_seen"] < -0.5 else float(s["best_seen"]),
+                  "best_frame": s["best_frame"]}
+    return out

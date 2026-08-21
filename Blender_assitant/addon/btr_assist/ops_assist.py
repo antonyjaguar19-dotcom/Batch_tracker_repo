@@ -2,20 +2,24 @@
 
     select your markers
       -> Blender tracks them, dies where it loses correlation
-      -> CoTracker, queried at YOUR points, says where each one is once it is visible again
-      -> YOUR pattern box is correlated against every candidate at full plate resolution;
-         anything that is not the same feature is refused and the track stays dead
-      -> the surviving resume lands on the correlation peak, MUTED, and Blender tracks on
-      -> repeat for N rounds
-      -> you look at each resume against the plate and press Keep or Drop
+      -> CoTracker predicts where the point goes on EVERY frame after that
+      -> YOUR pattern box is correlated against every one of those frames at full plate
+         resolution, and the FIRST frame it matches on is where the feature came back
+      -> the clip jumps there with the marker snapped onto it and the run STOPS: you look,
+         then Enter to track on, D to drop, A to accept the rest, Esc to stop
+      -> Blender tracks on from there; repeat for N rounds
+      -> a search that runs out of window continues from where it stopped next round, so an
+         occlusion longer than one window is crossed in stages instead of ending the track
 
 Blender does every per-frame measurement. CoTracker is only consulted at a death, and only
 to answer "where did this go" -- it never contributes a tracked position to the export.
 
-Why the resume arrives muted: measured across three shots, a re-acquired point lands on the
+Why nothing resumes silently: measured across three shots, a re-acquired point lands on the
 RIGHT feature 26-47 % of the time, and a wrong one tracks perfectly well afterwards.
-Surviving proves a seed was trackable, not that it was the thing you asked for. So nothing
-un-mutes itself.
+Surviving proves a seed was trackable, not that it was the thing you asked for. So every
+resume is a proposal shown to the artist on its own frame before tracking continues. With
+`confirm_resumes` off it is not shown, and then nothing un-mutes itself: the batch Keep/Drop
+pass in the panel is the review instead.
 
 The pattern check is what attacks that 26-47 % directly rather than only surviving it. The
 patch is captured from the marker's keyframe BEFORE anything is tracked -- the pixels
@@ -139,6 +143,12 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "preview -- against every candidate resume at full plate resolution, "
                     "and refuse the ones that are not the same feature. Off restores the "
                     "old behaviour: CoTracker's first visible frame is planted unchecked")
+    confirm_resumes: BoolProperty(
+        name="Confirm each re-acquire", default=True,
+        description="When a feature is found again, jump the clip to that frame with the "
+                    "marker snapped onto it and WAIT: you look at it, then press Enter to "
+                    "track on, D to drop it, or Esc to stop. Off runs every round straight "
+                    "through and leaves the whole batch muted for review at the end")
     min_match: bpy.props.FloatProperty(
         name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
         description="Normalised correlation a candidate must reach against your pattern. "
@@ -165,6 +175,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _scores = None            # id -> [(frame, score)], what each resume actually matched
     _misses = None            # id -> reason, for the report
     _gave_up = None           # ids the loop has stopped re-asking about
+    _continue_from = None     # id -> (frame, x, y): resume the SEARCH here, not a position
+    _awaiting = None          # resumes snapped and waiting for the artist to say yes
     _pending = None           # resumes awaiting insertion
     _resumed = None           # id -> [resume frames], for the report
     _n_frames = 0
@@ -237,6 +249,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._scores = {}
         self._misses = {}
         self._gave_up = set()
+        self._continue_from = {}
+        self._awaiting = []
         self._round = 0
         self._start_tracking(context)
 
@@ -278,9 +292,16 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             if self._phase == "waiting":
                 client.cancel(self._root, self._job)
             return self._done(context, "cancelled")
-        if event.type != "TIMER":
-            return {"PASS_THROUGH"}
         try:
+            # The confirm phase is the one that wants keys rather than the timer, and it
+            # must SWALLOW them: passing them through would let Enter and D reach the clip
+            # editor's own keymap while the artist is answering a question.
+            if self._phase == "confirm":
+                if event.type == "TIMER":
+                    return {"RUNNING_MODAL"}
+                return self._tick_confirm(context, event)
+            if event.type != "TIMER":
+                return {"PASS_THROUGH"}
             if self._phase == "tracking":
                 return self._tick_tracking(context)
             if self._phase == "waiting":
@@ -336,14 +357,28 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             if prev and self.min_resume_len and (f1 - prev[-1]) < self.min_resume_len:
                 self._gave_up.add(tr.name)
                 continue
-            m = tr.markers.find_frame(f1, exact=True)
-            if m is None:
-                continue
-            lx, ly = marker_to_image_px(m, w, h)
+            # Normally the search starts from where Blender died. But if the previous round
+            # swept its whole window without finding the feature, it handed back where the
+            # guide thought the point was at the end of that window: start there instead and
+            # sweep the NEXT window, so an occlusion longer than one window is crossed in
+            # stages rather than ending the track. Nothing from that continuation is planted
+            # -- it is a place to look from, and the pattern check still rules on whatever
+            # the look finds.
+            cont = self._continue_from.get(tr.name)
+            if cont is not None and cont[0] > f1:
+                lf, lx, ly = int(cont[0]), float(cont[1]), float(cont[2])
+                gap = 1
+            else:
+                m = tr.markers.find_frame(f1, exact=True)
+                if m is None:
+                    continue
+                lf = f1
+                lx, ly = marker_to_image_px(m, w, h)
+                gap = self.gap
             reqs.append({"id": tr.name,
                          "query_frame": seed[0], "query_x": seed[1], "query_y": seed[2],
-                         "last_good_frame": f1, "last_good_x": lx, "last_good_y": ly,
-                         "gap": self.gap,
+                         "last_good_frame": lf, "last_good_x": lx, "last_good_y": ly,
+                         "gap": gap,
                          # The artist's own pattern, so the sidecar can refuse a resume that
                          # is not this feature. Sent as a box, not as pixels -- the sidecar
                          # reads the plate off disk itself and nothing but JSON crosses.
@@ -380,16 +415,102 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         for miss in data.get("misses") or []:
             self._misses[miss["id"]] = miss.get("reason", "")
             print("[assist] %s not resumed: %s" % (miss["id"], miss.get("reason", "")))
-            # A refused track has not moved: next round asks the same question about the
-            # same death frame with the same pattern and gets the same answer, at the cost
-            # of a whole CoTracker pass. Ask once.
-            self._gave_up.add(miss["id"])
+            # Two different failures, two different answers. A window that simply ran out
+            # before the feature came back is worth another pass further along -- that is
+            # what a long occlusion looks like from here, and abandoning the track there is
+            # exactly the "it just stops" behaviour. Anything else (no feature in the box,
+            # the shot ended) will answer the same way forever, so ask once.
+            if miss.get("retry") and miss.get("tail_frame"):
+                self._continue_from[miss["id"]] = (int(miss["tail_frame"]),
+                                                   float(miss["tail_x"]),
+                                                   float(miss["tail_y"]))
+            else:
+                self._gave_up.add(miss["id"])
         n = self._insert_resumes(context, data.get("resumes") or [])
         if not n:
+            if self._continue_from and self._round < self.rounds:
+                # Nothing found yet, but the search can go further. Skip the tracking pass
+                # -- there is nothing new to track -- and sweep the next window.
+                self._round += 1
+                return self._ask_cotracker(context)
             return self._done(context, "no candidate matched the pattern you set"
                               if (data.get("misses") and self.verify_pattern)
                               else "CoTracker found no way back for any track")
         self._round += 1
+        if self.confirm_resumes and self._awaiting:
+            return self._start_confirm(context)
+        self._start_tracking(context)
+        return {"RUNNING_MODAL"}
+
+    # ---------------------------------------------------------------- confirm
+
+    def _start_confirm(self, context):
+        """Show the artist what was found, at the frame it was found on, and wait.
+
+        The point of the whole loop is that a re-acquire is a PROPOSAL. Muting it and
+        letting the run continue makes the artist audit a batch afterwards, out of context,
+        with no memory of which frame mattered. Stopping here instead puts them on the
+        reappearance frame with the marker already snapped -- the one moment where "is that
+        my feature?" is a two-second question.
+        """
+        self._awaiting.sort(key=lambda a: a["frame"])
+        return self._show_current(context)
+
+    def _show_current(self, context):
+        a = self._awaiting[0]
+        clip = self._clip
+        win, area, region, _clip_, scene = self._ctx
+        scene.frame_set(int(a["frame"]))
+        space = area.spaces.active
+        space.clip_user.frame_current = int(a["frame"])
+        for tr in three_de.active_tracks(clip):
+            on = tr.name == a["id"]
+            tr.select = on
+            tr.select_anchor = on
+            tr.select_pattern = on
+            tr.select_search = on
+        self._phase = "confirm"
+        self._status(context,
+                     "%s found again at frame %d (match %s) -- ENTER track on   "
+                     "D drop   A accept all %d   ESC stop"
+                     % (a["id"], a["frame"],
+                        "n/a" if a["score"] is None else "%.2f" % a["score"],
+                        len(self._awaiting)))
+        return {"RUNNING_MODAL"}
+
+    def _drop_resume(self, name, frame):
+        """Delete the proposed segment and stop re-acquiring that track."""
+        rec = next((r for r in self._records if r["id"] == name), None)
+        if rec is None:
+            return
+        tr = rec["t"]
+        for m in [m for m in tr.markers if m.frame >= int(frame)]:
+            tr.markers.delete_frame(m.frame)
+        rec["alive"] = False
+        self._gave_up.add(name)
+        frames = self._resumed.get(name) or []
+        self._resumed[name] = [f for f in frames if f != int(frame)]
+        if not self._resumed[name]:
+            self._resumed.pop(name, None)
+
+    def _tick_confirm(self, context, event):
+        if event.value != "PRESS":
+            return {"RUNNING_MODAL"}
+        key = event.type
+        if key in ("RET", "NUMPAD_ENTER", "SPACE"):
+            self._awaiting.pop(0)
+        elif key == "D":
+            a = self._awaiting.pop(0)
+            self._drop_resume(a["id"], a["frame"])
+        elif key == "A":
+            self._awaiting = []
+        else:
+            return {"RUNNING_MODAL"}
+        if self._awaiting:
+            return self._show_current(context)
+        # Everything answered. If the artist dropped every one there is nothing to track.
+        if not any(r["alive"] for r in self._records):
+            return self._done(context, "every proposal dropped")
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
 
@@ -411,7 +532,14 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # full-res correlation peak rather than a guess, but Blender's first step from
             # it is across a gap of `gap_frames`, which is further than one frame of motion.
             # The pattern stays the size it was -- that size IS the artist's feature.
+            # `last_good_frame` is where the SEARCH started, which after a continuation is a
+            # frame the track has no marker on. Fall back to its real last live marker --
+            # the geometry has to come from a marker that exists, or the resume inherits
+            # Blender's default box instead of the artist's.
             old = tr.markers.find_frame(int(res["last_good_frame"]), exact=True)
+            if old is None or old.mute:
+                live = [f for f in live_frames(tr) if f < int(res["frame"])]
+                old = tr.markers.find_frame(live[-1], exact=True) if live else None
             if old is not None:
                 sx = (old.search_max[0] - old.search_min[0]) * 1.0
                 sy = (old.search_max[1] - old.search_min[1]) * 1.0
@@ -420,19 +548,35 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 m.search_max = (sx, sy)
             rec["alive"] = True
             rec["seed_frame"] = int(res["frame"])
+            self._continue_from.pop(res["id"], None)
+            self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
+                                   "score": res.get("match_score")})
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
             sc = res.get("match_score")
             self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))
-            print("[assist] %s resumed at %d  match %s  tried %s%s"
-                  % (res["id"], int(res["frame"]),
+            print("[assist] %s died f%s -> back at f%d (first over the line f%s, "
+                  "%d frame(s) swept)  match %s%s"
+                  % (res["id"], res.get("last_good_frame"), int(res["frame"]),
+                     res.get("first_match_frame"), int(res.get("scanned") or 0),
                      "n/a" if sc is None else "%.2f" % sc,
-                     res.get("tried") or [],
                      ("  (%s)" % res["match_note"]) if res.get("match_note") else ""))
             n += 1
         return n
 
     def _done(self, context, why):
-        """Mute every resumed segment, so nothing enters the export unconfirmed."""
+        """Settle the resumed segments.
+
+        With `confirm_resumes` OFF nothing has been looked at, so everything from each
+        resume onwards is muted and the batch Keep/Drop pass in the panel is the review.
+
+        With it ON the artist has already answered for each one, on its own reappearance
+        frame, with the marker snapped in front of them -- so re-muting it would ask the
+        same question a second time out of context, which is the thing the confirm phase
+        exists to avoid. The resume FRAME ITSELF is deleted instead: it is the estimate of
+        where the feature went, not a measurement of it, and the frame after it is the first
+        one Blender actually matched. That is exactly what `Keep` does by hand, and deleting
+        rather than muting leaves no stray muted marker for the panel to report as unread.
+        """
         muted = 0
         for name, frames in (self._resumed or {}).items():
             rec = next((r for r in self._records if r["id"] == name), None)
@@ -440,6 +584,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 continue
             tr = rec["t"]
             for f0 in frames:
+                if self.confirm_resumes:
+                    if len(tr.markers) > 1 and tr.markers.find_frame(f0, exact=True):
+                        tr.markers.delete_frame(f0)
+                    continue
                 for m in tr.markers:
                     if m.frame >= f0:
                         m.mute = True
@@ -460,8 +608,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tail += ", %d refused (see console)" % n_ref
         return self._finish(
             context, "INFO",
-            "%s: %d track(s), median span %d/%d, %d resume(s) muted for review%s"
-            % (why, len(self._records), median, self._n_frames, n_res, tail))
+            "%s: %d track(s), median span %d/%d, %d resume(s) %s%s"
+            % (why, len(self._records), median, self._n_frames, n_res,
+               "confirmed by you" if self.confirm_resumes else "muted for review", tail))
 
 
 class CLIP_OT_btr_confirm_resumes(bpy.types.Operator):

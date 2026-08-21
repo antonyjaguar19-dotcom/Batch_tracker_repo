@@ -11,6 +11,8 @@ by construction:
   * a DIFFERENT feature sitting where the guide pointed   -> scores below the threshold
   * an exposure and grain change on the same feature      -> still scores high
   * a flat, featureless patch                             -> refused, not scored
+  * the feature COVERED for six frames, then back          -> found on the frame it returns,
+    never inside the occluder, and a sweep that finds nothing says how close it got
 
 Runs in seconds on CPU with no Blender, no CoTracker and no plate on disk:
 
@@ -146,6 +148,51 @@ def main():
         check("best candidate rejects the decoy frame", f in (2, 3),
               "chose frame %d at %.2f" % (f, s))
         check("every candidate is reported", len(tried) == 3, str(tried))
+
+    # --- the reappearance sweep --------------------------------------------------
+    # The case the loop kept failing: the feature is COVERED for a stretch after the death,
+    # so the frames a visibility head flips first are still wrong, and only a full sweep
+    # finds the frame it is actually back on. Frames 0-3 hold the feature, 4-9 replace it
+    # with an occluder, 10+ have it back and moving.
+    seq = []
+    truth = {}
+    for i in range(16):
+        if 4 <= i < 10:
+            # occluder: a different texture sitting exactly where the feature was
+            seq.append(_plate_frame([(200 + i, 240, 99), (380, 240, 22)]))
+        else:
+            seq.append(_plate_frame([(200 + i, 240, 11), (380, 240, 22)]))
+            truth[i + 1] = (200.0 + i, 240.0)
+    occ = FakePlate(seq)
+    ref2 = patmatch.reference_patch(occ, 1, 200.0, 240.0, 31.0, 31.0)
+    # The guide's prediction: right position every frame (an ideal guide), so the only thing
+    # under test is whether the sweep picks the right FRAME.
+    # Blender died at frame 4, one frame before the occluder arrives, so the search runs
+    # from frame 5 -- straight into six frames of the wrong thing.
+    path = [(f, (200.0 + f - 1, 240.0)) for f in range(5, 17)]
+    res = patmatch.find_reappearance(
+        occ, [{"id": "T", "patch": ref2[0], "offset": ref2[1], "radius": 8.0,
+               "path": path}], min_match=0.60, settle=3)["T"]
+    check("sweep crosses the occlusion", res["frame"] is not None,
+          "frame %s score %s" % (res["frame"], res["score"]))
+    check("sweep does not stop inside the occluder", res["first_frame"] == 11,
+          "first over the line: f%s" % res["first_frame"])
+    check("sweep lands on the earliest return", (res["frame"] or 0) <= 14,
+          "chose f%s" % res["frame"])
+    if res["frame"]:
+        tx, ty = truth[res["frame"]]
+        err = ((res["x"] - tx) ** 2 + (res["y"] - ty) ** 2) ** 0.5
+        check("sweep position is exact", err < 0.15, "err %.4f px" % err)
+
+    # A sweep that never finds it must say so, and say how close it got.
+    never = patmatch.find_reappearance(
+        occ, [{"id": "T", "patch": ref2[0], "offset": ref2[1], "radius": 6.0,
+               "path": [(f, (200.0 + f - 1, 240.0)) for f in range(5, 10)]}],
+        min_match=0.60, settle=3)["T"]
+    check("sweep with no return reports none", never["frame"] is None)
+    check("sweep with no return reports its best", never["best_seen"] is not None
+          and never["best_seen"] < 0.60, "%.3f" % (never["best_seen"] or -1))
+    check("sweep counts what it looked at", never["scanned"] == 5, str(never["scanned"]))
 
     # --- a flat patch is refused, not scored -------------------------------------
     flat = np.zeros((H, W, 3), np.uint8) + 128
