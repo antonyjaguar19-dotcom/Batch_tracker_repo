@@ -153,24 +153,40 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
         n_muted = sum(1 for t in three_de.active_tracks(clip) if t.select
                       for m in t.markers if m.mute)
 
+        p = prefs.get(context)
         col = layout.column(align=True)
         col.scale_y = 1.3
         col.enabled = n_sel > 0
-        col.operator("clip.btr_assist_track",
-                     text="Track %d selected + re-acquire" % n_sel, icon="TRACKING")
+        op = col.operator("clip.btr_assist_track",
+                          text="Track %d selected + re-acquire" % n_sel, icon="TRACKING")
+        # The prefs hold the artist's choice; the operator holds the property. Copying here
+        # keeps one source of truth without giving a modal operator a redo panel it cannot
+        # have.
+        if p is not None:
+            op.verify_pattern = p.verify_pattern
+            op.min_match = p.min_match
         if not n_sel:
             layout.label(text="Select your markers first", icon="INFO")
+
+        if p is not None:
+            sub = layout.column(align=True)
+            sub.prop(p, "verify_pattern", text="Must match my pattern")
+            row = sub.row()
+            row.enabled = p.verify_pattern
+            row.prop(p, "min_match", text="Min match")
 
         box = layout.box()
         box.label(text="Place your own seeds. Blender", icon="INFO")
         box.label(text="tracks; CoTracker only says")
-        box.label(text="where a dead one went.")
+        box.label(text="where a dead one went -- your")
+        box.label(text="pattern box decides if it is")
+        box.label(text="the same feature.")
 
         if n_muted:
             rev = layout.box()
             rev.label(text="%d marker(s) awaiting review" % n_muted, icon="ERROR")
-            rev.label(text="Look at the plate at the resume")
-            rev.label(text="frame. 26-47% land correctly.")
+            rev.label(text="Match scores are in the")
+            rev.label(text="console; still check the plate.")
             row = rev.row(align=True)
             row.operator("clip.btr_confirm_resumes", text="Keep", icon="CHECKMARK").action = "KEEP"
             row.operator("clip.btr_confirm_resumes", text="Drop", icon="X").action = "DROP"

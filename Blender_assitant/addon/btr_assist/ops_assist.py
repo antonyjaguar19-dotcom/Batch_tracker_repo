@@ -3,7 +3,9 @@
     select your markers
       -> Blender tracks them, dies where it loses correlation
       -> CoTracker, queried at YOUR points, says where each one is once it is visible again
-      -> the track resumes there, MUTED, and Blender tracks on
+      -> YOUR pattern box is correlated against every candidate at full plate resolution;
+         anything that is not the same feature is refused and the track stays dead
+      -> the surviving resume lands on the correlation peak, MUTED, and Blender tracks on
       -> repeat for N rounds
       -> you look at each resume against the plate and press Keep or Drop
 
@@ -14,6 +16,15 @@ Why the resume arrives muted: measured across three shots, a re-acquired point l
 RIGHT feature 26-47 % of the time, and a wrong one tracks perfectly well afterwards.
 Surviving proves a seed was trackable, not that it was the thing you asked for. So nothing
 un-mutes itself.
+
+The pattern check is what attacks that 26-47 % directly rather than only surviving it. The
+patch is captured from the marker's keyframe BEFORE anything is tracked -- the pixels
+Blender draws in the Track panel's preview box, which is the artist's actual statement of
+what the feature is -- and the sidecar refuses any candidate that scores below `min_match`
+against it (`sidecar/patmatch.py`). A refusal leaves the track dead, which is the honest
+outcome: no resume beats a resume on the wrong feature. The review pass stays regardless,
+because a fixed patch cannot rule on a feature whose appearance genuinely changed, and
+because the score has not yet been measured against hand tracks on this footage.
 
 Why the resume frame itself is never exported: it is the guide's estimate of where the
 feature went, not a measurement of it. The frame after it is the first one Blender actually
@@ -50,6 +61,31 @@ def marker_to_image_px(marker, w, h):
 def image_px_to_uv(x, y_down, w, h):
     y_up = (h - 1.0) - y_down
     return three_de.px_to_uv(x, y_up, w, h)
+
+
+def marker_pattern_box(marker, w, h):
+    """The artist's pattern box in plate pixels, y-DOWN: (cx, cy, pw, ph).
+
+    `pattern_corners` are four OFFSETS from the marker in normalised clip space, in the
+    order bottom-left, bottom-right, top-right, top-left. Their bounding box is the region
+    Blender correlates and the region it draws in the Track panel's preview -- the feature,
+    as the artist set it. The box centre is not the marker: dragging a corner moves one side
+    only, so the centre has to be read from the corners rather than assumed to be `co`.
+    """
+    xs = [c[0] for c in marker.pattern_corners]
+    ys = [c[1] for c in marker.pattern_corners]
+    cu = marker.co[0] + (min(xs) + max(xs)) / 2.0
+    cv = marker.co[1] + (min(ys) + max(ys)) / 2.0
+    x, y_up = three_de.uv_to_px(cu, cv, w, h)
+    return (x, (h - 1.0) - y_up,
+            (max(xs) - min(xs)) * w, (max(ys) - min(ys)) * h)
+
+
+def marker_search_px(marker, w, h):
+    """Search box width in plate pixels -- the artist's statement of how far this feature
+    is allowed to move between frames."""
+    return max((marker.search_max[0] - marker.search_min[0]) * w,
+               (marker.search_max[1] - marker.search_min[1]) * h)
 
 
 def live_frames(track):
@@ -97,6 +133,19 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "contrast rather than to an occluder gets re-acquired successfully and "
                     "then dies again immediately, so the loop crawls forward a few frames "
                     "per round forever. The feature is bad; that needs a hand, not a retry")
+    verify_pattern: BoolProperty(
+        name="Must match your pattern", default=True,
+        description="Correlate YOUR pattern box -- the patch shown in the Track panel "
+                    "preview -- against every candidate resume at full plate resolution, "
+                    "and refuse the ones that are not the same feature. Off restores the "
+                    "old behaviour: CoTracker's first visible frame is planted unchecked")
+    min_match: bpy.props.FloatProperty(
+        name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
+        description="Normalised correlation a candidate must reach against your pattern. "
+                    "Below it the track is left dead rather than resumed on the wrong "
+                    "thing. Raise it if wrong resumes still get through; lower it if a "
+                    "feature that legitimately changed appearance is being refused -- the "
+                    "report prints the scores it saw either way")
 
     _timer = None
     _phase = ""
@@ -111,6 +160,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _opts = None
     _clip = None
     _seeds_px = None          # id -> (frame, x, y) in image px, the artist's own points
+    _patterns = None          # id -> the artist's pattern box, captured before tracking
+    _search_px = None         # id -> the artist's search box width, in plate px
+    _scores = None            # id -> [(frame, score)], what each resume actually matched
+    _misses = None            # id -> reason, for the report
+    _gave_up = None           # ids the loop has stopped re-asking about
     _pending = None           # resumes awaiting insertion
     _resumed = None           # id -> [resume frames], for the report
     _n_frames = 0
@@ -146,6 +200,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         # CoTracker gets queried with, so it follows the feature that was chosen rather than
         # wherever the track later drifted to.
         self._seeds_px = {}
+        self._patterns = {}
+        self._search_px = {}
         self._records = []
         for tr in tracks:
             fr = live_frames(tr)
@@ -156,6 +212,14 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 continue
             x, y = marker_to_image_px(m, w, h)
             self._seeds_px[tr.name] = (fr[0], x, y)
+            # The pattern patch is captured HERE, before a single frame is tracked, because
+            # it is the identity of the feature the artist chose. Reading it later would
+            # read wherever the track had drifted to by then, which is the thing the check
+            # exists to catch.
+            cx, cy, pw, ph = marker_pattern_box(m, w, h)
+            self._patterns[tr.name] = {"frame": fr[0], "cx": cx, "cy": cy,
+                                       "w": pw, "h": ph}
+            self._search_px[tr.name] = marker_search_px(m, w, h)
             self._records.append({"t": tr, "id": tr.name, "kind": "", "alive": True,
                                   "w": w, "h": h, "seed_frame": fr[0]})
         if not self._records:
@@ -170,6 +234,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         win, area, region = three_de.clip_editor(context, clip)
         self._ctx = (win, area, region, clip, context.scene)
         self._resumed = {}
+        self._scores = {}
+        self._misses = {}
+        self._gave_up = set()
         self._round = 0
         self._start_tracking(context)
 
@@ -256,7 +323,6 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         clip = self._clip
         w, h = clip.size
         reqs = []
-        self._gave_up = getattr(self, "_gave_up", set())
         for tr, f0, f1 in dead_tracks([r["t"] for r in self._records],
                                       self._n_frames, self.tail):
             seed = self._seeds_px.get(tr.name)
@@ -277,7 +343,12 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             reqs.append({"id": tr.name,
                          "query_frame": seed[0], "query_x": seed[1], "query_y": seed[2],
                          "last_good_frame": f1, "last_good_x": lx, "last_good_y": ly,
-                         "gap": self.gap})
+                         "gap": self.gap,
+                         # The artist's own pattern, so the sidecar can refuse a resume that
+                         # is not this feature. Sent as a box, not as pixels -- the sidecar
+                         # reads the plate off disk itself and nothing but JSON crosses.
+                         "pattern": self._patterns.get(tr.name),
+                         "search_px": self._search_px.get(tr.name, 0.0)})
         if not reqs:
             return self._done(context, "nothing died -- every track reaches the end")
 
@@ -285,7 +356,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         client.ensure(self._root, bpy.path.abspath(p.python_exe) if p else "",
                       p.port if p else 0)
         r = client.start_reacquire(self._root, clip_info(context, clip), reqs,
-                                   {"frame_hi": self._n_frames})
+                                   {"frame_hi": self._n_frames,
+                                    "verify_pattern": bool(self.verify_pattern),
+                                    "min_match": float(self.min_match)})
         self._job = r["id"]
         self._phase = "waiting"
         self._status(context, "round %d: asking CoTracker about %d dead track(s) ..."
@@ -304,9 +377,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             return self._done(context, "cancelled")
 
         data = st["result"]
+        for miss in data.get("misses") or []:
+            self._misses[miss["id"]] = miss.get("reason", "")
+            print("[assist] %s not resumed: %s" % (miss["id"], miss.get("reason", "")))
+            # A refused track has not moved: next round asks the same question about the
+            # same death frame with the same pattern and gets the same answer, at the cost
+            # of a whole CoTracker pass. Ask once.
+            self._gave_up.add(miss["id"])
         n = self._insert_resumes(context, data.get("resumes") or [])
         if not n:
-            return self._done(context, "CoTracker found no way back for any track")
+            return self._done(context, "no candidate matched the pattern you set"
+                              if (data.get("misses") and self.verify_pattern)
+                              else "CoTracker found no way back for any track")
         self._round += 1
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
@@ -325,8 +407,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             u, v = image_px_to_uv(float(res["x"]), float(res["y"]), w, h)
             m = tr.markers.insert_frame(int(res["frame"]), co=(u, v))
             m.mute = False        # it must be live for Blender to track FROM it
-            # A resume is a guess, so give the search box room to find the real peak; the
-            # pattern stays the size it was.
+            # The search box still gets room: with the pattern check on, the position is a
+            # full-res correlation peak rather than a guess, but Blender's first step from
+            # it is across a gap of `gap_frames`, which is further than one frame of motion.
+            # The pattern stays the size it was -- that size IS the artist's feature.
             old = tr.markers.find_frame(int(res["last_good_frame"]), exact=True)
             if old is not None:
                 sx = (old.search_max[0] - old.search_min[0]) * 1.0
@@ -337,6 +421,13 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             rec["alive"] = True
             rec["seed_frame"] = int(res["frame"])
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
+            sc = res.get("match_score")
+            self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))
+            print("[assist] %s resumed at %d  match %s  tried %s%s"
+                  % (res["id"], int(res["frame"]),
+                     "n/a" if sc is None else "%.2f" % sc,
+                     res.get("tried") or [],
+                     ("  (%s)" % res["match_note"]) if res.get("match_note") else ""))
             n += 1
         return n
 
@@ -356,10 +447,21 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         spans = sorted(len(live_frames(r["t"])) for r in self._records)
         median = spans[len(spans) // 2] if spans else 0
         n_res = sum(len(v) for v in (self._resumed or {}).values())
+        # The match score is the part of this report worth reading: it is the only number in
+        # the loop that says a resume is the artist's feature rather than merely a feature.
+        sc = [s for v in (self._scores or {}).values() for _, s in v if s is not None]
+        tail = ""
+        if sc:
+            tail = ", match %.2f-%.2f (min %.2f)" % (min(sc), max(sc), self.min_match)
+        elif self.verify_pattern:
+            tail = ", pattern check found nothing to check"
+        n_ref = len(self._misses or {})
+        if n_ref:
+            tail += ", %d refused (see console)" % n_ref
         return self._finish(
             context, "INFO",
-            "%s: %d track(s), median span %d/%d, %d resume(s) muted for review"
-            % (why, len(self._records), median, self._n_frames, n_res))
+            "%s: %d track(s), median span %d/%d, %d resume(s) muted for review%s"
+            % (why, len(self._records), median, self._n_frames, n_res, tail))
 
 
 class CLIP_OT_btr_confirm_resumes(bpy.types.Operator):

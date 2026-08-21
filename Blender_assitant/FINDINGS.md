@@ -554,3 +554,76 @@ Whether a resume lands on the RIGHT feature. Spans growing proves a resume was *
 which is exactly what `FINDINGS_REPORT.md` §8.4 warns is not the same thing — that mistake
 produced a clean-looking file in which the resumes were 315.73 px out. Scoring this needs
 hand tracks through an occlusion.
+
+---
+
+## Re-acquire now has to prove it is the artist's feature (2026-08-21)
+
+Answers the "still not measured" note directly above it. Spans growing proved a resume was
+*trackable*; nothing checked it was the thing the artist picked.
+
+The check: the marker's pattern box — the patch Blender draws in the Track panel's preview,
+captured at the keyframe **before any tracking runs** — is correlated (`TM_CCOEFF_NORMED`,
+full plate resolution) against every candidate resume CoTracker offers. Below `min_match`
+the track is left dead instead of resumed. `sidecar/patmatch.py`, gated in
+`sidecar/server.py:job_reacquire`.
+
+Two things came free with it:
+
+* **CoTracker's first visible frame is not the best one.** `resume_candidates` now offers
+  the first six, and the peak is chosen by correlation. On SH004 USER_04 moved from frame 24
+  (0.746) to frame 27 (0.814) — the point was still half-covered when the guide first called
+  it visible.
+* **Sub-pixel.** A passing match refines the plant by a parabola fit on the correlation
+  peak, so the check improves the position it approves rather than only judging it.
+
+### Synthetic, answers known by construction (`tests/test_patmatch.py`, CPU, seconds)
+
+| case | result |
+|---|---|
+| same feature, +17,+9 px | found to **0.008 px**, score 0.988 |
+| same feature, +17.4,+9.65 px | found to **0.014 px**, score 0.880 |
+| same feature, 2 stops down + grain σ6 | found to **0.010 px**, score 0.939 |
+| **different feature** where the guide pointed | **0.186** — refused |
+| flat / off-plate box | refused, not scored |
+
+The decoy at 0.186 against the truth at 0.939 is the whole point: the two are separated by
+0.75, not by a hair.
+
+### SH004, real plate, 6 seeds, 2 rounds
+
+One refusal, and it was right. USER_00 was planted on flat sky — the 28×28 patch spans
+**130..135 grey levels**, std 0.42. Blender still tracked it 40 frames on brute+normalised
+correlation, and the old path then re-acquired it and "tracked" it for **116 more frames on
+nothing**. With the check on it scores 0.48–0.52 across all six candidates, its own peak
+jumps ±10 px between adjacent frames, and it is refused. That is the failure this was built
+for, caught on the first real run.
+
+Refusals now say which of the two problems it is, because the fix differs: the same
+candidate is re-scored against the patch at the **last good frame**. Both low ⇒ no feature
+in the box (move the marker). Seed low, last-good high ⇒ the feature changed appearance
+(re-key, or lower `min_match`). USER_00 scored 0.58 against frame 40 as well — no feature.
+
+### Where the 0.60 default comes from
+
+12 real SH004 features, each scored against its own frame-1 patch at its true position every
+20 frames to frame 160 (`guide` track from `SH004__final__seeds.json`):
+
+```
+           f1     f10    f20    f40    f60    f80    f100   f120   f140   f160
+median     1.000  0.944  0.906  0.895  0.877  0.917  0.819  0.868  0.932  0.928
+min        1.000  0.723  0.497  0.621  0.487  0.707  0.545  0.725  0.595  0.512
+```
+
+A real feature stays at **0.82–0.94 median** over the whole shot, so 0.60 leaves a wide
+margin — but the worst single feature dips to **0.487**, and the featureless seed's noise
+floor was **0.52**. Those overlap. 0.60 is therefore a default, not a law: it will
+occasionally refuse a hard feature, which is why the threshold is exposed in the panel and
+why every score the run saw is printed.
+
+### What this still does not settle
+
+Whether an *approved* resume is on the right feature — only that a rejected one is not.
+Nothing here is scored against hand tracks through an occlusion, so the resume still arrives
+**muted** and the Keep/Drop pass stays. The pattern check narrows what reaches that pass; it
+does not replace it.

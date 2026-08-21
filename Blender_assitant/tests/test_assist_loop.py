@@ -31,11 +31,12 @@ sys.path.insert(0, os.path.join(ASSIST, "sidecar"))
 
 from btr_assist import three_de, track_core
 from btr_assist.ops_assist import (marker_to_image_px, image_px_to_uv, live_frames,
-                                   dead_tracks)
+                                   dead_tracks, marker_pattern_box, marker_search_px)
 
 spec = json.load(open(r"{spec}", encoding="utf-8"))
 plate, pts, rounds, gap, tail = (spec["plate"], spec["points"], spec["rounds"],
                                  spec["gap"], spec["tail"])
+verify, min_match = spec["verify_pattern"], spec["min_match"]
 
 
 def log(m):
@@ -70,7 +71,7 @@ opts = track_core.Opts(leash=0.0)
 track_core.apply_settings(clip, opts)
 
 tracks = three_de.active_tracks(clip)
-records, seeds_px = [], {{}}
+records, seeds_px, patterns, search_px = [], {{}}, {{}}, {{}}
 for i, (nx, ny) in enumerate(pts):
     x, y_down = nx * w, ny * h
     u, v = image_px_to_uv(x, y_down, w, h)
@@ -82,7 +83,11 @@ for i, (nx, ny) in enumerate(pts):
     records.append({{"t": tr, "id": tr.name, "kind": "", "alive": True,
                     "w": w, "h": h, "seed_frame": 1}})
     seeds_px[tr.name] = (1, x, y_down)
-    log("seed %s at image px (%.1f, %.1f)" % (tr.name, x, y_down))
+    cx, cy, pw, ph = marker_pattern_box(m, w, h)
+    patterns[tr.name] = {{"frame": 1, "cx": cx, "cy": cy, "w": pw, "h": ph}}
+    search_px[tr.name] = marker_search_px(m, w, h)
+    log("seed %s at image px (%.1f, %.1f), pattern %.0fx%.0f at (%.1f, %.1f)"
+        % (tr.name, x, y_down, pw, ph, cx, cy))
 
 # round-trip the coordinate conversion before believing anything downstream
 worst = 0.0
@@ -131,11 +136,14 @@ for rnd in range(rounds + 1):
         lx, ly = marker_to_image_px(m, w, h)
         reqs.append({{"id": tr.name, "query_frame": s[0], "query_x": s[1], "query_y": s[2],
                      "last_good_frame": f1, "last_good_x": lx, "last_good_y": ly,
-                     "gap": gap}})
+                     "gap": gap, "pattern": patterns.get(tr.name),
+                     "search_px": search_px.get(tr.name, 0.0)}})
         log("  dead: %s spans %d..%d of %d" % (tr.name, f0, f1, n_frames))
 
     ci = {{"path": os.path.abspath(plate), "width": w, "height": h, "frames": n_frames}}
-    r = client.start_reacquire(root, ci, reqs, {{"frame_hi": n_frames}})
+    r = client.start_reacquire(root, ci, reqs,
+                               {{"frame_hi": n_frames, "verify_pattern": verify,
+                                "min_match": min_match}})
     while True:
         js = client.poll(root, r["id"])
         if js["state"] not in ("queued", "running"):
@@ -164,9 +172,11 @@ for rnd in range(rounds + 1):
             mk.search_min = (-sx, -sy); mk.search_max = (sx, sy)
         rec["alive"] = True; rec["seed_frame"] = int(rr["frame"])
         resumed.setdefault(rr["id"], []).append(int(rr["frame"]))
-        log("    %s died f%d -> resume f%d at (%.1f, %.1f), %d occluded"
+        sc = rr.get("match_score")
+        log("    %s died f%d -> resume f%d at (%.1f, %.1f), %d occluded, match %s %s"
             % (rr["id"], rr["last_good_frame"], rr["frame"], rr["x"], rr["y"],
-               rr["occluded_frames"]))
+               rr["occluded_frames"], "n/a" if sc is None else "%.2f" % sc,
+               rr.get("tried") or ""))
     report["rounds"][-1]["resumes"] = res["resumes"]
     report["rounds"][-1]["misses"] = res["misses"]
 
@@ -185,6 +195,11 @@ def main():
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--gap", type=int, default=3)
     ap.add_argument("--tail", type=int, default=2)
+    ap.add_argument("--min-match", type=float, default=0.60,
+                    help="correlation a resume must reach against the seed pattern")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="plant CoTracker's first visible frame unchecked (the old "
+                         "behaviour, kept so the two can be compared on one plate)")
     ap.add_argument("--blender",
                     default=os.environ.get("BTR_BLENDER_EXE", DEFAULT_BLENDER))
     args = ap.parse_args()
@@ -196,7 +211,9 @@ def main():
     report_path = os.path.join(outdir, "report.json")
     with open(spec_path, "w", encoding="utf-8") as fh:
         json.dump({"plate": os.path.abspath(args.plate), "points": pts,
-                   "rounds": args.rounds, "gap": args.gap, "tail": args.tail}, fh)
+                   "rounds": args.rounds, "gap": args.gap, "tail": args.tail,
+                   "verify_pattern": not args.no_verify,
+                   "min_match": args.min_match}, fh)
 
     driver = os.path.join(outdir, "driver.py")
     with open(driver, "w", encoding="utf-8") as fh:

@@ -185,15 +185,33 @@ def resume_position(guide_track, guide_vis, last_good_frame, last_good_px, gap=3
 
     Returns (resume_frame, (x, y)) or None if the guide never comes back.
     """
+    got = resume_candidates(guide_track, guide_vis, last_good_frame, last_good_px,
+                            gap=gap, max_search=max_search, limit=1)
+    return got[0] if got else None
+
+
+def resume_candidates(guide_track, guide_vis, last_good_frame, last_good_px, gap=3,
+                      max_search=200, limit=6):
+    """The first `limit` frames the guide calls visible, each with a resume position.
+
+    Same displacement rule as `resume_position`, applied per candidate. More than one is
+    offered because the guide's first VISIBLE frame is a threshold crossing, not a judgement
+    about how much of the feature is back: a point emerging from an occluder is routinely
+    half-covered on that frame and whole a frame or two later. The caller correlates the
+    artist's own pattern against each and keeps the best -- see `patmatch.best_candidate`.
+
+    Returns [(frame, (x, y)), ...], nearest first, possibly empty.
+    """
     g0 = guide_track.get(int(last_good_frame))
     if g0 is None:
-        return None
+        return []
+    out = []
     f = int(last_good_frame) + max(1, int(gap))
-    limit = int(last_good_frame) + int(max_search)
-    while f <= limit:
+    limit_f = int(last_good_frame) + int(max_search)
+    while f <= limit_f and len(out) < max(1, int(limit)):
         g = guide_track.get(f)
         if g is not None and guide_vis.get(f, False):
             dx, dy = g[0] - g0[0], g[1] - g0[1]
-            return f, (last_good_px[0] + dx, last_good_px[1] + dy)
+            out.append((f, (last_good_px[0] + dx, last_good_px[1] + dy)))
         f += 1
-    return None
+    return out

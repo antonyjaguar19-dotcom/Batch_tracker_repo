@@ -140,6 +140,7 @@ def job_reacquire(payload):
         require_repo()
         import blio                                                  # noqa: PLC0415
         import cotrack                                               # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
 
         clip = payload.get("clip") or {}
         reqs = payload.get("requests") or []
@@ -224,6 +225,18 @@ def job_reacquire(payload):
                                        on_status=job.say)
             for j, r in enumerate(grp):
                 per_req[r["id"]] = (sub["tracks"][j], sub["vis"][j])
+        # ---- identity check ------------------------------------------------------
+        # CoTracker says WHERE. It does not say WHICH -- 26-47 % of its resumes land on a
+        # different feature that then tracks perfectly well. So every candidate is
+        # correlated at full plate resolution against the artist's own pattern patch, taken
+        # from the marker's keyframe: the pixels Blender draws in the Track panel preview.
+        # A candidate below `min_match` is not planted at all; it is reported as a miss with
+        # its score, so a threshold that is wrong for a plate shows up as near-misses rather
+        # than as silence.
+        min_match = float(params.get("min_match", 0.60))
+        n_cand = int(params.get("match_candidates", 6))
+        verify = bool(params.get("verify_pattern", True))
+
         res = {"scale": None}
 
         resumes, misses = [], []
@@ -235,26 +248,102 @@ def job_reacquire(payload):
                 continue
             tm, vm = got
             lg = int(r["last_good_frame"])
-            rp = cotrack.resume_position(
-                tm, vm, lg, (float(r["last_good_x"]), float(r["last_good_y"])),
+            last_px = (float(r["last_good_x"]), float(r["last_good_y"]))
+            cands = cotrack.resume_candidates(
+                tm, vm, lg, last_px,
                 gap=int(r.get("gap", 3)),
-                max_search=int(params.get("max_search", 200)))
-            if rp is None:
+                max_search=int(params.get("max_search", 200)),
+                limit=n_cand if verify else 1)
+            if not cands:
                 misses.append({"id": r["id"],
                                "reason": "CoTracker never calls it visible again "
                                          "after frame %d" % lg})
                 continue
-            f, (x, y) = rp
+
+            pat = r.get("pattern") or {}
+            ref = None
+            if verify and pat:
+                ref = patmatch.reference_patch(
+                    plate, int(pat.get("frame", lg)),
+                    float(pat["cx"]), float(pat["cy"]),
+                    float(pat["w"]), float(pat["h"]))
+
+            score, tried, why = None, [], ""
+            if ref is None:
+                f, (x, y) = cands[0]
+                if verify and pat:
+                    why = "no pattern to check against (box off-plate or featureless)"
+            else:
+                patch, offset = ref
+                # Search radius: the marker's own search box if the addon sent one, since
+                # that is the artist's statement of how far this feature may move. The guide
+                # has already carried the point most of the way, so this only has to cover
+                # the guide's own error.
+                radius = float(r.get("search_px") or max(24.0, patch.shape[1]))
+                radius = max(8.0, min(float(params.get("max_match_radius", 96.0)),
+                                      radius / 2.0))
+                best = patmatch.best_candidate(plate, patch, offset, cands, radius=radius)
+                if best is None:
+                    misses.append({"id": r["id"],
+                                   "reason": "pattern search window fell off the plate"})
+                    continue
+                f, x, y, score, tried = best
+                if score < min_match:
+                    # A refusal the artist cannot act on is only half useful, and there are
+                    # two very different reasons a candidate fails. Score the same candidate
+                    # against the patch at the LAST GOOD frame as well: that patch is the
+                    # feature as it looked just before it died. Both low means there is no
+                    # strong feature in the box at all (measured on SH004: a seed on flat
+                    # sky, 130..135 grey levels, scored 0.48-0.52 against both and moved its
+                    # own peak +/-10 px between frames -- it had tracked 40 frames and then
+                    # "re-acquired" onto nothing for 116 more). Seed low but last-good high
+                    # means the feature is there and has changed appearance, which is a
+                    # threshold or re-key decision, not a bad marker.
+                    alt = None
+                    ref2 = patmatch.reference_patch(
+                        plate, lg, last_px[0], last_px[1],
+                        float(pat["w"]), float(pat["h"]))
+                    if ref2 is not None:
+                        got2 = patmatch.match(plate, f, ref2[0], x, y,
+                                              radius=radius, offset=ref2[1])
+                        alt = None if got2 is None else float(got2[2])
+                    if alt is not None and alt >= min_match:
+                        why2 = ("it still matches how it looked at frame %d (%.2f), so the "
+                                "feature has changed appearance since your keyframe -- "
+                                "re-key the marker there, or lower Min match" % (lg, alt))
+                    else:
+                        why2 = ("it does not match frame %d either (%.2f), so there is no "
+                                "strong feature in the box you set -- move the marker onto "
+                                "one" % (lg, -1.0 if alt is None else alt))
+                    misses.append({
+                        "id": r["id"],
+                        "score": round(float(score), 3),
+                        "score_last_good": None if alt is None else round(alt, 3),
+                        "tried": [(ff, None if s is None else round(float(s), 3))
+                                  for ff, s in tried],
+                        "reason": "best pattern match %.2f < %.2f over frames %s; %s"
+                                  % (score, min_match,
+                                     ",".join(str(ff) for ff, _ in tried), why2)})
+                    continue
+
             occluded = sum(1 for ff in range(lg, f) if not vm.get(ff, True))
             resumes.append({"id": r["id"], "frame": int(f), "x": x, "y": y,
                             "last_good_frame": lg,
                             "gap_frames": int(f - lg),
                             "occluded_frames": int(occluded),
+                            "match_score": None if score is None else round(float(score), 3),
+                            "match_note": why,
+                            "tried": [(ff, None if s is None else round(float(s), 3))
+                                      for ff, s in tried],
                             "guide_dx": tm[f][0] - tm[lg][0],
                             "guide_dy": tm[f][1] - tm[lg][1]})
-        job.say("%d resume(s), %d without one" % (len(resumes), len(misses)))
+        scored = [r["match_score"] for r in resumes if r["match_score"] is not None]
+        job.say("%d resume(s), %d without one%s"
+                % (len(resumes), len(misses),
+                   ("; pattern match %.2f..%.2f" % (min(scored), max(scored)))
+                   if scored else ""))
         cotrack.free()
-        return {"resumes": resumes, "misses": misses,
+        return {"resumes": resumes, "misses": misses, "min_match": min_match,
                 "width": plate.w, "height": plate.h, "passes": len(groups)}
     return fn
 

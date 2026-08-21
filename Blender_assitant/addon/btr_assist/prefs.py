@@ -9,7 +9,7 @@ import json
 import os
 
 import bpy
-from bpy.props import BoolProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
 
 DEFAULTS_CACHE = {}
 
@@ -60,6 +60,20 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         description="A 50% proxy halves tracking precision invisibly. With this on, the "
                     "addon uses the original footage for the duration of a job and "
                     "restores your setting afterwards")
+    # These two live here rather than only on the operator because they are a judgement the
+    # artist makes once per plate, not per run, and a modal operator has no redo panel to
+    # adjust them in. The operator still owns the properties -- the panel copies these into
+    # it -- so scripting the operator directly is unaffected.
+    verify_pattern: BoolProperty(
+        name="Re-acquire must match your pattern", default=True,
+        description="Correlate the pattern box you set -- the patch shown in the Track "
+                    "panel preview -- against every candidate resume, at full plate "
+                    "resolution, and refuse the ones that are not the same feature")
+    min_match: FloatProperty(
+        name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
+        description="Correlation a candidate must reach against your pattern before it is "
+                    "planted. Below it the track is left dead rather than resumed on the "
+                    "wrong thing. The run reports the scores it saw, so tune from those")
 
     def draw(self, context):
         layout = self.layout
@@ -70,6 +84,10 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "verify_pattern")
+        sub = layout.row()
+        sub.enabled = self.verify_pattern
+        sub.prop(self, "min_match")
         if not self.python_exe:
             box = layout.box()
             box.label(text="Run bootstrap.bat in Blender_assitant to fill these in.",
