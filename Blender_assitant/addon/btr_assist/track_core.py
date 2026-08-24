@@ -25,6 +25,15 @@ import math
 
 import bpy
 
+try:
+    from .scale_watch import ScaleWatch, size_of
+except ImportError:                   # pragma: no cover -- see below
+    # The parity harness (`tests/parity_run_core.py`) puts `addon/btr_assist` on sys.path
+    # and imports this file as a TOP-LEVEL module, because the package's __init__ registers
+    # operators it has no use for. A relative import is an ImportError there, and the gate
+    # that proves this loop matches the original is not worth losing to an import style.
+    from scale_watch import ScaleWatch, size_of
+
 # ---------------------------------------------------------------- geometry tables
 # Copied from bl_track.py:43-86 rather than imported: this file runs inside Blender, where
 # the repo is not importable. `tests/test_track_core_parity.py` is what keeps the two
@@ -85,6 +94,14 @@ class Opts:
         self.search_scale = 1.0
         self.leash = 20.0                   # px from the guide; 0 disables the leash
         self.backwards = True
+        # Pattern-box scale watch. Inert unless a record carries a watch (`attach_watch`),
+        # so the headless path and the parity test are byte-identical with these present.
+        # A watch only fires under a motion model that solves scale -- `Loc` never resizes
+        # the box, so there is nothing for it to see.
+        self.watch_scale = False
+        self.scale_rate = 0.10              # fractional size change in ONE frame
+        self.scale_ratio = 1.6              # cumulative size against the artist's box
+        self.scale_onset = 1.06             # size band that counts as "still the same box"
         for k, v in kw.items():
             if not hasattr(self, k):
                 raise KeyError("unknown option %r" % k)
@@ -121,6 +138,41 @@ def set_geom(marker, pattern_px, search_px, w, h):
     marker.pattern_corners = ((-hu, -hv), (hu, -hv), (hu, hv), (-hu, hv))
     marker.search_min = (-su, -sv)
     marker.search_max = (su, sv)
+
+
+def pattern_px(marker, w, h):
+    """The marker's pattern box size in plate pixels, as (width, height).
+
+    `pattern_corners` are four OFFSETS from the marker in normalised clip space. Under
+    `LocScale` Blender rewrites them every frame, so this is a per-frame MEASUREMENT of how
+    big the tracker currently thinks the feature is -- not a setting.
+    """
+    xs = [c[0] for c in marker.pattern_corners]
+    ys = [c[1] for c in marker.pattern_corners]
+    return (max(xs) - min(xs)) * w, (max(ys) - min(ys)) * h
+
+
+def attach_watch(records, opts, frame=None):
+    """Give each record a `ScaleWatch` baselined on the box it starts this pass with.
+
+    Called again before every pass: after a repair (or a resume) the track restarts from a
+    new frame with a new box, and a watch still holding the old baseline would flag the very
+    first frame. `watch=None` on a record opts it out permanently, which is how a track that
+    has already used up its repairs stops being asked about.
+    """
+    for r in records:
+        if not opts.watch_scale or r.get("no_watch"):
+            r["watch"] = None
+            continue
+        f = int(frame if frame is not None else r.get("seed_frame",
+                                                      r["t"].markers[0].frame))
+        m = r["t"].markers.find_frame(f, exact=True)
+        if m is None:
+            r["watch"] = None
+            continue
+        r["watch"] = ScaleWatch(size_of(pattern_px(m, r["w"], r["h"])),
+                                rate=opts.scale_rate, ratio=opts.scale_ratio,
+                                onset=opts.scale_onset)
 
 
 def _select(track, on):
@@ -293,7 +345,7 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
         live.setdefault(int(r.get("seed_frame", r["t"].markers[0].frame)), []).append(r)
     running = []
     st = stats if stats is not None else {}
-    st.update({"deaths": 0, "clamped": 0, "entered": 0, "calls": 0,
+    st.update({"deaths": 0, "clamped": 0, "entered": 0, "calls": 0, "flagged": 0,
                "frame": 0, "total": len(frames), "alive": 0, "done": False})
 
     for i, f in enumerate(frames):
@@ -319,6 +371,19 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
                 r["alive"] = False
                 st["deaths"] += 1
                 continue
+            # Scale watch. A flag STOPS the track where it is -- it does not delete
+            # anything and it is not a death: the marker Blender just wrote stays, and the
+            # caller decides what the swell meant by looking at the pixels. Checked before
+            # the leash because a track that is no longer on its feature has nothing to
+            # gain from being pulled towards the guide.
+            watch = r.get("watch")
+            if watch is not None:
+                flag = watch.feed(nxt, size_of(pattern_px(m, r["w"], r["h"])))
+                if flag:
+                    r["alive"] = False
+                    r["scale_flag"] = flag
+                    st["flagged"] += 1
+                    continue
             if opts.leash <= 0.0:
                 continue
             g = guide.get(r["id"]) or {}

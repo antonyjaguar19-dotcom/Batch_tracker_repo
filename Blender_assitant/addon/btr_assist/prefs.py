@@ -81,6 +81,20 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "planted. Below it the track is left dead rather than resumed on the "
                     "wrong thing. The run reports the scores it saw, so tune from those")
 
+    animate_scale: BoolProperty(
+        name="Animate location + scale", default=True,
+        description="Track with the LocScale motion model so Blender solves a size for the "
+                    "pattern box on every frame. That size is what the drift watch reads")
+    watch_scale: BoolProperty(
+        name="Watch the pattern box", default=True,
+        description="Stop a track whose pattern box grows or shrinks unusually fast, or "
+                    "drifts far from the size you set, and check the patch you seeded "
+                    "against the plate there before it writes another frame")
+    scale_ratio: FloatProperty(
+        name="Max size vs your box", default=1.6, min=1.05, max=6.0,
+        description="Cumulative pattern-box size against the box you set, either way "
+                    "round, before the track is stopped and checked")
+
     def draw(self, context):
         layout = self.layout
         col = layout.column()
@@ -95,6 +109,13 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         sub = layout.row()
         sub.enabled = self.verify_pattern
         sub.prop(self, "min_match")
+        layout.prop(self, "animate_scale")
+        row = layout.row()
+        row.enabled = self.animate_scale
+        row.prop(self, "watch_scale")
+        row = layout.row()
+        row.enabled = self.animate_scale and self.watch_scale
+        row.prop(self, "scale_ratio")
         if not self.python_exe:
             box = layout.box()
             box.label(text="Run bootstrap.bat in Blender_assitant to fill these in.",

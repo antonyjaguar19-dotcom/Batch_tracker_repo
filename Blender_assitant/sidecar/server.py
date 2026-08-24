@@ -126,6 +126,72 @@ def job_seed(payload):
     return fn
 
 
+def job_patcheck(payload):
+    """Why did these pattern boxes change size -- the feature, or the tracker losing it?
+
+    No model, no GPU: this is two correlations per track against the artist's own patch, so
+    it runs in well under a second on CPU and can sit inside the tracking loop rather than
+    at the end of it. It shares an endpoint shape with `reacquire` only so the addon's
+    polling code is the same one.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        if not reqs:
+            raise ValueError("no tracks to check")
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+
+        out_dir = os.path.join(ASSIST, "logs", "patcheck", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        min_match = float(params.get("min_match", 0.60))
+        out = []
+        for r in reqs:
+            pat = r.get("pattern") or {}
+            cur = r.get("current") or {}
+            if not pat or not cur:
+                out.append({"id": r["id"], "ok": False, "verdict": "no-reference",
+                            "reason": "no pattern box was sent"})
+                continue
+            rep = patmatch.drift_report(
+                plate, int(pat.get("frame", 1)),
+                (float(pat["cx"]), float(pat["cy"]), float(pat["w"]), float(pat["h"])),
+                int(r["frame"]), float(cur["cx"]), float(cur["cy"]),
+                (float(cur["cx"]), float(cur["cy"]), float(cur["w"]), float(cur["h"])),
+                # The box has already moved as far as it is going to; this only has to
+                # cover where the correlation peak sits relative to it.
+                radius=float(r.get("radius", 32.0)),
+                min_match=min_match)
+            rep["id"] = r["id"]
+            rep["frame"] = int(r["frame"])
+            out.append(rep)
+            job.say("%s f%d: %s (ref %s, scaled %s, %.2fx, %.2f px off)"
+                    % (r["id"], int(r["frame"]), rep.get("verdict"),
+                       "n/a" if rep.get("score_ref") is None else "%.2f" % rep["score_ref"],
+                       "n/a" if rep.get("score_scaled") is None
+                       else "%.2f" % rep["score_scaled"],
+                       rep.get("scale", 1.0), rep.get("offset_px", 0.0)))
+        return {"checks": out, "min_match": min_match,
+                "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_reacquire(payload):
     """Where should each dead track be resumed? One CoTracker pass covers all of them.
 
@@ -438,7 +504,7 @@ class Handler(BaseHTTPRequestHandler):
                                              os._exit(0)), daemon=True).start()
             return None
 
-        if self.path in ("/jobs/seed", "/jobs/reacquire"):
+        if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -448,7 +514,8 @@ class Handler(BaseHTTPRequestHandler):
             job = Job(kind)
             with JOBS_LOCK:
                 JOBS[job.id] = job
-            run_job(job, (job_seed if kind == "seed" else job_reacquire)(payload))
+            run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
+                          "patcheck": job_patcheck}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

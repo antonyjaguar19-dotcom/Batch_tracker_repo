@@ -146,3 +146,13 @@ def start_reacquire(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/reacquire",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_patcheck(assist_root, clip_info, requests, params=None):
+    """Ask why a pattern box changed size. CPU only -- no model is loaded for this."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/patcheck",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)

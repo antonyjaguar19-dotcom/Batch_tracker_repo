@@ -707,3 +707,109 @@ With it on, the confirmed segment is no longer re-muted at the end — the artis
 answered. Only the resume frame itself is removed, because it is the guide's estimate rather
 than a measurement, which is exactly what `Keep` did by hand. With it off, nothing has been
 looked at and the old batch Keep/Drop behaviour is unchanged.
+
+---
+
+## The pattern box is a measurement, and nobody was reading it (2026-08-24, v0.5.0)
+
+Once a seed is placed, the addon now tracks with **location and scale both animated**
+(`LocScale`) and watches the box size on every frame. A tracker that has started sliding off
+its feature does not announce it — the position stays plausible, the track stays alive, and
+the run finishes with a file that looks fine. But under `LocScale` the pattern box swells,
+because correlation is being satisfied by the surroundings instead of by the feature. So the
+box size is an early-warning channel that was already there and was being thrown away.
+
+Verified first, before anything was built on it: **Blender really does rewrite
+`pattern_corners` every frame under `LocScale`** — 6/6 tracks on SH004, one distinct size
+per frame, and the sizes move a long way (a 160-frame track ranging 19–32 px from a 31 px
+seed). Under `Loc` the box never changes and the whole watch is inert, which is why the two
+are one switch in the UI.
+
+### What the watch does
+
+`addon/btr_assist/scale_watch.py` — no bpy, so it is testable without Blender. Two limits,
+because they catch two different failures, plus an onset:
+
+* `rate` (default **0.10**) — fractional size change from one frame to the next.
+* `ratio` (default **1.6**) — cumulative size against the box the artist set, either way up.
+* `onset` — the first frame after which the box never came back inside 6 % of the artist's
+  size. The frame that trips a limit is where the evidence crossed a line; the onset is
+  where the trouble started, and it is what a repair cuts back to. On a 3 %/frame creep the
+  two are **13 frames apart**.
+
+A flag stops that track where it is. It is not a death and it deletes nothing.
+
+### What a flag means is decided on the plate, not in the addon
+
+`sidecar/patmatch.drift_report` correlates the patch from the seed frame against the flag
+frame **twice** — at its own size, and resized by exactly how much the box grew — and the
+two scores separate a feature that got bigger from a box that got bigger. Four verdicts
+(`classify_drift`), only one of which deletes anything:
+
+| verdict | evidence | what happens |
+|---|---|---|
+| `lost` | patch not findable at any size | cut back to the onset, leave dead → re-acquire takes it from a frame that can be trusted |
+| `grown` | scaled patch beats unscaled by > 0.05 | keep the box, re-baseline, carry on |
+| `bad-box` | patch is there at its own size, box is not | put the artist's box back, keep Blender's position, carry on |
+| `clean` | patch is there and the box is within 1.25× | carry on, nothing touched |
+
+Synthetic cases with answers known by construction (`tests/test_scale_drift.py`): a true
+1.45× approach scores **0.92 scaled vs 0.21 unscaled**; a box swelling onto its neighbours
+scores **0.97 unscaled vs 0.16 scaled**. The separation is not close, which is why the
+0.05 margin is not a delicate number.
+
+### A metric measured and REMOVED before it shipped
+
+The obvious drift measure — how far the seed patch's correlation peak sits from where the
+tracker has the box — **does not work on real footage, and gating on it would have been
+destructive**. Measured over 36 `LocScale` tracks on SH004 (2416 sampled frames, search
+radius 24 px): tracks whose patch stays findable for all 160 frames still show that peak
+**p50 4.2 px, p90 25.0 px** from their own tracked position. A fixed patch matched 150
+frames later cannot arbitrate a sub-pixel position — snapping to it would have dragged
+healthy tracks tens of pixels and undone exactly the per-frame precision Blender is here
+for. The offset is now **reported and never acted on**; presence and size are all the patch
+is asked. This is the third metric this project has caught by feeding it known-good input
+(peak ratio and patch contrast were the first two).
+
+The same measurement is why a repair **never moves the marker** and only `lost` deletes
+frames.
+
+### Thresholds, chosen from the distribution rather than from taste
+
+36 tracks × 160 frames on SH004, box size logged every frame with the watch off:
+
+```
+per-frame |step-1|   p50 0.0135   p90 0.0650   p99 0.4128
+box scale, healthy   p50 0.97     p90 1.08     p99 1.33     max 1.46
+```
+
+`rate 0.10` sits just above the p90 of ordinary frame-to-frame movement; `ratio 1.6` sits
+above the p99 of a healthy track's cumulative size. Sweeping rate × ratio against "does this
+track eventually lose its patch": **0.10/1.6 flags all 8 of the 8 tracks that go bad**;
+0.15 and above misses 2 of them. The cost of the sensitive setting is false alarms, and a
+false alarm is cheap by construction — it costs one correlation and changes nothing.
+
+### What the shipped defaults do on SH004
+
+28 of 36 tracks flag at least once. Verdicts at the first flag:
+
+```
+clean 16    bad-box 5    grown 4    lost 3
+```
+
+**All 3 `lost` verdicts — the only destructive one — landed on tracks that genuinely lose
+their patch. It did not fire once on a track that stayed findable for 160 frames.** 16 of
+28 flags do nothing at all, which is the intended shape: stop cheaply, decide on evidence.
+
+`/jobs/patcheck` end to end over the wire: 8 tracks, **3.5 s** including sidecar start and
+first plate decode. No model and no GPU — it is two correlations per track.
+
+### What this does not settle
+
+* The verdicts were scored against the seed patch itself, which is the same signal the
+  verdict uses. A track whose appearance genuinely changed reads as `lost` to both. The
+  independent check would be hand tracks or `refs/SH004_lk`, and it has not been run.
+* The modal wiring — flag → sidecar → repair → carry on — is not covered by a headless
+  test, because the watch runs inside Blender and the correlation runs in the sidecar and
+  no single interpreter has both. Both halves are tested; the seam is exercised by hand.
+* Repair is capped at 2 per track (`drift_fixes`), which is a guess, not a measurement.

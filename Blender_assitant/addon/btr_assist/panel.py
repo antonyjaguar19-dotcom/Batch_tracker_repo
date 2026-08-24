@@ -166,6 +166,9 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
             op.verify_pattern = p.verify_pattern
             op.min_match = p.min_match
             op.confirm_resumes = p.confirm_resumes
+            op.animate_scale = p.animate_scale
+            op.watch_scale = p.watch_scale
+            op.scale_ratio = p.scale_ratio
         if not n_sel:
             layout.label(text="Select your markers first", icon="INFO")
 
@@ -176,12 +179,26 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
             row = sub.row()
             row.enabled = p.verify_pattern
             row.prop(p, "min_match", text="Min match")
+            sub.prop(p, "animate_scale", text="Animate loc + scale")
+            row = sub.row()
+            row.enabled = p.animate_scale
+            row.prop(p, "watch_scale", text="Watch pattern box")
+            row = sub.row()
+            row.enabled = p.animate_scale and p.watch_scale
+            row.prop(p, "scale_ratio", text="Max box growth")
 
         box = layout.box()
         box.label(text="Blender tracks. When it loses", icon="INFO")
         box.label(text="the pattern, CoTracker skips to")
         box.label(text="where your feature is back,")
         box.label(text="snaps it, and asks you.")
+
+        if p is not None and p.animate_scale and p.watch_scale:
+            box = layout.box()
+            box.label(text="A box that swells stops the", icon="FULLSCREEN_ENTER")
+            box.label(text="track: your seeded patch is")
+            box.label(text="re-checked there, the box put")
+            box.label(text="back, bad frames dropped.")
 
         if n_muted:
             rev = layout.box()

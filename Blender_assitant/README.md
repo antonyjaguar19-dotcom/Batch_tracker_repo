@@ -78,6 +78,31 @@ is a hard dependency of auto-seed**, in both modes.
    `frame 87/160  114 live  8 dead  3 clamped`; <kbd>Esc</kbd> cancels between frames.
 5. **Assist ▸ 3DE 2D tracks ▸ Export 3DE file**.
 
+### Track + re-acquire, and the box the track carries
+
+Select your markers and press **Track N selected + re-acquire**. Location *and scale* are
+animated, so Blender solves a size for the pattern box on every frame — and that size is
+watched. A tracker sliding off its feature does not announce it: the position stays
+plausible and the track stays alive, but the box swells, because correlation is being
+satisfied by the surroundings instead of by the feature.
+
+So a box that changes size unusually fast (>10 % in a frame), or wanders past 1.6× the box
+you set, **stops that track on the spot**. The patch from the frame you seeded is then
+correlated against the plate there — at its own size, and resized by exactly how much the
+box grew — and the two scores decide:
+
+| what the plate says | what happens |
+|---|---|
+| your patch is not there at any size | the frames back to where the box started growing are dropped, and re-acquire takes over from the last frame your own box measured |
+| the patch matches better *resized* | the feature really did approach camera: the box is kept and tracking carries on |
+| the patch is there at your size, the box is not | your box is put back and tracking carries on from the position Blender measured |
+| the patch is there and the box is near enough | false alarm; nothing is touched |
+
+The marker is **never moved** by this and only the first row deletes anything. That is a
+measurement, not caution — see FINDINGS, "a metric measured and REMOVED before it shipped".
+Two toggles and the growth limit are in the panel; turn `Animate loc + scale` off and the
+whole thing is inert, because under `Loc` the box never changes.
+
 Two things the UI does silently on your behalf:
 
 - **Full resolution is forced** while a job runs, then your proxy setting is put back. A
@@ -100,6 +125,8 @@ produce a plausible-looking track file that is quietly wrong.
 | `spacing_px` | **15** | Spacing caps the count, not quality. One shot logged `1278 past quality bar -> 28 after spacing` at the default 60; at 15 the same shot yields 122 tracks. |
 | `pattern_match` | **PREV_FRAME** | The bench prefers KEYFRAME (0.050 px vs 0.060 px). Real plates reverse it: KEYFRAME dies **2.6–2.9× more often**, because it matches the seed patch forever. |
 | `leash` | **20 px** | PREV_FRAME's cost is accumulated drift; the leash bounds it. The two are one decision — PREV_FRAME with `leash = 0` is the worst of both. |
+| `scale_rate` / `scale_ratio` | **0.10 / 1.6** | Chosen from the distribution over 36 tracks on SH004: ordinary frame-to-frame box movement is p90 0.065, a healthy track's cumulative size p99 1.33. At 0.10/1.6 all 8 tracks that go on to lose their patch are flagged; 0.15 misses 2. False alarms are cheap — 16 of 28 flags change nothing. |
+| repair moves the marker | **never** | The seed patch's peak sits p50 4.2 px / p90 25.0 px from a *healthy* track's own position 150 frames later. Snapping to it would wreck good tracks; presence and size are all a fixed patch can answer. |
 | motion model | **per-class** (Loc / LocScale) | A 10-config sweep: Affine worst-track 0.300, Perspective 0.360, bigger patterns 0.210, against 0.100 for these. |
 | moving-tile + pattern refine | **off** | Blender replaces both. Bot with refines off 2.71 px, with them 0.06 px, Blender on the same raw guide 0.05 px — and they were the expensive half of a run. |
 | `max-guide-dev` | **not implemented** | Measured harmful at every threshold: against a raw guide it is the guide that is wrong. |
@@ -127,6 +154,11 @@ blender.exe --factory-startup -noaudio --python blender_scripts\spike_foreground
 REM accuracy, against artist hand tracks -- the number that counts
 runtime\python311\python.exe ..\experiments\blender_track\eval_vs_manual.py --pair seeded ...
 REM reference: 2.20 px overall, 31%% of frames within 1 px
+
+REM the pattern-box watch: when it stops a track, and what the stop means (CPU, seconds)
+runtime\python311\python.exe tests	est_scale_watch.py
+runtime\python311\python.exe tests	est_scale_drift.py
+REM expect: all checks passed. Neither needs Blender, a plate, or the sidecar.
 
 REM robustness, no ground truth needed
 runtime\python311\python.exe ..\experiments\blender_track\track_stats.py <export>.txt
