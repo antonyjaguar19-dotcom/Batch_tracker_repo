@@ -67,7 +67,10 @@ scene = bpy.context.scene
 scene.frame_start, scene.frame_end = 1, n_frames
 ctx = (win, area, region, clip, scene)
 
-opts = track_core.Opts(leash=0.0)
+opts = track_core.Opts(leash=0.0,
+                       search_scale=float(spec.get("search_scale") or 1.0),
+                       pattern_scale=float(spec.get("pattern_scale") or 1.0),
+                       correlation=float(spec.get("correlation") or 0.75))
 track_core.apply_settings(clip, opts)
 
 tracks = three_de.active_tracks(clip)
@@ -103,9 +106,18 @@ for name, u, v in seed_spec:
     # changes size, so `last_box` below would carry no information and this gate would test
     # a configuration no artist runs.
     tr.motion_model = "LocScale"; tr.use_brute = True; tr.use_normalization = True
-    tr.correlation_min = 0.75; tr.frames_limit = 0; tr.pattern_match = "PREV_FRAME"
+    # From opts, not hardcoded -- same trap as the geometry above: a spec value that reaches
+    # the loop but not the track is a knob that silently does nothing.
+    tr.correlation_min = opts.correlation
+    tr.frames_limit = 0; tr.pattern_match = opts.pattern_match
     m = tr.markers[0]; m.co = (u, v)
-    track_core.set_geom(m, 21.0 * max(1.0, w / 1920.0), 41.0 * max(1.0, w / 1920.0), w, h)
+    # The scales have to be applied HERE. This driver seeds by hand rather than through
+    # `track_core.seed_tracks`, so an `Opts` carrying pattern_scale/search_scale reaches the
+    # tracking loop and never touches the geometry -- which silently made a search-box A/B
+    # run three identical arms.
+    _px = max(1.0, w / 1920.0)
+    track_core.set_geom(m, 21.0 * _px * opts.pattern_scale,
+                        41.0 * _px * opts.search_scale, w, h)
     records.append({{"t": tr, "id": tr.name, "kind": "", "alive": True,
                     "w": w, "h": h, "seed_frame": 1}})
     seeds_px[tr.name] = (1, x, y_down)
@@ -281,6 +293,13 @@ def main():
                          "`eval_vs_manual --pair seeded` mean what it says: the engine "
                          "starts on the same feature the reference starts on")
     ap.add_argument("--export", help="write the finished tracks out as 3DE ASCII")
+    ap.add_argument("--search-scale", type=float, default=1.0,
+                    help="multiply every search box. A plate whose features move further "
+                         "between frames than the box can reach cannot be tracked at all, "
+                         "and the shipped tables carry no motion term")
+    ap.add_argument("--pattern-scale", type=float, default=1.0)
+    ap.add_argument("--correlation", type=float, default=0.75,
+                    help="Blender's correlation floor; a step under it is a death")
     ap.add_argument("--kill-at", type=int, default=0,
                     help="cut every track at this frame after the first pass, so the "
                          "re-acquire has something to re-acquire. Needed on a shot where "
@@ -309,7 +328,10 @@ def main():
                    "min_match": args.min_match,
                    "seed_file": os.path.abspath(args.seed_file) if args.seed_file else "",
                    "export": os.path.abspath(args.export) if args.export else "",
-                   "kill_at": args.kill_at}, fh)
+                   "kill_at": args.kill_at,
+                   "search_scale": args.search_scale,
+                   "pattern_scale": args.pattern_scale,
+                   "correlation": args.correlation}, fh)
 
     driver = os.path.join(outdir, "driver.py")
     with open(driver, "w", encoding="utf-8") as fh:

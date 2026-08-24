@@ -1122,3 +1122,108 @@ Turning `Only when it was hidden` off restores stop-and-ask for every resume.
 * The baseline column is Blender tracking the same frames without dying, not ground truth.
   Both columns are measured against LK, whose own closure is 0.15–0.91 px, so differences
   below about 1 px should not be read as real.
+
+---
+
+## The foreground was never searched for (2026-08-24, SH013)
+
+Reported on a real shot with a real occluder: "the tracks have a gap and is not tracked in
+the FG when the camera started chasing the bike". Two separate faults, and the loud one is
+not the AI's.
+
+SH013 is motocross — 303 frames, 2562x1440, **59.94 fps**, camera chasing a bike over dirt.
+
+### What the tracker was being asked to do
+
+Inter-frame motion by image band, full-res plate px:
+
+| frame | sky/BG | mid | FG band | FG p95 |
+|---|---|---|---|---|
+| 30 | 0.0 | 7.8 | 10.6 | 43.5 |
+| 80 | 0.0 | 2.8 | 17.8 | 46.8 |
+| 130 | 0.0 | 3.5 | 20.0 | **66.7** |
+
+Against what the shipped geometry can reach:
+
+    corner  pattern 28 px  search 55 px  ->  +-13 px
+    blob    pattern 41 px  search 68 px  ->  +-13 px
+    edge    pattern 33 px  search 81 px  ->  +-24 px
+
+**The feature is outside the search box before Blender looks for it.** Not drift, not
+rejection — it is never searched for. `KIND_GEOM` is a fixed table tuned on SH004, where the
+camera is slow, and it carries no motion term at all. The bot's own tracker derives geometry
+from a measured shot profile (`app/shot_profile.py`); the addon never got that.
+
+Correlation is emphatically NOT the problem, and this must not be mistaken for a fix to it:
+at the CORRECT position those same foreground patches score **0.88-0.93 NCC** between
+consecutive frames. Direct probe in Blender, one foreground seed:
+
+    search= 55 (shipped)   markers [1]        died on the first step
+    search=200             markers [1..13]    tracks
+
+### The tracks end where the plate ends
+
+With the box widened, five foreground seeds ran 13-47 frames and **every one finished with
+its search box off the edge of the plate** (15-38 px from it). They do not fail; they leave
+frame. On a chase plate the near-ground is only on screen for that long, and short foreground
+tracks are the correct answer there — 3DE solves from them. The bug was getting **one** frame
+where the footage had 13-47 to give.
+
+The correlation floor barely moves this: at a 3.5x box, dropping 0.75 -> 0.40 takes spans
+from 7/10/13/16/23 to 13/13/26/28/43, and the ends are still the frame edge.
+
+### What shipped
+
+`sidecar/motion.py` + `/jobs/motion`: coarse optical flow over sampled frame pairs, reported
+on a 6x4 grid. A grid because motion is wildly non-uniform here — 0.0 px/frame in the sky
+against 20 in the near-ground — so one number for the plate would starve the foreground or
+bloat every background box into a lookalike-matcher.
+
+The operator measures before tracking, as a **modal phase**, and widens any box too small to
+reach: `search = 2 * (p95 * 1.5 + pattern/2)`, capped at a quarter of the plate width.
+
+**Only ever enlarges.** A small box an artist set deliberately is a statement about how far
+that feature may move. A box too small to reach the feature at all is not a statement, it is
+a track that dies on its first step.
+
+Live on SH013 through the real sidecar: `plate moves 62 px/frame here, search box 55 -> 213
+px`, and the seed went from **span 1 to span 13**, ending at the frame edge. The re-acquire
+then refused correctly — the feature is off the bottom of the plate and is not coming back —
+rather than inventing a resume.
+
+`tests/test_motion_fit.py` checks both halves, because they are different claims: flow reads
+2.0 / 12.0 / 39.8 on synthetic plates shifted by a known 2 / 12 / 40 px per frame; the grid
+separates a still half from a moving half; a fast plate is widened to 163 px (reaching 68);
+**SH004's slow plate stays at 55 px**; an artist's larger box is kept; runaway motion is
+capped. The "leave slow plates alone" cases matter as much as the rest — inflating every box
+would trade a rare failure for a permanent one.
+
+### Three ways a fix can be invisible, all hit in one session
+
+Each presented as "the change did nothing", and each was the change never being loaded:
+
+* **A running Blender does not pick up a reinstalled addon.** Extension modules import at
+  enable time. Check the process start time against the install time.
+* **A running sidecar does not pick up new sidecar code.** `client.ensure` health-checks,
+  finds the old process alive, and reuses it — so `/jobs/motion` fails on a machine where the
+  feature is installed correctly, and the addon quietly falls back to the built-in boxes
+  forever. The fallback logs and degrades rather than failing, which is right, but the
+  staleness deserves a version stamp in `ensure`. NOT DONE.
+* **A test driver that reads a setting but seeds with its own hardcoded geometry.** A
+  search-box A/B ran three identical arms and was reported as "the box is not the cause". It
+  was the cause. `--search-scale` and `--correlation` now reach the markers.
+
+Three identical arms is the shape of a broken harness, not a null result.
+
+### What this does not settle
+
+* **The gaps are still unmeasured.** On this shot a track that stopped mid-chase looked
+  exactly like a failed occlusion recovery and was not one; measuring re-acquire here before
+  the foreground tracked would have scored the wrong fault. SH013 is still the only footage
+  present with a real occluder, and it is now the right instrument for that question.
+* `MOTION_HEADROOM = 1.5` is derived from one shot, where the worst single-frame motion ran
+  about 1.4x the cell p95. A measured starting point, not a settled constant.
+* Widening costs time and false-match risk, and neither has been quantified: no run here has
+  scored ACCURACY with widened boxes against a reference, only span.
+* The grid is 6x4 and static for the shot. A feature crossing from a slow cell into a fast
+  one is sized by where it STARTED.

@@ -131,6 +131,46 @@ def job_seed(payload):
     return fn
 
 
+def job_motion(payload):
+    """How far does this plate move between frames, per region?
+
+    Exists because the addon's geometry table has no motion term and cannot get one on its
+    own: Blender ships numpy but not cv2, and this is optical flow. Cheap and coarse by
+    design -- it sizes a search box, so tens of pixels is the resolution that matters.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import motion                                                # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        params = payload.get("params") or {}
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+        out_dir = os.path.join(ASSIST, "logs", "motion", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d -- "
+                               "different plate, or a proxy is on" % (cw, ch, plate.w, plate.h))
+        job.stage = "measuring plate motion"
+        mo = motion.measure(plate, int(clip.get("frames", 0) or plate.n),
+                            samples=int(params.get("samples", motion.DEFAULT_SAMPLES)),
+                            on_status=job.say)
+        if mo is None:
+            raise RuntimeError("could not read enough frames to measure motion")
+        job.say("motion: p95 %.1f px/frame over the plate, worst cell %.1f"
+                % (mo["global_p95"], max(max(r) for r in mo["p95"])))
+        return mo
+    return fn
+
+
 def job_patcheck(payload):
     """Why did these pattern boxes change size -- the feature, or the tracker losing it?
 
@@ -579,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
                                              os._exit(0)), daemon=True).start()
             return None
 
-        if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck"):
+        if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -590,7 +630,7 @@ class Handler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 JOBS[job.id] = job
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
-                          "patcheck": job_patcheck}[kind](payload))
+                          "patcheck": job_patcheck, "motion": job_motion}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

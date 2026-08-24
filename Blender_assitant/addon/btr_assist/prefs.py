@@ -83,6 +83,13 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "nothing occluded the worst single frame was 6.66 px and none landed on "
                     "a different feature. Crossing a real occlusion has not been measured "
                     "that way and still stops for you")
+    fit_search_box: BoolProperty(
+        name="Fit search box to the plate", default=True,
+        description="Measure how far the plate moves between frames and widen any search box "
+                    "too small to reach that far. The built-in sizes carry no motion term: on "
+                    "a 59.94 fps chase plate the near-ground moves 21-53 px per frame while "
+                    "the default corner box reaches 13, and every foreground marker died on "
+                    "its first step. Boxes are only made bigger, never smaller")
     min_match: FloatProperty(
         name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
         description="Correlation a candidate must reach against your pattern before it is "
@@ -112,6 +119,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "fit_search_box")
         layout.prop(self, "confirm_resumes")
         sub_c = layout.row()
         sub_c.enabled = self.confirm_resumes

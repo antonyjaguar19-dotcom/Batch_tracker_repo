@@ -66,6 +66,17 @@ from .ops_seed import clip_info
 
 TICK_SECONDS = 0.05
 
+#: Design displacement as a multiple of the cell's measured p95 motion. A box has to survive
+#: the fastest moment the feature lives through, not the typical one; p95 is already a
+#: high-water mark and this is headroom for the frames above it. Measured on SH013, the worst
+#: single-frame motion ran about 1.4x the cell p95.
+MOTION_HEADROOM = 1.5
+
+#: Never grow a search box past this fraction of the plate width. A huge box is slow AND
+#: starts matching things that merely look similar -- the failure the tight built-in table
+#: was chosen to avoid. Widening is a floor being lifted, not a licence.
+MAX_SEARCH_FRAC = 0.25
+
 #: The only events the confirm phase consumes. EVERYTHING else passes through to the clip
 #: editor, because the question it asks -- "is that your feature?" -- is answered by zooming
 #: in, panning, and scrubbing, and swallowing every event to protect four keys made Blender
@@ -192,6 +203,14 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "buys nothing. A resume that crosses a real occlusion has NOT been "
                     "measured that way and still stops. Turn this off to be asked about "
                     "every resume")
+    fit_search_box: BoolProperty(
+        name="Fit search box to the plate", default=True,
+        description="Measure how far the plate actually moves between frames and widen any "
+                    "search box too small to reach that far. The built-in sizes were tuned "
+                    "on a slow shot and carry no motion term -- measured on a 59.94 fps "
+                    "chase plate the near-ground moves 21-53 px per frame while the default "
+                    "corner box reaches 13, so every foreground marker died on its FIRST "
+                    "step. Boxes are only ever made bigger, never smaller")
     animate_scale: BoolProperty(
         name="Animate location + scale", default=True,
         description="Track with the LocScale motion model, so Blender solves a SIZE for the "
@@ -247,6 +266,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _continue_from = None     # id -> (frame, x, y): resume the SEARCH here, not a position
     _awaiting = None          # resumes snapped and waiting for the artist to say yes
     _auto_kept = 0            # resumes taken without asking, because nothing was occluded
+    _motion = None            # per-cell plate motion, px/frame, measured by the sidecar
+    _widened = None           # [(id, from_px, to_px)] for the report
     _pending = None           # resumes awaiting insertion
     _fixes = None             # id -> how many times the scale watch has repaired it
     _drift = None             # [(id, frame, verdict, ...)] for the report
@@ -338,11 +359,14 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._continue_from = {}
         self._awaiting = []
         self._auto_kept = 0
+        self._motion = None
+        self._widened = []
         self._fixes = {}
         self._drift = []
         self._backward_done = False
         self._round = 0
-        self._start_tracking(context)
+        if not self._start_motion(context):
+            self._start_tracking(context)
 
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.05, window=context.window)
@@ -350,6 +374,88 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     # ---------------------------------------------------------------- phases
+
+    def _start_motion(self, context):
+        """Ask the sidecar how far this plate moves. False means just start tracking.
+
+        A modal PHASE, not a call inside `invoke`: this is several optical-flow passes and
+        takes seconds, and blocking the main thread for seconds is the exact behaviour that
+        made this operator read as hung once already.
+        """
+        if not self.fit_search_box:
+            return False
+        p = prefs.get(context)
+        try:
+            client.ensure(self._root, bpy.path.abspath(p.python_exe) if p else "",
+                          p.port if p else 0)
+            r = client.start_motion(self._root, clip_info(context, self._clip))
+        except client.SidecarError as exc:
+            # Not fatal. A plate whose motion cannot be measured still tracks with the
+            # built-in sizes, which is exactly what happened before this existed.
+            print("[assist] could not measure plate motion (%s); using the built-in "
+                  "search boxes" % exc)
+            return False
+        self._job = r["id"]
+        self._phase = "motion"
+        self._status(context, "measuring how far the plate moves ...")
+        return True
+
+    def _tick_motion(self, context):
+        st = client.poll(self._root, self._job)
+        if st["state"] in ("queued", "running"):
+            self._status(context, "%s  (%.0fs)" % (st.get("stage") or "measuring",
+                                                   st.get("seconds", 0)))
+            return {"RUNNING_MODAL"}
+        if st["state"] == "cancelled":
+            return self._done(context, "cancelled")
+        if st["state"] == "error":
+            print("[assist] motion measurement failed: %s" % st["error"]["message"])
+        else:
+            self._motion = st.get("result")
+            self._widen_boxes(context)
+        self._start_tracking(context)
+        return {"RUNNING_MODAL"}
+
+    def _widen_boxes(self, context):
+        """Enlarge any search box too small to reach the motion measured where it sits.
+
+        Only ever ENLARGES. A box the artist deliberately made small is a statement about how
+        far that feature is allowed to move. A box too small to reach the feature at all is
+        not a statement, it is a track that dies on its first step.
+        """
+        mo = self._motion
+        if not mo:
+            return
+        clip = self._clip
+        w, h = clip.size
+        gx, gy = mo["grid"]
+        cap = w * MAX_SEARCH_FRAC
+        for rec in self._records:
+            tr = rec["t"]
+            m = tr.markers.find_frame(int(rec["seed_frame"]), exact=True)
+            if m is None:
+                continue
+            x, y = marker_to_image_px(m, w, h)
+            i = min(gx - 1, max(0, int(x / max(1.0, float(w)) * gx)))
+            j = min(gy - 1, max(0, int(y / max(1.0, float(h)) * gy)))
+            p95 = float(mo["p95"][j][i])
+            pat_w = (max(c[0] for c in m.pattern_corners)
+                     - min(c[0] for c in m.pattern_corners)) * w
+            pat_h = (max(c[1] for c in m.pattern_corners)
+                     - min(c[1] for c in m.pattern_corners)) * h
+            have = (m.search_max[0] - m.search_min[0]) * w
+            # Blender finds the feature while it stays inside (search_half - pattern_half),
+            # so the reach that matters is the DIFFERENCE, not the box width.
+            want = 2.0 * (p95 * MOTION_HEADROOM + max(pat_w, pat_h) / 2.0)
+            want = min(want, cap)
+            if want <= have + 1.0:
+                continue
+            sx, sy = want / 2.0 / w, want / 2.0 / h
+            m.search_min = (-sx, -sy)
+            m.search_max = (sx, sy)
+            self._widened.append((rec["id"], have, want))
+            print("[assist] %s: plate moves %.0f px/frame here, search box %.0f -> %.0f px"
+                  % (rec["id"], p95, have, want))
 
     def _start_tracking(self, context):
         overlay.hide()
@@ -385,7 +491,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
 
     def modal(self, context, event):
         if event.type == "ESC":
-            if self._phase in ("waiting", "drift"):
+            if self._phase in ("waiting", "drift", "motion"):
                 client.cancel(self._root, self._job)
             return self._done(context, "cancelled")
         try:
@@ -398,6 +504,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 return self._tick_confirm(context, event)
             if event.type != "TIMER":
                 return {"PASS_THROUGH"}
+            if self._phase == "motion":
+                return self._tick_motion(context)
             if self._phase == "tracking":
                 return self._tick_tracking(context)
             if self._phase == "waiting":
@@ -925,6 +1033,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tail = ", match %.2f-%.2f (min %.2f)" % (min(sc), max(sc), self.min_match)
         elif self.verify_pattern:
             tail = ", pattern check found nothing to check"
+        if self._widened:
+            tail += (", %d search box(es) widened to %.0f px for plate motion"
+                     % (len(self._widened), max(t for _, _, t in self._widened)))
         if self._auto_kept:
             tail += (", %d resume(s) taken without asking (nothing occluded)"
                      % self._auto_kept)
