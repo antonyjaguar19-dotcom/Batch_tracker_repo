@@ -77,6 +77,12 @@ MOTION_HEADROOM = 1.5
 #: was chosen to avoid. Widening is a floor being lifted, not a licence.
 MAX_SEARCH_FRAC = 0.25
 
+#: Plate motion, px/frame, above which a seed is worth warning about. Measured on SH013: at
+#: 43-48 px/frame the foreground gives 7-23 frame tracks, at 17-32 it gives 32-154, and at
+#: 0-8 it gives 128-206. The number is where that falls off, not a tracking limit -- nothing
+#: in the tracker moved it.
+FAST_SEED_PX = 35.0
+
 #: The only events the confirm phase consumes. EVERYTHING else passes through to the clip
 #: editor, because the question it asks -- "is that your feature?" -- is answered by zooming
 #: in, panning, and scrubbing, and swallowing every event to protect four keys made Blender
@@ -267,6 +273,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _awaiting = None          # resumes snapped and waiting for the artist to say yes
     _auto_kept = 0            # resumes taken without asking, because nothing was occluded
     _motion = None            # per-cell plate motion, px/frame, measured by the sidecar
+    _seed_motion = None       # id -> px/frame where that seed sits
     _widened = None           # [(id, from_px, to_px)] for the report
     _pending = None           # resumes awaiting insertion
     _fixes = None             # id -> how many times the scale watch has repaired it
@@ -360,6 +367,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._awaiting = []
         self._auto_kept = 0
         self._motion = None
+        self._seed_motion = {}
         self._widened = []
         self._fixes = {}
         self._drift = []
@@ -418,6 +426,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._opts.motion_headroom = MOTION_HEADROOM
             self._opts.motion_cap_frac = MAX_SEARCH_FRAC
             self._widen_boxes(context)
+            self._warn_fast_seeds(context)
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
 
@@ -444,6 +453,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             i = min(gx - 1, max(0, int(x / max(1.0, float(w)) * gx)))
             j = min(gy - 1, max(0, int(y / max(1.0, float(h)) * gy)))
             p95 = float(mo["p95"][j][i])
+            self._seed_motion[rec["id"]] = p95
             pat_w = (max(c[0] for c in m.pattern_corners)
                      - min(c[0] for c in m.pattern_corners)) * w
             pat_h = (max(c[1] for c in m.pattern_corners)
@@ -461,6 +471,35 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._widened.append((rec["id"], have, want))
             print("[assist] %s: plate moves %.0f px/frame here, search box %.0f -> %.0f px"
                   % (rec["id"], p95, have, want))
+
+    def _warn_fast_seeds(self, context):
+        """Tell the artist which seeds sit where the plate will not hold a long track.
+
+        Measured on SH013 with everything else already fixed -- box re-fitted per frame,
+        LocScale, 0.75 floor -- spans by region, out of 303 frames:
+
+            foreground  (47 px/frame)   13  16  10   7  23
+            midground   (17-32)         32  47 154  57  63
+            background  (0-8)          206 128  20  39 157
+
+        Nothing in the tracker closes that gap: bigger boxes changed nothing, Affine and
+        Perspective were worse than LocScale, and a bigger pattern was worse still. On the
+        frame each foreground track stopped, its own patch scored 0.53-0.72 ANYWHERE within
+        160 px -- the feature genuinely stops looking like itself in one frame. Short
+        foreground tracks are what that footage has to give, and saying so beforehand is
+        worth more than another round of tuning.
+        """
+        fast = sorted(((v, k) for k, v in (self._seed_motion or {}).items()
+                       if v >= FAST_SEED_PX), reverse=True)
+        if not fast:
+            return
+        for p95, name in fast:
+            print("[assist] %s sits where the plate moves %.0f px/frame -- expect a short "
+                  "track here, and place more of them rather than fewer" % (name, p95))
+        self.report({"WARNING"},
+                    "%d seed(s) are in fast-moving parts of the plate (up to %.0f px/frame); "
+                    "tracks there will be short whatever the settings"
+                    % (len(fast), fast[0][0]))
 
     def _start_tracking(self, context):
         overlay.hide()

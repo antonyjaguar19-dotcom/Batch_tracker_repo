@@ -1287,3 +1287,91 @@ these numbers written next to it.
 * A latent crash was fixed in passing: `/jobs/motion`'s fallback read `plate.n`, which does
   not exist (`Plate` exposes `.count`). It never fired because the addon always sends
   `frames`.
+
+### Foreground continuity on SH013: what it is not, and what it is (2026-08-24)
+
+Reported after the box fixes: *"track continuity is still bad"*. It was. Four candidate
+causes were measured and eliminated in order, all on the same eight foreground seeds.
+
+**Not the search box.** Re-fitting per frame changed not one span at the 0.75 floor
+(209 tracked frames either way).
+
+**Not the motion model.** `LocScale` — what the operator already ships — is the best of them.
+Note the earlier probes in this file used `Loc` and therefore understated the shipped config:
+
+| model | tracked frames |
+|---|---|
+| Loc | 209 |
+| **LocScale** | **302** |
+| LocRotScale | 224 |
+| Affine | 214 |
+| Perspective | 213 |
+
+**Not the pattern size.** Bigger is strictly worse — 28 px 302, 56 px 270, 84 px 203,
+112 px 201. A larger patch straddles more of a ground plane that is shearing under it.
+
+**It is appearance.** On the frame each track stopped, its own patch was correlated against
+the next frame over a 160 px radius:
+
+| trk | died | best NCC anywhere | at distance |
+|---|---|---|---|
+| P00 | 13 | 0.721 | 62 px |
+| P01 | 16 | 0.596 | 69 px |
+| P02 | 10 | 0.680 | 167 px |
+| P04 | 23 | 0.640 | 136 px |
+| P06 | 47 | 0.528 | 43 px |
+
+Every one is under the 0.75 floor. The feature genuinely stops looking like itself in a
+single frame — a 28 px pattern travelling 47 px per frame is mostly motion blur, smeared
+differently each time.
+
+**And this is why the floor must not be lowered.** Those sub-threshold peaks sit 136-167 px
+away where the plate moves 43-48 px/frame. They are false matches. Dropping `min_match` to
+0.65 would not lengthen a track; it would plant it 136 px off the feature — longer, and
+wrong, and wrong in a way that looks fine in a span count. The earlier note in this file that
+0.40 "buys +34 % tracked frames" is exactly the trap: it buys frames, not tracks.
+
+**Raising `rounds` does not help either.** Re-acquire refuses too, and correctly: 0 resumes,
+5 misses, best 0.45-0.54 against the 0.60 floor. Those foreground points swept off the plate;
+there is nothing to come back to, and refusing beats planting a marker on a different clod of
+dirt.
+
+### What the shot actually has
+
+Same shipped config, spans out of 303 frames, by region:
+
+| region | measured motion | spans |
+|---|---|---|
+| foreground (y .72-.88) | 43-48 px/frame | 13, 16, 10, 7, 23 |
+| midground (y .45-.62) | 17-32 px/frame | 32, 47, **154**, 57, 63 |
+| background (y .25-.40) | 0-8 px/frame | **206**, 128, 20, 39, **157** |
+
+The plate tracks perfectly well. The near-ground of a 59.94 fps chase does not hold a feature
+for long, and no setting changes that — it is the footage, not the tracker. A matchmove here
+comes from the midground and background, plus many short foreground tracks, which is what an
+artist would hand-track anyway.
+
+### What shipped
+
+A warning, not a tuning change. Any seed sitting where the plate moves faster than
+`FAST_SEED_PX = 35` px/frame now says so before tracking starts, per seed in the console and
+once in the status bar. Nothing else changed: the box re-fit stays, the correlation floor
+stays, `LocScale` stays.
+
+That threshold is where the measured falloff happens (43-48 -> short, 17-32 -> long), not a
+limit in the tracker. Telling the artist which seeds cannot pay off is worth more here than
+another round of tuning that measurably does nothing.
+
+### What this does not settle
+
+* Everything above is SPAN. No accuracy number exists for SH013 at any setting — there is no
+  reference on this plate.
+* Whether CoTracker alone could follow that foreground is untested. It produces a path
+  regardless; the pattern check refuses it, and refusing is right without evidence the path
+  is correct. This is the one remaining idea with a plausible route to foreground continuity,
+  and it needs a hand-tracked foreground feature to judge.
+* `rounds` is capped at 10 and is not exposed in the panel at all. It did not matter here,
+  but an artist cannot raise it on footage where it might.
+* `min_resume_len = 12` abandons a track whose resumed segment is shorter than 12 frames.
+  On this plate 7-frame segments are normal, so the give-up rule is tuned against footage
+  like this one. Untested either way.
