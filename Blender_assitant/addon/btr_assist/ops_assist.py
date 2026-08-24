@@ -61,10 +61,22 @@ import os
 import bpy
 from bpy.props import BoolProperty, IntProperty
 
-from . import client, prefs, three_de, track_core
+from . import client, overlay, prefs, three_de, track_core
 from .ops_seed import clip_info
 
 TICK_SECONDS = 0.05
+
+#: The only events the confirm phase consumes. EVERYTHING else passes through to the clip
+#: editor, because the question it asks -- "is that your feature?" -- is answered by zooming
+#: in, panning, and scrubbing, and swallowing every event to protect four keys made Blender
+#: read as HUNG: no zoom, no pan, no click, no playhead, with the only hint in the status
+#: bar at the bottom edge of the window. Reported from a real session; the artist killed
+#: Blender rather than press a key they could not see.
+#:
+#: SPACE used to accept, and is deliberately gone: it is playback. Now that navigation
+#: passes through, an artist pressing it to watch the motion would have silently accepted
+#: the proposal instead of looking at it.
+ANSWER_KEYS = frozenset(("RET", "NUMPAD_ENTER", "D", "A"))
 
 
 def _clip(context):
@@ -328,6 +340,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     # ---------------------------------------------------------------- phases
 
     def _start_tracking(self, context):
+        overlay.hide()
         self._stats = {}
         # Re-baselined every pass. A track that restarts from a repair or a resume starts
         # with a different box, and a watch still holding the old baseline would flag its
@@ -346,6 +359,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 area.tag_redraw()
 
     def _finish(self, context, level, msg):
+        overlay.hide()
         wm = context.window_manager
         if self._timer is not None:
             wm.event_timer_remove(self._timer)
@@ -363,9 +377,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 client.cancel(self._root, self._job)
             return self._done(context, "cancelled")
         try:
-            # The confirm phase is the one that wants keys rather than the timer, and it
-            # must SWALLOW them: passing them through would let Enter and D reach the clip
-            # editor's own keymap while the artist is answering a question.
+            # The confirm phase runs on keys rather than the timer. It consumes ONLY the
+            # four answer keys (`ANSWER_KEYS`) and passes everything else through -- see
+            # the comment there for what swallowing the rest cost.
             if self._phase == "confirm":
                 if event.type == "TIMER":
                     return {"RUNNING_MODAL"}
@@ -744,12 +758,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tr.select_pattern = on
             tr.select_search = on
         self._phase = "confirm"
-        self._status(context,
-                     "%s found again at frame %d (match %s) -- ENTER track on   "
-                     "D drop   A accept all %d   ESC stop"
-                     % (a["id"], a["frame"],
-                        "n/a" if a["score"] is None else "%.2f" % a["score"],
-                        len(self._awaiting)))
+        score = "n/a" if a["score"] is None else "%.2f" % a["score"]
+        msg = ("%s found again at frame %d (match %s) -- ENTER track on   "
+               "D drop   A accept all %d   ESC stop"
+               % (a["id"], a["frame"], score, len(self._awaiting)))
+        self._status(context, msg)
+        # ...and in the editor itself. The status bar alone is why this phase was mistaken
+        # for a hang. Navigation still works while this is up.
+        overlay.show(["%s found again at frame %d   (match %s)"
+                      % (a["id"], a["frame"], score),
+                      "ENTER  track on      D  drop      A  accept all %d      ESC  stop"
+                      % len(self._awaiting),
+                      "zoom and pan as normal -- nothing is frozen"])
         return {"RUNNING_MODAL"}
 
     def _drop_resume(self, name, frame):
@@ -768,18 +788,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._resumed.pop(name, None)
 
     def _tick_confirm(self, context, event):
-        if event.value != "PRESS":
-            return {"RUNNING_MODAL"}
         key = event.type
-        if key in ("RET", "NUMPAD_ENTER", "SPACE"):
+        if key not in ANSWER_KEYS:
+            return {"PASS_THROUGH"}
+        if event.value != "PRESS":
+            return {"RUNNING_MODAL"}     # swallow the release of a key we consumed
+        if key in ("RET", "NUMPAD_ENTER"):
             self._awaiting.pop(0)
         elif key == "D":
             a = self._awaiting.pop(0)
             self._drop_resume(a["id"], a["frame"])
-        elif key == "A":
+        else:                            # A -- accept the remaining proposals unread
             self._awaiting = []
-        else:
-            return {"RUNNING_MODAL"}
         if self._awaiting:
             return self._show_current(context)
         # Everything answered. If the artist dropped every one there is nothing to track.

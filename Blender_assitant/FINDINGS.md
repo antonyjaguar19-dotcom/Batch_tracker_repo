@@ -813,3 +813,86 @@ first plate decode. No model and no GPU — it is two correlations per track.
   test, because the watch runs inside Blender and the correlation runs in the sidecar and
   no single interpreter has both. Both halves are tested; the seam is exercised by hand.
 * Repair is capped at 2 per track (`drift_fixes`), which is a guess, not a measurement.
+
+---
+
+## The confirm phase was mistaken for a hang, because it was one (2026-08-24)
+
+Reported from a real session: "i tried tracking a seed and blender froze". The sidecar log
+had nothing wrong in it — the last job finished cleanly and returned a resume:
+
+```
+[job 22510a90cb64] 1 resume(s), 0 without one; pattern match 0.62..0.62
+[sidecar] parent 21752 exited -- shutting down
+```
+
+The sidecar was healthy, answered, and then watched Blender get killed. So the fault was
+entirely on the addon side, in whatever runs *immediately after* a resume arrives — which
+is the confirm phase.
+
+### What it was
+
+`_tick_confirm` returned `RUNNING_MODAL` for every event that was not <kbd>Enter</kbd>,
+<kbd>D</kbd>, <kbd>A</kbd>, or <kbd>Esc</kbd>. A modal operator that returns `RUNNING_MODAL`
+consumes the event: nothing reaches the editor. So while the loop waited for an answer,
+Blender took **no** mouse move, no click, no wheel, no middle-drag, no playhead. The only
+sign it was alive was one line of status-bar text at the bottom edge of the window.
+
+The comment above it named the reason — passing keys through would let <kbd>Enter</kbd> and
+<kbd>D</kbd> reach the clip editor's own keymap — and that reason is real, but the cure was
+applied to *every* event rather than to those keys.
+
+The irony is the point. The question being asked is **"is that your feature?"**, and the
+only honest way to answer it is to zoom in and look. The phase that exists to make the
+artist look was the one phase that would not let them.
+
+### What it is now
+
+Consume the four answer keys and their releases; `PASS_THROUGH` on everything else. Zoom,
+pan, scrub and play all work while the question is up.
+
+<kbd>Space</kbd> was dropped from the accept keys in the same change. It used to accept,
+which was harmless only because nothing else worked either — now that navigation reaches
+the editor, an artist pressing Space to play the shot and see the motion would have
+silently accepted the proposal they were about to judge.
+
+The prompt is also drawn **in the clip editor** now (`overlay.py`), not only in the status
+bar, and says in as many words that nothing is frozen. `_draw` is wrapped and never raises:
+a draw handler that throws fires again on the next redraw, and unlike a panel there is
+nothing to collapse to stop it.
+
+### One thing measured here rather than assumed
+
+The obvious other suspect was the polling. `_tick_waiting` issues a synchronous HTTP
+`poll()` on Blender's main thread on **every 0.05 s timer tick — 20 requests a second** —
+each with a 10 s timeout, while the sidecar runs CoTracker on the GPU. That looks exactly
+like a freeze waiting to happen, and it is not: the sidecar is a `ThreadingHTTPServer` and
+every job runs on its own daemon thread, so a poll never queues behind the work it is
+asking about. It is wasteful, not blocking. It was left alone; the freeze was elsewhere.
+
+`client.ensure()` *can* block the main thread for up to 60 s while a cold sidecar imports
+torch, and that is real — but the log shows the sidecar was already up and serving, so it
+was not this either.
+
+### Gates
+
+* `tests/test_confirm_keys.py` — 19 navigation keys × 3 event values all pass through and
+  change no state; Enter/D/A do what they say; an answer key's RELEASE is swallowed too, so
+  it cannot leak into the editor; dropping the last proposal ends the run instead of
+  starting an empty tracking pass; and <kbd>Space</kbd> is pinned as pass-through, since it
+  used to accept.
+* `tests/test_overlay_draw.py` — `_draw` called in every state the module can be in: never
+  shown, shown, hidden, hidden twice, re-shown. `blf` is stubbed, and not for convenience:
+  calling the real one outside a GPU draw context does not raise, it takes the process down
+  with `EXCEPTION_ACCESS_VIOLATION` (measured, headless, 5.2). The stub also checks the
+  arguments — three lines, first one highlighted, stacked upward off the bottom edge.
+* Unchanged and re-run: parity **25100 samples, 0.000000000 px, 0 span mismatches**, panel
+  draw PASS, `test_scale_watch` / `test_scale_drift` / `test_patmatch` PASS.
+
+### What this does not settle
+
+The modal itself still has no headless test — an Operator instance cannot be constructed,
+so `_tick_confirm` is called unbound with a stand-in `self`, the same compromise
+`test_panels_draw` makes for `draw()`. That covers the decision, not Blender's event
+routing: whether `PASS_THROUGH` actually reaches the clip editor's keymap was confirmed by
+hand, not by a test.

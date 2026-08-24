@@ -36,7 +36,7 @@ bl_info = {
 # regex keeps the manifest and the source from disagreeing.
 VERSION = bl_info["version"]
 
-from . import ops_3de, ops_assist, ops_seed, panel, prefs
+from . import ops_3de, ops_assist, ops_seed, overlay, panel, prefs
 
 MODULES = (prefs, ops_3de, ops_seed, ops_assist, panel)
 
@@ -50,6 +50,9 @@ def register():
 
 def unregister():
     import bpy
+    # A draw handler outlives unregister(): disabling the addon while the confirm prompt is
+    # up would leave a callback pointing into a dead module, firing on every redraw.
+    overlay.hide()
     for mod in reversed(MODULES):
         for cls in reversed(mod.CLASSES):
             try:

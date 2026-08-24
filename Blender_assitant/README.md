@@ -103,6 +103,27 @@ measurement, not caution — see FINDINGS, "a metric measured and REMOVED before
 Two toggles and the growth limit are in the panel; turn `Animate loc + scale` off and the
 whole thing is inert, because under `Loc` the box never changes.
 
+### When a feature is found again, it stops and asks
+
+A re-acquire is a **proposal**, not a result — autonomous re-acquire measured 315.73 px
+against hand tracks. So when one is found the clip jumps to that frame with the marker
+already snapped onto it, and the run waits. The question is on screen in the clip editor
+itself, not only in the status bar:
+
+| key | |
+|---|---|
+| <kbd>Enter</kbd> | it is your feature — track on from here |
+| <kbd>D</kbd> | it is not — drop this segment and stop re-acquiring that track |
+| <kbd>A</kbd> | accept the rest without looking |
+| <kbd>Esc</kbd> | stop the run |
+
+**Everything else still works while it waits** — zoom, pan, scrub, play. Answering "is that
+my feature?" means looking at it closely, so nothing but those four keys is taken. Note
+<kbd>Space</kbd> plays the shot as usual; it does *not* accept.
+
+Turn **Confirm each re-acquire** off and the rounds run straight through, leaving every
+resumed segment muted for the Keep/Drop buttons at the end instead.
+
 Two things the UI does silently on your behalf:
 
 - **Full resolution is forced** while a job runs, then your proxy setting is put back. A
