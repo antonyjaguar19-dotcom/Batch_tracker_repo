@@ -182,6 +182,16 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "marker snapped onto it and WAIT: you look at it, then press Enter to "
                     "track on, D to drop it, or Esc to stop. Off runs every round straight "
                     "through and leaves the whole batch muted for review at the end")
+    confirm_only_occluded: BoolProperty(
+        name="Only ask when it was hidden", default=True,
+        description="Confirm only the resumes where CoTracker says the feature was actually "
+                    "OCCLUDED, and accept the rest without stopping. Measured on SH004 "
+                    "against an independent Lucas-Kanade reference: over 10 autonomous "
+                    "resumes with no occlusion, the worst single frame was 6.66 px and not "
+                    "one landed on a different feature -- so stopping to ask about those "
+                    "buys nothing. A resume that crosses a real occlusion has NOT been "
+                    "measured that way and still stops. Turn this off to be asked about "
+                    "every resume")
     animate_scale: BoolProperty(
         name="Animate location + scale", default=True,
         description="Track with the LocScale motion model, so Blender solves a SIZE for the "
@@ -236,6 +246,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _gave_up = None           # ids the loop has stopped re-asking about
     _continue_from = None     # id -> (frame, x, y): resume the SEARCH here, not a position
     _awaiting = None          # resumes snapped and waiting for the artist to say yes
+    _auto_kept = 0            # resumes taken without asking, because nothing was occluded
     _pending = None           # resumes awaiting insertion
     _fixes = None             # id -> how many times the scale watch has repaired it
     _drift = None             # [(id, frame, verdict, ...)] for the report
@@ -326,6 +337,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._gave_up = set()
         self._continue_from = {}
         self._awaiting = []
+        self._auto_kept = 0
         self._fixes = {}
         self._drift = []
         self._backward_done = False
@@ -851,8 +863,16 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             rec["alive"] = True
             rec["seed_frame"] = int(res["frame"])
             self._continue_from.pop(res["id"], None)
-            self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
-                                   "score": res.get("match_score")})
+            # Ask only about the case that has not been measured. A resume across frames the
+            # guide calls VISIBLE is the case the numbers cover; one across an occlusion is
+            # the case the confirm phase was built for, and it still stops.
+            occluded = int(res.get("occluded_frames") or 0)
+            if self.confirm_only_occluded and occluded <= 0:
+                self._auto_kept += 1
+            else:
+                self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
+                                       "score": res.get("match_score"),
+                                       "occluded": occluded})
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
             sc = res.get("match_score")
             self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))
@@ -905,6 +925,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tail = ", match %.2f-%.2f (min %.2f)" % (min(sc), max(sc), self.min_match)
         elif self.verify_pattern:
             tail = ", pattern check found nothing to check"
+        if self._auto_kept:
+            tail += (", %d resume(s) taken without asking (nothing occluded)"
+                     % self._auto_kept)
         n_ref = len(self._misses or {})
         if n_ref:
             tail += ", %d refused (see console)" % n_ref

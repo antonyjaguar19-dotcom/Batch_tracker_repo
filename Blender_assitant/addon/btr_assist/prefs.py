@@ -75,6 +75,14 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "snapped onto it and wait for you: Enter tracks on, D drops it, A "
                     "accepts the rest, Esc stops. Off runs straight through and leaves the "
                     "batch muted for review at the end")
+    confirm_only_occluded: BoolProperty(
+        name="Only ask when it was hidden", default=True,
+        description="Confirm only the resumes where the feature was actually OCCLUDED, and "
+                    "take the rest without stopping. Measured on SH004 against an "
+                    "independent Lucas-Kanade reference: over 10 autonomous resumes with "
+                    "nothing occluded the worst single frame was 6.66 px and none landed on "
+                    "a different feature. Crossing a real occlusion has not been measured "
+                    "that way and still stops for you")
     min_match: FloatProperty(
         name="Minimum match", default=0.60, min=0.0, max=1.0, subtype="FACTOR",
         description="Correlation a candidate must reach against your pattern before it is "
@@ -105,6 +113,9 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
         layout.prop(self, "confirm_resumes")
+        sub_c = layout.row()
+        sub_c.enabled = self.confirm_resumes
+        sub_c.prop(self, "confirm_only_occluded")
         layout.prop(self, "verify_pattern")
         sub = layout.row()
         sub.enabled = self.verify_pattern

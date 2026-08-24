@@ -166,6 +166,7 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
             op.verify_pattern = p.verify_pattern
             op.min_match = p.min_match
             op.confirm_resumes = p.confirm_resumes
+            op.confirm_only_occluded = p.confirm_only_occluded
             op.animate_scale = p.animate_scale
             op.watch_scale = p.watch_scale
             op.scale_ratio = p.scale_ratio
@@ -175,6 +176,9 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
         if p is not None:
             sub = layout.column(align=True)
             sub.prop(p, "confirm_resumes", text="Confirm each re-acquire")
+            row_c = sub.row()
+            row_c.enabled = p.confirm_resumes
+            row_c.prop(p, "confirm_only_occluded", text="Only when it was hidden")
             sub.prop(p, "verify_pattern", text="Must match my pattern")
             row = sub.row()
             row.enabled = p.verify_pattern

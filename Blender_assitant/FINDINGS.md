@@ -1054,3 +1054,71 @@ Two process notes worth keeping:
   `import btr_assist` is a `ModuleNotFoundError`, which is how the first live attempt failed —
   and, because the console output was behind a buffering pipe, it briefly looked like a
   successful run whose sidecar jobs actually belonged to a different Blender.
+
+---
+
+## Autonomous re-acquire, scored against something that is not us (2026-08-24)
+
+The standing number — **315.73 px, 26–47 % on-feature** — is why every resume stops and asks.
+It was produced by a different method, and it predates today's localisation change. So it was
+re-run properly.
+
+### Getting a case at all
+
+Seeded from `refs/SH004_lk/manual.txt` (5 corners, pyramidal Lucas-Kanade, gradient-based —
+a different algorithm family from the NCC used here, so pixel-locking bias is not shared;
+round-trip closure 0.15–0.91 px). Seeding from the reference's own first-frame positions is
+what makes `eval_vs_manual --pair seeded` mean what it says.
+
+**All 5 tracks survived all 160 frames. Zero deaths, so nothing to re-acquire.** Worth
+recording on its own: on this shot Blender alone holds every reference corner end to end.
+Autonomous, no confirming, scored over 800 samples: **median 0.77 px, 55 % within 1 px** — the
+first number in this project scoring the assist loop against an independent reference rather
+than against itself.
+
+So deaths were made: `--kill-at F` cuts every track at frame F after the first pass. The
+truncated track looks dead to `dead_tracks` for the same reason a real one does, and the LK
+reference still holds the answer for every frame after the cut.
+
+### The result, frames after the cut only
+
+| cut at | tracks | frames | median | p90 | <1 px | <3 px | baseline, same frames |
+|---|---|---|---|---|---|---|---|
+| f40 | 5 | 535 | 3.44 | 6.14 | 27 % | 48 % | 1.15 px |
+| f80 | 5 | 323 | 1.96 | 5.21 | 43 % | 73 % | 1.13 px |
+| f120 | 5 | 131 | 2.58 | 5.06 | 27 % | 69 % | 1.52 px |
+
+Autonomous re-acquire costs **1–2 px of median** against a track that never died. Across all
+10 resumes the **worst single frame is 6.66 px**, and not one landed on a different feature.
+Against 315.73 px and 3-of-5-wrong, that is a different failure mode entirely: right feature,
+slightly off, instead of confidently tracking something else.
+
+### What the number is allowed to justify — and what it is not
+
+**Every one of those 10 resumes reports `occluded_frames = 0`.** The guide called the feature
+visible throughout; these are loss-of-correlation deaths, not occlusion crossings. Truncating
+a track does not hide anything, so this harness *cannot* produce an occlusion case, and
+occlusion is precisely what CoTracker is in the loop for.
+
+So the rule shipped is exactly as wide as the evidence: **`confirm_only_occluded` (default ON)
+stops for the resumes that crossed an occlusion and takes the rest without asking.** The
+common death — blur, contrast, a feature going soft — no longer interrupts, because that case
+is measured and it holds. A resume across frames the guide calls hidden is unmeasured and
+still stops. The count taken without asking is reported at the end, so nothing is accepted on
+the artist's behalf silently.
+
+Turning `Only when it was hidden` off restores stop-and-ask for every resume.
+
+### What this does not settle
+
+* **No occlusion was tested.** The one case the confirm phase exists for is still unmeasured,
+  on this shot and every other reference here. It needs footage with a real occluder and a
+  hand track across it.
+* 5 tracks, all corners, one shot, one plate. `refs.json` labels every one `corner`; blobs and
+  edges are not represented.
+* Deaths are simulated by truncation. A real death happens because correlation failed, which
+  usually means the picture changed — the last-good patch a real death leaves behind may be
+  worse than the clean one a cut leaves.
+* The baseline column is Blender tracking the same frames without dying, not ground truth.
+  Both columns are measured against LK, whose own closure is 0.15–0.91 px, so differences
+  below about 1 px should not be read as real.

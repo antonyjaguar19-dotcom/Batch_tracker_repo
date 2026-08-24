@@ -71,11 +71,34 @@ opts = track_core.Opts(leash=0.0)
 track_core.apply_settings(clip, opts)
 
 tracks = three_de.active_tracks(clip)
+
+# Seeding from a 3DE file puts the engine on the SAME feature the reference starts on, which
+# is what makes `eval_vs_manual --pair seeded` mean what it appears to mean. Raw --points are
+# for plumbing runs where there is nothing to score against.
+seed_spec = []
+if spec.get("seed_file"):
+    # `three_de.read_3de` returns [(name, [(frame, x, y), ...]), ...] -- a LIST of pairs,
+    # not the dict `blio.read_3de` hands back. Same file, two readers, two shapes.
+    ref = three_de.read_3de(spec["seed_file"])
+    for name, pts3 in sorted(ref):
+        live3 = sorted((f, x, y) for f, x, y in pts3 if f >= 1)
+        if not live3:
+            continue
+        _f, rx, ry = live3[0]
+        # 3DE px here share Blender's y-up convention (three_de.uv_to_px does not flip), so
+        # this is the exact inverse of what `collect` writes back out.
+        u, v = three_de.px_to_uv(rx, ry, w, h)
+        seed_spec.append((name, u, v))
+    log("seeding %d track(s) from %s" % (len(seed_spec), os.path.basename(spec["seed_file"])))
+else:
+    for i, (nx, ny) in enumerate(pts):
+        u, v = image_px_to_uv(nx * w, ny * h, w, h)
+        seed_spec.append(("USER_%02d" % i, u, v))
+
 records, seeds_px, patterns, search_px = [], {{}}, {{}}, {{}}
-for i, (nx, ny) in enumerate(pts):
-    x, y_down = nx * w, ny * h
-    u, v = image_px_to_uv(x, y_down, w, h)
-    tr = tracks.new(name="USER_%02d" % i, frame=1)
+for name, u, v in seed_spec:
+    x, y_down = three_de.uv_to_px(u, v, w, h)[0], (h - 1.0) - three_de.uv_to_px(u, v, w, h)[1]
+    tr = tracks.new(name=name, frame=1)
     # LocScale, matching the shipped operator default -- under `Loc` the pattern box never
     # changes size, so `last_box` below would carry no information and this gate would test
     # a configuration no artist runs.
@@ -120,6 +143,22 @@ for rnd in range(rounds + 1):
         pass
     if rnd == 0:
         track_core.track_backward_pass(ctx, records, opts)
+        # Simulated death. On a shot where Blender holds every feature to the end there is
+        # no re-acquire to score, and the reference sets that exist here are exactly that
+        # kind of shot. Cutting each track at a chosen frame reproduces the case the artist
+        # actually hits -- "it was fine, then it stopped" -- while leaving an INDEPENDENT
+        # reference (Lucas-Kanade, gradient-based) holding the answer for every frame after
+        # the cut. Nothing else about the loop changes: the truncated track looks dead to
+        # `dead_tracks` for the same reason a real one does.
+        if spec.get("kill_at"):
+            kf = int(spec["kill_at"])
+            cut = 0
+            for r in records:
+                for mk in [m for m in r["t"].markers if m.frame > kf]:
+                    r["t"].markers.delete_frame(mk.frame)
+                    cut += 1
+                r["alive"] = True
+            log("simulated death: cut %d marker(s) after frame %d" % (cut, kf))
     spans = sorted(len(live_frames(r["t"])) for r in records)
     log("round %d: tracked in %.1fs, deaths %d, spans %s"
         % (rnd, time.time() - t0, st.get("deaths", 0), spans))
@@ -206,6 +245,26 @@ for rnd in range(rounds + 1):
 
 report["resumed"] = resumed
 report["final_spans"] = sorted(len(live_frames(r["t"])) for r in records)
+
+if spec.get("export"):
+    # What the artist would have after pressing Keep: the resumed segments live, minus the
+    # resume frame itself, which is the guide's ESTIMATE of where the feature went rather
+    # than a measurement of it. Scoring with that frame in would score CoTracker, not the
+    # loop.
+    dropped = 0
+    for name, frames in resumed.items():
+        rec = next((r for r in records if r["id"] == name), None)
+        if rec is None:
+            continue
+        for f0 in frames:
+            mk = rec["t"].markers.find_frame(int(f0), exact=True)
+            if mk is not None and len(rec["t"].markers) > 1:
+                rec["t"].markers.delete_frame(int(f0))
+                dropped += 1
+    three_de.write_3de(spec["export"], three_de.collect(clip))
+    log("exported %s (dropped %d resume estimate frame(s))"
+        % (os.path.basename(spec["export"]), dropped))
+    report["export"] = spec["export"]
 json.dump(report, open(r"{report}", "w"), indent=2)
 log("final spans %s of %d" % (report["final_spans"], n_frames))
 log("DONE")
@@ -216,6 +275,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plate", required=True)
     ap.add_argument("--points", nargs="+", default=["0.45,0.42"])
+    ap.add_argument("--seed-file",
+                    help="3DE ASCII whose first-frame positions become the seeds, keeping "
+                         "the reference's track names. This is what makes "
+                         "`eval_vs_manual --pair seeded` mean what it says: the engine "
+                         "starts on the same feature the reference starts on")
+    ap.add_argument("--export", help="write the finished tracks out as 3DE ASCII")
+    ap.add_argument("--kill-at", type=int, default=0,
+                    help="cut every track at this frame after the first pass, so the "
+                         "re-acquire has something to re-acquire. Needed on a shot where "
+                         "Blender holds every feature to the end")
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--gap", type=int, default=3)
     ap.add_argument("--tail", type=int, default=2)
@@ -237,7 +306,10 @@ def main():
         json.dump({"plate": os.path.abspath(args.plate), "points": pts,
                    "rounds": args.rounds, "gap": args.gap, "tail": args.tail,
                    "verify_pattern": not args.no_verify,
-                   "min_match": args.min_match}, fh)
+                   "min_match": args.min_match,
+                   "seed_file": os.path.abspath(args.seed_file) if args.seed_file else "",
+                   "export": os.path.abspath(args.export) if args.export else "",
+                   "kill_at": args.kill_at}, fh)
 
     driver = os.path.join(outdir, "driver.py")
     with open(driver, "w", encoding="utf-8") as fh:
