@@ -1009,3 +1009,48 @@ confirm keys PASS, overlay draw PASS, scale watch / scale drift / patmatch PASS.
 * Re-acquire still lands within 2 px only 30 % of the time with the shipped seed patch, and
   85 % with this change — on healthy tracks with a correct guide. It remains a proposal the
   artist confirms, and the confirm step is still the thing that makes it safe.
+
+---
+
+## Keep un-muted the one marker it was written to discard (2026-08-24)
+
+Found by the first live run in a windowed Blender, not by any headless gate.
+
+A track seeded at frame 1 came back with a **muted marker at frame 0** — the `sequence=False`
+artefact `track_core.track_backward_pass` already documents ("a track seeded at frame 40 came
+back with markers at 39..44"). Nothing downstream noticed it: 3DE export runs `skip_muted=True`,
+so it can never reach a track file, and in the viewport it is invisible.
+
+It broke `Keep`. That button un-mutes a resumed segment while deliberately leaving the FIRST
+muted frame muted, because a resume frame is the guide's ESTIMATE of where the feature went,
+and the frame after it is the first one Blender actually matched. It finds that frame with
+`min(m.frame for m in muted)` — so with the artefact present, `first` is frame 0, and the
+estimate at frame 54 is above it and gets un-muted onto the track. The artist presses Keep and
+silently gets the guessed position they were meant to be spared.
+
+Fix: muted markers below the track's first LIVE frame are not resumes, and are excluded before
+`first` is taken.
+
+`tests/test_confirm_resumes.py` pins both directions — the new rule spares frame 54 and
+un-mutes only 55/56, and the old rule provably un-muted 54. It drives the rule rather than the
+operator: a `MovieClip` cannot be synthesised headless without a file, and the test says so
+rather than pretending to cover more than it does.
+
+### What the live run also showed
+
+The whole loop, in a real windowed Blender, 24.9 s: modal timer ticking, clip-editor context
+resolving, overlay module loading, scale watch flagging at f9 and f10 and both coming back
+`clean` from the sidecar, re-acquire landing at f58 after a death at f53, and round 2 refusing
+honestly ("nothing reached 0.60 ... best 0.32 at frame 158"). The two false alarms in the first
+ten frames each cost a sidecar round trip, which is worth watching if the watch is ever tuned.
+
+Two process notes worth keeping:
+
+* **A running Blender does not pick up a reinstalled addon.** Extension modules are imported at
+  enable time; rebuilding the zip while Blender is open leaves the old code in memory. A live
+  test against a session started before the install tests the previous build — check the
+  process start time against the install time before believing any live result.
+* Installed as an extension the package is `bl_ext.user_default.btr_assist`. A bare
+  `import btr_assist` is a `ModuleNotFoundError`, which is how the first live attempt failed —
+  and, because the console output was behind a buffering pipe, it briefly looked like a
+  successful run whose sidecar jobs actually belonged to a different Blender.

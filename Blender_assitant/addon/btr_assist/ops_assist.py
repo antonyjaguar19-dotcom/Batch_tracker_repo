@@ -945,7 +945,17 @@ class CLIP_OT_btr_confirm_resumes(bpy.types.Operator):
             return {"CANCELLED"}
         n = 0
         for tr in sel:
-            muted = [m for m in tr.markers if m.mute]
+            # Muted markers BELOW the track's first live frame are not resumes -- they are
+            # the `sequence=False` artefact recorded in `track_core.track_backward_pass`: a
+            # track seeded at frame N comes back with a marker at N-1. Measured live on a
+            # seed at frame 1, which produces one at frame 0. It matters here and nowhere
+            # else: KEEP deliberately leaves the FIRST muted frame muted, because a resume
+            # frame is the guide's estimate rather than a measurement -- and with the
+            # artefact in the list, `first` is the artefact, so the estimate it meant to
+            # discard gets un-muted instead.
+            live = live_frames(tr)
+            floor = live[0] if live else 0
+            muted = [m for m in tr.markers if m.mute and m.frame > floor]
             if not muted:
                 continue
             if self.action == "KEEP":
