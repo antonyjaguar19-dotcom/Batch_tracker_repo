@@ -412,6 +412,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             print("[assist] motion measurement failed: %s" % st["error"]["message"])
         else:
             self._motion = st.get("result")
+            # The loop re-fits per frame from this; `_widen_boxes` only sets the box the
+            # first step will use.
+            self._opts.motion = self._motion
+            self._opts.motion_headroom = MOTION_HEADROOM
+            self._opts.motion_cap_frac = MAX_SEARCH_FRAC
             self._widen_boxes(context)
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
@@ -532,9 +537,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 done = True
                 break
         st = self._stats
-        self._status(context, "round %d: frame %d/%d   %d live   %d dead   %d flagged"
+        self._status(context,
+                     "round %d: frame %d/%d   %d live   %d dead   %d flagged   %d refit"
                      % (self._round + 1, st.get("frame", 0), st.get("total", 0),
-                        st.get("alive", 0), st.get("deaths", 0), st.get("flagged", 0)))
+                        st.get("alive", 0), st.get("deaths", 0), st.get("flagged", 0),
+                        st.get("refit", 0)))
         if not (done or st.get("done")):
             return {"RUNNING_MODAL"}
 

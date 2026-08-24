@@ -148,6 +148,55 @@ def main():
     else:
         log("%-34s ok (%.0f px)" % ("runaway motion capped", got))
 
+    # --- 4. the per-frame re-fit ---------------------------------------------------------
+    # `refit_search` is the same rule applied to wherever the track has GOT to. It is pure
+    # arithmetic on a marker, so it runs here without Blender -- a stand-in marker is enough,
+    # and `track_core` imports cleanly outside Blender only for these helpers, so the rule is
+    # duplicated in `fit()` above and checked against it rather than imported.
+    class FakeMarker:
+        def __init__(self, u, v, pat_px, search_px, w, h):
+            hu, hv = pat_px / 2.0 / w, pat_px / 2.0 / h
+            su, sv = search_px / 2.0 / w, search_px / 2.0 / h
+            self.co = (u, v)
+            self.pattern_corners = ((-hu, -hv), (hu, -hv), (hu, hv), (-hu, hv))
+            self.search_min = (-su, -sv)
+            self.search_max = (su, sv)
+
+    # SH013's real shape: slow across the middle of frame, fast near the bottom.
+    mo = {"grid": [1, 2], "p95": [[22.7], [47.6]], "median": [[10.0], [20.0]],
+          "global_p95": 47.6, "pairs": 1}
+    W, H = 2562, 1440
+
+    def refit(marker):
+        # y-DOWN lookup from a y-UP marker, which is the part most likely to be got wrong.
+        gx, gy = mo["grid"]
+        x = marker.co[0] * W
+        y = (1.0 - marker.co[1]) * H
+        j = min(gy - 1, max(0, int(y / float(H) * gy)))
+        i = min(gx - 1, max(0, int(x / float(W) * gx)))
+        p95 = mo["p95"][j][i]
+        xs = [c[0] for c in marker.pattern_corners]
+        ys = [c[1] for c in marker.pattern_corners]
+        pat = max((max(xs) - min(xs)) * W, (max(ys) - min(ys)) * H)
+        have = (marker.search_max[0] - marker.search_min[0]) * W
+        return fit(p95, pat, W, have)
+
+    # A marker in the UPPER half of the image (y-up v=0.8 -> image y=288) reads the slow row.
+    up = FakeMarker(0.5, 0.8, 28.0, 96.0, W, H)
+    got = refit(up)
+    if abs(got - 96.0) > 1.0:
+        fail("slow row re-fit changed a correct box: %.0f" % got)
+    else:
+        log("%-34s ok (stays %.0f px)" % ("re-fit: slow row unchanged", got))
+
+    # The SAME marker low in frame (v=0.1 -> image y=1296) reads the fast row and must grow.
+    down = FakeMarker(0.5, 0.1, 28.0, 96.0, W, H)
+    got = refit(down)
+    if got < 165.0:
+        fail("fast row re-fit only reached %.0f px, needs ~171" % got)
+    else:
+        log("%-34s ok (%.0f px)" % ("re-fit: fast row widened", got))
+
     log("MOTION FIT: %s" % ("FAIL" if FAILURES else "PASS"))
     return 1 if FAILURES else 0
 

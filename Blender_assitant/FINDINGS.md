@@ -1227,3 +1227,63 @@ Three identical arms is the shape of a broken harness, not a null result.
   scored ACCURACY with widened boxes against a reference, only span.
 * The grid is 6x4 and static for the shot. A feature crossing from a slow cell into a fast
   one is sized by where it STARTED.
+
+### The box was sized for where the feature started (2026-08-24, SH013)
+
+Reported straight after the fix above: *"the feature is still in the frame but track is not
+completely tracked until it exits."* Correct on both counts, and it exposes the limitation
+that shipped with it — the grid was read **once, at the seed**.
+
+Measured, box sized once from the seed cell, eight foreground seeds:
+
+| trk | span | p95 @seed | p95 @death | box | needed | why it stopped |
+|---|---|---|---|---|---|---|
+| P00 | 13 | 47.6 | 47.0 | 171 | 169 | left frame, 15 px from edge |
+| P04 | 24 | 22.7 | 47.6 | 96 | 171 | left frame, 22 px from edge |
+| **P06** | **42** | **22.7** | **47.6** | **96** | **171** | **box too small there — 248 px of frame left** |
+| P07 | 63 | 22.7 | 37.1 | 96 | 139 | left frame, 17 px from edge |
+
+Seven of eight really do leave frame. P06 does not: seeded where the plate moves 22.7
+px/frame, swept into a region moving 47.6, and died holding a box that no longer reached.
+
+So `track_job` now re-fits each marker's search box every frame from the cell it has actually
+reached. `Opts.motion` defaults to None and the loop is byte-identical without it, which is
+what keeps the parity gate meaningful.
+
+### It buys nothing on its own
+
+| | spans | tracked frames |
+|---|---|---|
+| corr 0.75, sized once | 13 17 10 8 24 32 42 63 | 209 |
+| corr 0.75, re-fit | 13 17 10 8 24 32 42 63 | 209 — **identical** |
+| corr 0.40, sized once | 13 17 25 17 24 44 48 63 | 251 |
+| corr 0.40, re-fit | 13 17 25 17 24 **129** 49 63 | **337** |
+
+At the shipped correlation floor the track dies of **appearance** before it ever dies of
+reach, so a bigger box does not extend one span — P06 included, which then reports "box was
+big enough, something else". Relax the floor and reach starts to matter: one track goes 44 →
+129 frames, +34 % tracked frames overall.
+
+**The two limits are coupled and neither is worth much alone.** That is the finding. A reach
+fix reads as useless while correlation is binding; a correlation fix reads as marginal while
+reach is binding.
+
+Shipped regardless, on narrow grounds: a box that cannot reach the feature is wrong whatever
+is currently killing the track first, and it is measured to change nothing at the default.
+
+**The correlation floor is deliberately NOT lowered.** 0.40 accepts weaker matches, weaker
+matches mean drift, and there is no reference on SH013 to measure drift against — the span
+numbers above say how many frames survive, not whether they are on the feature. Lowering a
+quality floor because it produces longer tracks, without checking where those tracks are, is
+the exact mistake this project's conventions exist to prevent. It stays an artist's knob with
+these numbers written next to it.
+
+### What this does not settle
+
+* No accuracy number exists for SH013 at any setting. Everything here is span.
+* `MOTION_HEADROOM = 1.5` still comes from one shot.
+* What actually kills these tracks at 0.75 is unidentified — "appearance" covers motion blur,
+  perspective foreshortening and scale change, and no measurement here separates them.
+* A latent crash was fixed in passing: `/jobs/motion`'s fallback read `plate.n`, which does
+  not exist (`Plate` exposes `.count`). It never fired because the addon always sends
+  `frames`.

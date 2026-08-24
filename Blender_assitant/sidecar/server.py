@@ -160,7 +160,7 @@ def job_motion(payload):
             raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d -- "
                                "different plate, or a proxy is on" % (cw, ch, plate.w, plate.h))
         job.stage = "measuring plate motion"
-        mo = motion.measure(plate, int(clip.get("frames", 0) or plate.n),
+        mo = motion.measure(plate, int(clip.get("frames", 0) or plate.count),
                             samples=int(params.get("samples", motion.DEFAULT_SAMPLES)),
                             on_status=job.say)
         if mo is None:

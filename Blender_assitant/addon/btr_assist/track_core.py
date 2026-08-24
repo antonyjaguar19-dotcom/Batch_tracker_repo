@@ -99,6 +99,11 @@ class Opts:
         # A watch only fires under a motion model that solves scale -- `Loc` never resizes
         # the box, so there is nothing for it to see.
         self.watch_scale = False
+        # Per-cell plate motion from the sidecar, or None. With None this loop is
+        # byte-identical to what it was -- which is what keeps the parity gate meaningful.
+        self.motion = None
+        self.motion_headroom = 1.5
+        self.motion_cap_frac = 0.25
         self.scale_rate = 0.10              # fractional size change in ONE frame
         self.scale_ratio = 1.6              # cumulative size against the artist's box
         self.scale_onset = 1.06             # size band that counts as "still the same box"
@@ -173,6 +178,44 @@ def attach_watch(records, opts, frame=None):
         r["watch"] = ScaleWatch(size_of(pattern_px(m, r["w"], r["h"])),
                                 rate=opts.scale_rate, ratio=opts.scale_ratio,
                                 onset=opts.scale_onset)
+
+
+def motion_at(mo, x, y, w, h):
+    """Measured p95 motion in px/frame at a plate position (image px, y-DOWN)."""
+    gx, gy = mo["grid"]
+    i = min(gx - 1, max(0, int(x / max(1.0, float(w)) * gx)))
+    j = min(gy - 1, max(0, int(y / max(1.0, float(h)) * gy)))
+    return float(mo["p95"][j][i])
+
+
+def refit_search(marker, w, h, mo, headroom=1.5, cap_frac=0.25):
+    """Widen this marker's search box if the plate moves further HERE than it reaches.
+
+    Sizing once from the seed is not enough on a plate whose motion is not uniform. Measured
+    on SH013 the p95 runs 22.7 px/frame across the middle of frame and 47.6 near the bottom,
+    and a foreground feature crosses from one to the other in a few dozen frames: seeded at
+    22.7 it gets a 96 px box, needs 171 by the time it has sped up, and dies at frame 42 with
+    the feature still well inside the frame. That reads exactly like a tracking failure and
+    is a box that stopped reaching.
+
+    Returns the new width in px, or 0.0 when nothing changed. Only ever ENLARGES -- see
+    `_widen_boxes` in the operator for why a small box is not always a mistake.
+    """
+    xs = [c[0] for c in marker.pattern_corners]
+    ys = [c[1] for c in marker.pattern_corners]
+    pat = max((max(xs) - min(xs)) * w, (max(ys) - min(ys)) * h)
+    # y-DOWN for the grid lookup: `marker.co` is y-UP clip space.
+    x = marker.co[0] * w
+    y = (1.0 - marker.co[1]) * h
+    p95 = motion_at(mo, x, y, w, h)
+    want = min(2.0 * (p95 * headroom + pat / 2.0), w * cap_frac)
+    have = (marker.search_max[0] - marker.search_min[0]) * w
+    if want <= have + 1.0:
+        return 0.0
+    sx, sy = want / 2.0 / w, want / 2.0 / h
+    marker.search_min = (-sx, -sy)
+    marker.search_max = (sx, sy)
+    return want
 
 
 def _select(track, on):
@@ -346,7 +389,7 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
     running = []
     st = stats if stats is not None else {}
     st.update({"deaths": 0, "clamped": 0, "entered": 0, "calls": 0, "flagged": 0,
-               "frame": 0, "total": len(frames), "alive": 0, "done": False})
+               "refit": 0, "frame": 0, "total": len(frames), "alive": 0, "done": False})
 
     for i, f in enumerate(frames):
         newly = live.pop(f, [])
@@ -371,6 +414,16 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
                 r["alive"] = False
                 st["deaths"] += 1
                 continue
+            # Re-fit the search box to where the feature has GOT to, not where it started.
+            # Before the scale watch and the leash on purpose: both of those judge a marker
+            # that has already been placed, while this decides whether the NEXT step can
+            # reach at all.
+            if opts.motion:
+                if refit_search(m, r["w"], r["h"], opts.motion,
+                                headroom=opts.motion_headroom,
+                                cap_frac=opts.motion_cap_frac):
+                    st["refit"] += 1
+
             # Scale watch. A flag STOPS the track where it is -- it does not delete
             # anything and it is not a death: the marker Blender just wrote stays, and the
             # caller decides what the swell meant by looking at the pixels. Checked before
