@@ -896,3 +896,116 @@ so `_tick_confirm` is called unbound with a stand-in `self`, the same compromise
 `test_panels_draw` makes for `draw()`. That covers the decision, not Blender's event
 routing: whether `PASS_THROUGH` actually reaches the clip editor's keymap was confirmed by
 hand, not by a test.
+
+---
+
+## The re-acquire was looking for a 250-frame-old picture (2026-08-24)
+
+Reported: a track ran clean to frame 253, died at 254, and the re-acquire snapped it back
+at 256 — but "not exactly as the 1st frames which i seeded". Match score 0.62 against a 0.60
+gate, so it passed and was planted.
+
+### Three suspects, measured in order
+
+**1. The pattern box size is ignored.** The seed patch is cut at the seed frame, at the seed
+box, and correlated at that size for the entire sweep. Under LocScale — the shipped default
+— Blender has been solving a per-frame size for 253 frames and none of it is sent. Measured
+on the 122 real SH004 seeds, box scale at the last good frame:
+
+| | p10 | p50 | p90 | max |
+|---|---|---|---|---|
+| died (n=35) | 0.29× | **1.52×** | 2.09× | 2.39× |
+| survived (n=87) | 0.26× | 0.89× | 1.34× | 1.96× |
+
+28 of 35 dead tracks are >10 % off their seed box. Real gap. But fixing *only* this does not
+work — see the table below, and note it LOSES in the >50 % band, which is where dying tracks
+actually sit. **Measured, then not shipped on its own.**
+
+**2. The match score does not predict the landing.** The 14 known-answer landings worse than
+20 px scored **p50 0.85, max 0.98**. Raising the gate 0.60 → 0.90 moves median error 3.87 →
+3.11 px, still leaves 8 % beyond 20 px, and throws away 40 % of resumes. `min_match` is an
+identity gate and nothing more; it was never going to fix this.
+
+**3. The reference is stale.** `track_core`'s own docstring already measured this effect on
+the tracker itself: KEYFRAME matching — correlate against the seed patch forever — dies
+2.6–2.9× more often than PREV_FRAME, because appearance drifts. `find_reappearance` is
+KEYFRAME matching at its most extreme: one patch, 250 frames later.
+
+### The known-answer harness
+
+A resume has no ground truth — the track is dead, so there is nothing to score a landing
+against. So the answer is borrowed from tracks that did NOT die: a track Blender held for all
+160 frames has a measured position on every one of them. Pretend it died at frame F,
+re-acquire at F+3, and its own marker there is the answer. Both arms sweep the same frames,
+from the same guide path, at the same radius, scored against the same position; the only
+difference is the picture they are looking for.
+
+158 cases — 59 surviving SH004 tracks × simulated deaths at f40/f80/f120:
+
+| arm | found | err p50 | err p90 | err max | ≤2 px |
+|---|---|---|---|---|---|
+| seed patch (shipped) | 155/158 | 3.87 | 18.96 | 112.69 | 30 % |
+| seed patch, resized to the track's box | 151/158 | 3.36 | 17.28 | 77.95 | 34 % |
+| best of 9 scales | 158/158 | 3.24 | 18.57 | 105.17 | 30 % |
+| **the last good frame's patch** | 153/158 | **0.46** | **5.41** | 54.67 | **85 %** |
+
+**8.4× better median, 30 % → 85 % within 2 px.** It also disposes of suspect 1: the last-good
+patch is cut at the box the track was carrying, so the size correction arrives free.
+Staleness was the fault; scale was a symptom of looking at the wrong frame.
+
+Stratified, the size-only arm is a wash and the reason is visible — it wins 30/19 in the
+25–50 % band and loses 5/6 above 50 %:
+
+| box scale at death | n | seed p50/p90 | resized p50/p90 | resized W/L/T |
+|---|---|---|---|---|
+| within 10 % | 41 | 2.56 / 9.00 | 2.53 / 9.99 | 16/19/6 |
+| 10–25 % off | 48 | 3.23 / 14.26 | 3.15 / 14.86 | 20/28/0 |
+| 25–50 % off | 49 | 5.45 / 20.10 | 3.73 / 17.45 | 30/19/0 |
+| >50 % off | 11 | 6.16 / 20.56 | 7.01 / 17.79 | 5/6/0 |
+
+### What shipped: two patches, two jobs
+
+Localising with the last-good patch alone would be a regression of the thing the pattern
+check exists for. If a track has already drifted onto the wrong feature before dying, its
+last-good patch IS the wrong feature, and re-acquire would confirm it enthusiastically. So:
+
+* **Localise** with the feature as the track last saw it (`last_box`, sent by the addon from
+  the marker on the frame it died).
+* **Verify identity** with the artist's seed patch, at the position localisation found,
+  within `VERIFY_RADIUS = 6 px` — a second opinion on one spot, not another search.
+* The seed patch is **resized to the track's box** for that check. Scored at positions known
+  to be correct, the seed patch at seed size falsely refuses **11 %** of correct resumes; at
+  the track's size, **7 %**. Same patch, same position — the size is the difference. This is
+  where the scale measurement earns its place.
+* A refusal now says what happened ("found something at frame N but your own pattern only
+  scores X there") instead of reporting a bare number, and does not retry — the feature was
+  found, it is simply not the artist's, and another sweep finds the same thing.
+* `match_score` keeps its meaning — the artist's own pattern — so the confirm prompt still
+  reads the number worth reading. `locate_score` is new and reports what localisation scored.
+
+With no `last_box` (a continuation, or a track whose marker is missing) the path is
+byte-identical to before.
+
+### Gates
+
+End to end on SH004 through the real sidecar: resume at f58, identity 0.804, locate 0.702;
+the round-2 miss reports correctly and the shot finishes. `test_assist_loop` now seeds
+**LocScale** and sends `last_box`, matching the shipped operator — under `Loc` the box never
+changes size and the gate would have been testing a configuration no artist runs. Unchanged
+and re-run: parity 25100 samples / 0.000000000 px / 0 span mismatches, panel draw PASS,
+confirm keys PASS, overlay draw PASS, scale watch / scale drift / patmatch PASS.
+
+### What this does not settle
+
+* **The truth is Blender's own continuous track, and the winning arm is NCC like Blender is.**
+  They share a bias, so the absolute 0.46 px is optimistic. The 8.4× gap *between arms* is the
+  finding, since both were scored the same way. An independent check needs hand tracks or
+  `refs/SH004_lk`.
+* The harness only covers tracks that survived, whose boxes barely move (p50 0.87). The
+  population that actually dies sits at p50 1.52× and cannot be measured this way, because a
+  dead track has no answer to score against.
+* The identity check runs at one position. A resume that localises onto a lookalike a few
+  pixels from the real feature is inside `VERIFY_RADIUS` and will not be caught by it.
+* Re-acquire still lands within 2 px only 30 % of the time with the shipped seed patch, and
+  85 % with this change — on healthy tracks with a correct guide. It remains a proposal the
+  artist confirms, and the confirm step is still the thing that makes it safe.

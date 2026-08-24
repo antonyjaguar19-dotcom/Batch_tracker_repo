@@ -103,6 +103,26 @@ measurement, not caution — see FINDINGS, "a metric measured and REMOVED before
 Two toggles and the growth limit are in the panel; turn `Animate loc + scale` off and the
 whole thing is inert, because under `Loc` the box never changes.
 
+### How a lost feature is found again
+
+Two different pictures do two different jobs, because they answer different questions.
+
+**Where is it?** The feature as the track *last saw it* — the patch on the frame it died,
+at the box size it was carrying there. A track that has run 250 frames looks nothing like
+its seed frame any more, and searching for the seed picture is what put resumes a few pixels
+off their feature. Measured on 158 known-answer cases: seed patch lands p50 **3.87 px**
+(30 % within 2 px), last-good patch p50 **0.46 px** (85 %).
+
+**Is it yours?** The pattern box *you* set, correlated at the position that search found. If
+a track had already slid onto something else before it died, its last-good patch is that
+something else, and this is what refuses it. The refusal says so: *"found something at frame
+N but your own pattern only scores X there"*.
+
+So `Minimum match` gates identity, not accuracy — worth knowing, because a high score does
+**not** mean a good landing. The worst landings measured scored 0.85–0.98. Raising the gate
+buys almost nothing and costs you resumes; looking at the proposal is what works, which is
+why it stops and asks.
+
 ### When a feature is found again, it stops and asks
 
 A re-acquire is a **proposal**, not a result — autonomous re-acquire measured 315.73 px

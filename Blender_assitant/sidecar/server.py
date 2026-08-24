@@ -25,6 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSIST = os.path.abspath(os.path.join(HERE, ".."))
+
+#: Pixels of slack the identity check is allowed around the position localisation found.
+#: It is a second opinion on one spot, not a search -- widen it and a nearby lookalike can
+#: answer for the artist's feature.
+VERIFY_RADIUS = 6.0
 VERSION = "0.1.0"
 
 TOKEN = ""
@@ -313,6 +318,7 @@ def job_reacquire(payload):
 
         resumes, misses = [], []
         jobs, meta, unverified, pattern_std = [], {}, [], {}
+        verify_ref = {}          # id -> (seed patch, offset, box scale, localised?)
         for r in reqs:
             got = per_req.get(r["id"])
             if got is None:
@@ -355,7 +361,37 @@ def job_reacquire(payload):
             # guide's own error.
             radius = float(r.get("search_px") or max(24.0, patch.shape[1]))
             radius = max(8.0, min(float(params.get("max_match_radius", 96.0)), radius / 2.0))
-            jobs.append({"id": r["id"], "patch": patch, "offset": offset,
+
+            # Two patches, two jobs. LOCALISING wants the feature as the track last saw it;
+            # VERIFYING wants the feature the artist chose, and those stop being the same
+            # picture within a few dozen frames. Measured on 158 known-answer cases (SH004,
+            # 59 tracks that survived the shot, simulated deaths at f40/80/120): localising
+            # with the seed patch lands p50 3.87 px / 30 % within 2 px, with the last-good
+            # patch p50 0.46 px / 85 %. Correcting only the seed patch's SIZE gets 3.36 px
+            # -- so staleness, not scale, is what was costing the landing.
+            #
+            # The seed patch keeps the job it was introduced for. Localising with the
+            # last-good patch would happily re-acquire a feature the track had already
+            # drifted onto; the identity check below is what refuses that, and it has to
+            # read the artist's own box or it is checking nothing.
+            lb = r.get("last_box") or {}
+            loc = None
+            if lb:
+                loc = patmatch.reference_patch(plate, int(lb.get("frame", lg)),
+                                               float(lb["cx"]), float(lb["cy"]),
+                                               float(lb["w"]), float(lb["h"]))
+            # Scale of the track's box against the artist's. The identity check is run at
+            # THIS size: the same 158 cases, scored at a position known to be correct, put
+            # the seed patch at seed size below 0.60 on 11 % of CORRECT resumes and at the
+            # track's size on 7 %. Same patch, same position -- the size is the difference
+            # between refusing a good resume and keeping it.
+            try:
+                vscale = float(lb["w"]) / float(pat["w"]) if lb else 1.0
+            except (KeyError, TypeError, ZeroDivisionError):
+                vscale = 1.0
+            verify_ref[r["id"]] = (patch, offset, vscale, loc is not None)
+            jpatch, joffset = (loc if loc is not None else (patch, offset))
+            jobs.append({"id": r["id"], "patch": jpatch, "offset": joffset,
                          "radius": radius, "path": path})
 
         found = patmatch.find_reappearance(plate, jobs, min_match=min_match,
@@ -407,7 +443,8 @@ def job_reacquire(payload):
                         "tail_x": float(path[-1][1][0]),
                         "tail_y": float(path[-1][1][1]),
                         "reason": "swept frames %d-%d; nothing reached %.2f against the "
-                                  "pattern you set (best %s at frame %s). %s"
+                                  "feature as the track last saw it (best %s at frame "
+                                  "%s). %s"
                                   % (path[0][0], path[-1][0], min_match,
                                      "n/a" if best is None else "%.2f" % best,
                                      hit["best_frame"],
@@ -416,6 +453,39 @@ def job_reacquire(payload):
                     continue
                 f, x, y = int(hit["frame"]), float(hit["x"]), float(hit["y"])
                 score, first_frame = float(hit["score"]), hit["first_frame"]
+                locate_score = score
+                # Identity. Localisation has answered "the feature is HERE"; this answers
+                # "and it is the one you picked". Only a few pixels of slack -- the position
+                # is already a full-res correlation peak, so this is a second opinion on the
+                # same spot, not another search.
+                vp, voff, vscale, localised = verify_ref.get(r["id"], (None, None, 1.0, False))
+                if localised and vp is not None:
+                    vpatch = (patmatch._resized(vp, vscale)
+                              if abs(vscale - 1.0) > 0.02 else vp)
+                    got = None
+                    if vpatch is not None:
+                        got = patmatch.match(plate, f, vpatch, x, y,
+                                             radius=VERIFY_RADIUS, offset=voff)
+                    score = None if got is None else float(got[2])
+                    if score is None:
+                        # Cannot be judged -- the box does not fit at this size here. Say so
+                        # rather than passing an unchecked resume off as verified.
+                        score = locate_score
+                        unverified.append((r["id"], "your pattern box does not fit at the "
+                                                    "resumed position; localisation only"))
+                    elif score < min_match:
+                        misses.append({
+                            "id": r["id"], "score": round(score, 3), "best_frame": f,
+                            "searched": [int(path[0][0]), int(path[-1][0])],
+                            # Nothing to retry: the feature WAS found, and it is not the
+                            # one the artist picked. Another sweep finds the same thing.
+                            "retry": False,
+                            "reason": "found something at frame %d (localised %.2f) but "
+                                      "your own pattern only scores %.2f there, under "
+                                      "%.2f -- the track had most likely drifted off your "
+                                      "feature before it died"
+                                      % (f, locate_score, score, min_match)})
+                        continue
                 std = pattern_std.get(r["id"])
                 note = ("your pattern box has almost no contrast (std %.1f) -- the match "
                         "score cannot mean much here" % std) if (std is not None
@@ -427,6 +497,11 @@ def job_reacquire(payload):
                             "gap_frames": int(f - lg),
                             "occluded_frames": int(occluded),
                             "match_score": None if score is None else round(score, 3),
+                            # What localisation scored, with whatever patch it used. Kept
+                            # separate because `match_score` is the artist's own pattern and
+                            # is the one worth reading before confirming.
+                            "locate_score": (None if hit is None or hit.get("score") is None
+                                             else round(float(hit["score"]), 3)),
                             "first_match_frame": first_frame,
                             "scanned": scanned,
                             "match_note": note,

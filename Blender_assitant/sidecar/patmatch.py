@@ -185,7 +185,12 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
     where `path` is the guide's predicted position for EVERY frame after the failure, in
     frame order. The sweep walks those frames ONCE, decoding each frame a single time and
     testing every job still looking, and resolves a job at the FIRST frame whose correlation
-    against the artist's own patch reaches `min_match`.
+    against `patch` reaches `min_match`.
+
+    `patch` is the LOCALISATION reference and is normally the feature as the track last saw
+    it, not as it was seeded -- the caller decides. This function does not check identity;
+    finding where something is and deciding whether it is the right something are separate
+    questions, answered with different pictures. See `server.py`'s reacquire handler.
 
     First, not best. Best-over-the-whole-window would skip past a perfectly good return in
     favour of a marginally sharper frame fifty frames later, and every frame it skipped is a

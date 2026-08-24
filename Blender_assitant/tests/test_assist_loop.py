@@ -76,7 +76,10 @@ for i, (nx, ny) in enumerate(pts):
     x, y_down = nx * w, ny * h
     u, v = image_px_to_uv(x, y_down, w, h)
     tr = tracks.new(name="USER_%02d" % i, frame=1)
-    tr.motion_model = "Loc"; tr.use_brute = True; tr.use_normalization = True
+    # LocScale, matching the shipped operator default -- under `Loc` the pattern box never
+    # changes size, so `last_box` below would carry no information and this gate would test
+    # a configuration no artist runs.
+    tr.motion_model = "LocScale"; tr.use_brute = True; tr.use_normalization = True
     tr.correlation_min = 0.75; tr.frames_limit = 0; tr.pattern_match = "PREV_FRAME"
     m = tr.markers[0]; m.co = (u, v)
     track_core.set_geom(m, 21.0 * max(1.0, w / 1920.0), 41.0 * max(1.0, w / 1920.0), w, h)
@@ -135,15 +138,18 @@ for rnd in range(rounds + 1):
             continue
         s = seeds_px[tr.name]
         cont = continue_from.get(tr.name)
+        last_box = None
         if cont is not None and cont[0] > f1:
             lf, lx, ly, g = int(cont[0]), float(cont[1]), float(cont[2]), 1
         else:
             m = tr.markers.find_frame(f1, exact=True)
             lf, g = f1, gap
             lx, ly = marker_to_image_px(m, w, h)
+            bcx, bcy, bpw, bph = marker_pattern_box(m, w, h)
+            last_box = {{"frame": lf, "cx": bcx, "cy": bcy, "w": bpw, "h": bph}}
         reqs.append({{"id": tr.name, "query_frame": s[0], "query_x": s[1], "query_y": s[2],
                      "last_good_frame": lf, "last_good_x": lx, "last_good_y": ly,
-                     "gap": g, "pattern": patterns.get(tr.name),
+                     "gap": g, "pattern": patterns.get(tr.name), "last_box": last_box,
                      "search_px": search_px.get(tr.name, 0.0)}})
         log("  dead: %s spans %d..%d of %d%s"
             % (tr.name, f0, f1, n_frames,

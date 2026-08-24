@@ -653,6 +653,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # -- it is a place to look from, and the pattern check still rules on whatever
             # the look finds.
             cont = self._continue_from.get(tr.name)
+            last_box = None
             if cont is not None and cont[0] > f1:
                 lf, lx, ly = int(cont[0]), float(cont[1]), float(cont[2])
                 gap = 1
@@ -663,10 +664,17 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 lf = f1
                 lx, ly = marker_to_image_px(m, w, h)
                 gap = self.gap
+                # The box the track was CARRYING when it died, on the frame it died on.
+                # Under LocScale that is a per-frame measurement of what the feature looks
+                # like now -- which after 250 frames is a different thing from what it
+                # looked like when it was seeded. The sidecar localises with this and still
+                # checks identity against the seed box below.
+                bcx, bcy, bpw, bph = marker_pattern_box(m, w, h)
+                last_box = {"frame": lf, "cx": bcx, "cy": bcy, "w": bpw, "h": bph}
             reqs.append({"id": tr.name,
                          "query_frame": seed[0], "query_x": seed[1], "query_y": seed[2],
                          "last_good_frame": lf, "last_good_x": lx, "last_good_y": ly,
-                         "gap": gap,
+                         "gap": gap, "last_box": last_box,
                          # The artist's own pattern, so the sidecar can refuse a resume that
                          # is not this feature. Sent as a box, not as pixels -- the sidecar
                          # reads the plate off disk itself and nothing but JSON crosses.
