@@ -296,9 +296,14 @@ def classify_drift(score_ref, score_scaled, offset_px, scale,
                    min_match=0.60, margin=SCALE_MARGIN, band=CLEAN_BAND):
     """What does a swollen pattern box mean? Three answers, two of them actionable.
 
-      * `lost`    -- the artist's patch is not there at any size. The box grew because
-                     there was nothing holding it, and the frames it measured on the way
-                     are not worth keeping.
+      * `unknown` -- the artist's patch is not there at any size, which sounds like proof
+                     the track is lost and is not. It is the ABSENCE of evidence, and the
+                     two causes are indistinguishable from here: the tracker slid off, or
+                     the feature stopped looking like its seed frame. Measured on SH013
+                     (59.94 fps chase plate) the second is routine -- a foreground patch
+                     scores 0.53-0.72 against the NEXT frame, let alone against a seed
+                     fifty frames back -- and a correctly tracked feature reads exactly the
+                     same as a lost one. This verdict therefore does NOT delete anything.
       * `grown`   -- the patch matches BETTER when resized by the amount the box grew. The
                      feature really is approaching (or leaving) camera; the box is right and
                      only the baseline was wrong.
@@ -323,7 +328,12 @@ def classify_drift(score_ref, score_scaled, offset_px, scale,
     """
     scores = [s for s in (score_ref, score_scaled) if s is not None]
     if not scores or max(scores) < min_match:
-        return "lost"
+        # Absence of evidence. This used to return "lost" and the caller deleted every frame
+        # back to the swell onset -- measured on SH013 that cut a track which otherwise ran
+        # the whole 303-frame shot down to 5 markers, because the seed patch is simply not
+        # findable on that footage. Nothing here can tell "slid off" from "changed
+        # appearance", so nothing here may destroy frames.
+        return "unknown"
     if (score_scaled is not None and score_ref is not None
             and score_scaled - score_ref > margin):
         return "grown"

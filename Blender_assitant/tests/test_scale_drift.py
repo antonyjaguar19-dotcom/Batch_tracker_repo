@@ -10,7 +10,7 @@ blesses a tracker that has walked onto the background.
   * the box grew, the feature did not  -> bad-box, and the artist's own box still finds the
                                           feature exactly where it was
   * the box grew a little              -> clean; nothing is repaired over grain
-  * the feature is gone                -> lost, at any size
+  * the feature is gone                -> unknown (not findable at any size)
 
 The position the match reports is checked here too, but only to show the patch really did
 find the right thing -- it is NOT what the repair acts on. On a real plate a fixed patch
@@ -131,10 +131,10 @@ def main():
     # --- the feature is gone ------------------------------------------------------
     rep = patmatch.drift_report(plate, 1, seed_box, 4, 200.0, 240.0,
                                 (200.0, 240.0, 56.0, 56.0), radius=12.0)
-    check("a feature that is not there is lost", rep["verdict"] == "lost",
+    check("a feature that is not there is unknown", rep["verdict"] == "unknown",
           "%s (ref %.2f, scaled %.2f)" % (rep["verdict"], rep["score_ref"] or 0,
                                           rep["score_scaled"] or -1))
-    check("lost is not a near miss", max(rep["score_ref"] or -1,
+    check("unknown is not a near miss", max(rep["score_ref"] or -1,
                                          rep["score_scaled"] or -1) < 0.60,
           "best %.3f" % max(rep["score_ref"] or -1, rep["score_scaled"] or -1))
 
@@ -151,8 +151,10 @@ def main():
     # classify_drift is what the verdicts above come out of; these pin the boundaries so a
     # threshold cannot be moved by accident.
     cd = patmatch.classify_drift
-    check("both scores below the gate -> lost",
-          cd(0.55, 0.58, 0.2, 1.4, min_match=0.60) == "lost")
+    # "unknown", not "lost": both scores being low is the ABSENCE of evidence, and a
+    # verdict that deletes frames may not be reached that way. See patmatch.classify_drift.
+    check("both scores below the gate -> unknown",
+          cd(0.55, 0.58, 0.2, 1.4, min_match=0.60) == "unknown")
     check("scaled wins by more than the margin -> grown",
           cd(0.70, 0.90, 0.2, 1.4) == "grown")
     check("scaled wins by less than the margin -> not genuine",

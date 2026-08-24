@@ -1375,3 +1375,89 @@ another round of tuning that measurably does nothing.
 * `min_resume_len = 12` abandons a track whose resumed segment is shorter than 12 frames.
   On this plate 7-frame segments are normal, so the give-up rule is tuned against footage
   like this one. Untested either way.
+
+### The scale watch was deleting correct tracks (2026-08-24, SH013)
+
+Reported three times, and I kept measuring the wrong thing: *"still the track is not fully
+tracked"*. Every experiment above ran `track_core.track_job` directly. **The operator runs
+more than that**, and the difference is the whole answer.
+
+Same seed, same plate, same shipped settings, one flag:
+
+```
+watch_scale = 1     LIVE_01 live markers    5   (f1..f5)
+watch_scale = 0     LIVE_01 live markers  302   (f1..f302)
+```
+
+```
+[assist] LIVE_01 f54 lost: no match at any size -- 49 frame(s) from f6 dropped
+```
+
+A track that runs the entire 303-frame shot was cut to five markers by its own quality check.
+
+### Why
+
+`classify_drift` returned `lost` when neither the seed patch nor its resized copy reached
+`min_match`, and the operator's `lost` branch deleted every frame back to the swell onset. It
+was the only destructive verdict in the addon, and its justification was that a patch which
+is not there at any size is evidence the box grew onto nothing.
+
+**It is not evidence. It is the absence of evidence**, and the two causes are
+indistinguishable from inside that function:
+
+* the tracker slid off the feature, or
+* the feature stopped looking like its seed frame.
+
+On SH004, where the watch was built and validated, the second case does not arise — the seed
+patch stays findable for all 160 frames, so a low score really did mean the first. On SH013 it
+is routine: measured earlier in this file, a foreground patch scores **0.53-0.72 against the
+very next frame**, let alone against a seed fifty frames back. A perfectly tracked feature
+reads exactly like a lost one, and the destructive branch fires on both.
+
+The three `lost` verdicts that validated this on SH004 were real. They were also the only
+evidence, from the one plate where the failure mode cannot occur.
+
+### The fix
+
+`lost` becomes `unknown`, and `unknown` is handled the way the addon already handles a
+question it cannot ask — the `not chk.get("ok")` branch, whose comment already said the right
+thing: *"refusing to answer is not evidence against the track."* Keep every measured frame,
+stop watching that track, carry on from where it stopped.
+
+Nothing else about the watch changed. `bad-box` still resets a box that swelled onto the
+surroundings, `grown` still keeps a box that followed a feature approaching camera, `clean`
+still does nothing. Those three have positive evidence behind them; only the destructive one
+did not.
+
+`_rewind` is deleted with its last caller — it was the one function in the addon that removes
+markers, and nothing may reach it any more.
+
+### After, watch ON, as shipped
+
+| seed | region | markers |
+|---|---|---|
+| 0.50, 0.55 | midground | **302** of 303 (was 5) |
+| 0.20, 0.30 | background | 247, two `bad-box` repairs, one re-acquire at f254 |
+| 0.35, 0.62 | mid/fore | 32 — this one genuinely dies |
+
+The repairs still happen and still help: *"box was 0.62x yours and the feature was not (match
+0.85) -- box reset"*.
+
+### The lesson worth keeping
+
+A quality check validated on one plate had never met footage where its core assumption fails.
+It did not merely miss problems, it **destroyed correct work**, silently, and reported the
+destruction as a repair. Both defects found in 2026-08 were metrics measuring something other
+than what they read as; this is a third, and the most expensive, because a metric that only
+reports can be ignored while one that deletes cannot.
+
+Three earlier sessions of measurement on this complaint went into `track_job` in isolation and
+found nothing, because the fault was in the layer the harness did not exercise. **Test the
+thing the artist runs.**
+
+### What this does not settle
+
+* A track that genuinely slides onto the background is now kept rather than cut back. That is
+  the deliberate trade: the artist confirms re-acquires anyway, and no automatic deletion is
+  worth the case above. Unmeasured on SH004 whether those 3 tracks now survive as bad data.
+* Everything here is span. No accuracy number exists for SH013.

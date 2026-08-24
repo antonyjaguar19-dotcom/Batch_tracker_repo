@@ -686,25 +686,6 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
 
-    def _rewind(self, track, first, last):
-        """Delete the stretch measured by a box that was already growing.
-
-        `first` is the onset -- the frame after which the box never came back to the size
-        the artist set -- so the marker before it is the last one measured by the artist's
-        own box. Those frames are not missing data being invented away: they are positions
-        produced by a pattern that had stopped being the feature, and a gap is legal in 3DE
-        where a confident wrong number is not.
-        """
-        n = 0
-        for f in range(int(first), int(last) + 1):
-            if len(track.markers) <= 1:
-                break
-            m = track.markers.find_frame(f, exact=True)
-            if m is not None:
-                track.markers.delete_frame(f)
-                n += 1
-        return n
-
     def _apply_drift(self, context, data):
         """Act on each verdict. Four answers, and the track continues on three of them."""
         clip = self._clip
@@ -727,16 +708,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 # against the track.
                 rec["alive"], rec["no_watch"] = True, True
                 note = chk.get("reason", "not checked")
-            elif verdict == "lost":
-                # The artist's patch is not there at any size: the box grew because there
-                # was nothing holding it. Drop back to the last frame measured by the
-                # artist's own box and leave the track dead -- re-acquire now starts from a
-                # frame that can be trusted, which is the whole point of stopping early.
-                # This is the ONLY verdict that deletes anything, because it is the only one
-                # with evidence that the frames are not the feature.
-                cut = self._rewind(tr, onset, f)
-                rec["alive"] = False
-                note = "no match at any size -- %d frame(s) from f%d dropped" % (cut, onset)
+            elif verdict == "unknown":
+                # The patch is not findable at any size. That reads as proof the track is
+                # lost and is not: the tracker sliding off and the feature ceasing to look
+                # like its seed frame are indistinguishable from here. This used to delete
+                # every frame back to the onset, and on a 59.94 fps chase plate it cut a
+                # track that otherwise ran the whole 303-frame shot down to FIVE markers.
+                # Same rule as a question that cannot be asked: keep what was measured,
+                # stop watching this track, carry on from where it stopped.
+                rec["alive"], rec["no_watch"] = True, True
+                rec["seed_frame"] = f
+                note = ("no match at any size -- cannot tell drift from a change in "
+                        "appearance, so nothing was dropped and the watch is off here")
             elif verdict == "grown":
                 # The feature really did change size. The box is right and only the baseline
                 # was wrong, so keep the box and carry on from here.
