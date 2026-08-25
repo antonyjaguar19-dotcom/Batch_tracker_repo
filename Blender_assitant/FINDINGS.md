@@ -2241,3 +2241,62 @@ track and not the plate.
   better nearby" and passes.
 * It checks the LAST frame only. A track that wanders off and comes back would pass.
 * The probe costs one extra wide correlation per track per checked frame. Not profiled.
+
+### A feature approaching camera is not a feature lost (2026-08-25)
+
+The artist: *"when the track comes close to the camera and the feature perspective changes,
+the track is cut until where the track maintained the perspective shape."*
+
+The check working as written, and being wrong. A feature approaching camera stops resembling
+the patch taken when it was small and far away. Its score collapses in the same shape drift
+does, and nothing in `first_loss` could tell them apart — so it ended good tracks precisely
+where they start to matter.
+
+**What separates them is whether somewhere better exists.** A track still on its feature sits
+at the local optimum however far its score has fallen; a track that slid off has a much better
+answer a short distance away. Measured on the artist's SH006 pair, at each track's last frame:
+
+| | claimed position | best within 60 px | gain |
+|---|---|---|---|
+| drifted assist track, f95 | 0.501 | **0.979, 23 px away** | **0.478** |
+| artist's hand track, f250 | 0.731 | 0.786 | **0.055** |
+
+`hold_check` now probes for that better match — one extra correlation per frame — and **every
+cut requires it**. Two pinned test rows differ ONLY in that field, with identical scores and
+identical margins:
+
+```
+approaching camera: gain 0.02  ->  no cut
+drift:              gain 0.45  ->  cut at f44
+```
+
+### It closed a gap nothing else covered
+
+A **slow** slide onto a neighbour: gradual enough never to trip the fall test, on texture
+distinct enough never to trip the ambiguity test. Invisible to everything built so far.
+"A much better match sits 20 px away" needs no rate and no margin, so it is now its own
+trigger — guarded by the score having given way at all, so a healthy track with a marginally
+better neighbour is left alone.
+
+Reference 1 improved as a side effect: **43/47 -> 45/47 on feature (96 %), 0 off, 2 gaps.**
+The probe recovered two frames the ambiguity trigger had been over-cutting.
+
+### The CoTracker model, recorded because it was asked
+
+`weights/cotracker3_scaled_offline.pth` — **CoTracker3 scaled, offline**. 102 MB, 25.5 M
+parameters, 188 tensors, loaded as `CoTrackerPredictor(offline=True, v2=False, window_len=60)`.
+Not a lite variant, and none is installed.
+
+Offline is load-bearing rather than a preference: it sees the whole window at once, which is
+what produces the per-frame visibility that identified the occlusion at f13-24 and the return
+at f25. The online model streams and cannot. The CC-BY-NC licence noted in `cotrack.py` applies
+to this model.
+
+### What this does not settle
+
+* `PROBE_RADIUS = 60 px`. A track that slides further than that reads as "nothing better
+  nearby" and survives.
+* The probe costs one wide correlation per frame per track on top of the existing one. Still
+  not profiled.
+* The perspective case is pinned as a synthetic pair, not against footage of a feature actually
+  approaching camera. The artist reported it; no reference for it exists.

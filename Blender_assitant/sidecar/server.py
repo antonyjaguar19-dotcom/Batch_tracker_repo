@@ -246,8 +246,10 @@ def job_hold(payload):
             if not path_pts:
                 results.append({"id": r["id"], "lost_at": None, "reason": "no positions"})
                 continue
+            # Probing costs one extra correlation per frame and is what stops a feature
+            # that merely changed PERSPECTIVE from being cut as drift. Default on.
             scores = patmatch.hold_check(plate, patch, off, path_pts,
-                                         probe_radius=float(params.get("probe_radius", 0.0)))
+                                         probe_radius=float(params.get("probe_radius", 60.0)))
             lost = patmatch.first_loss(scores, floor=floor, drop=drop)
             got = [r[1] for r in scores if r[1] is not None]
             results.append({

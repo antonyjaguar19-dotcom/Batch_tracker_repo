@@ -416,7 +416,7 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
 
 
 def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=0.20,
-               ambig_margin=0.05, ambig_drop=0.85):
+               ambig_margin=0.05, ambig_drop=0.85, probe_gain=0.10):
     """The first frame where a track stopped being on the artist's feature.
 
     Two conditions, and the second is what keeps this honest on difficult footage. An
@@ -434,9 +434,11 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
 
     Returns the frame number, or None.
     """
-    # `scores` may be [(frame, score)] or [(frame, score, margin)].
-    scores = [(r[0], r[1], (r[2] if len(r) > 2 else None)) for r in scores]
-    good = [s for _f, s, _m in scores if s is not None]
+    # `scores` may be [(frame, score)], [(frame, score, margin)] or
+    # [(frame, score, margin, gain, distance)].
+    scores = [(r[0], r[1], (r[2] if len(r) > 2 else None),
+               (r[3] if len(r) > 3 else None)) for r in scores]
+    good = [s for _f, s, _m, _g in scores if s is not None]
     if not good:
         return None
     # The baseline comes from the track's FIRST `head` scored frames, not the median of all
@@ -450,7 +452,8 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
     # the wrong frames define what normal looks like -- and nothing can then fall below half
     # of it. The head of a track is the part anchored to the frame the artist seeded, which
     # is the only part known to be their feature.
-    head_scores = [s for _f, s, _m in scores if s is not None][:max(1, int(head))]
+    head_scores = [s for _f, s, _m, _g in scores
+                   if s is not None][:max(1, int(head))]
     base = sorted(head_scores)[len(head_scores) // 2]
     # And it has to be a FALL, not a slide. A feature going soft -- defocus, a light change,
     # a plate getting grainier -- declines gently and is still the artist's feature; an
@@ -461,9 +464,23 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
     recent = []
     bad_run = 0
     first_bad = None
-    for f, s, mg in scores:
+    for f, s, mg, gain in scores:
         if s is None:
             continue
+        # A score falling is not on its own a reason to cut. A feature approaching camera
+        # changes PERSPECTIVE -- it is the same feature, correctly tracked, and it stops
+        # resembling the patch taken when it was small and far away. Cutting there ends a
+        # good track exactly where it starts to matter.
+        #
+        # What separates that from drift is whether somewhere better exists. A track still on
+        # its feature sits at the local optimum however much its score has fallen; a track
+        # that slid off has a much better answer a short distance away. Measured on the
+        # artist's SH006 pair at the last frame of each: the drifted track scores 0.501 with
+        # 0.979 sitting 23 px away, their hand track scores 0.731 with only 0.786 available
+        # -- a gain of 0.478 against 0.055.
+        #
+        # `gain is None` means nobody looked, and then the older rules stand alone.
+        better_exists = (gain is None) or (gain > probe_gain)
         # AMBIGUITY. A margin this small means the plate itself cannot say which of two
         # places the feature is -- measured on SH006, a wire crossing the feature leaves two
         # candidates 52 px apart within 0.006 of each other. The margin alone cannot condemn
@@ -472,7 +489,27 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
         # position the track claims. Measured at f91-95 there: the drifting track scores
         # 0.80 -> 0.50 while the artist's own hand track holds 0.91 -> 0.89, with the same
         # margin. Both conditions, or neither.
-        if (mg is not None and mg < ambig_margin and s < base * ambig_drop):
+        # SOMEWHERE BETTER. The plainest statement of drift there is: the artist's patch
+        # matches far better a short distance from where the track claims to be. It needs no
+        # rate and no margin, which is what makes it the one rule that catches a SLOW slide
+        # onto a neighbour -- gradual enough never to trip the fall test, and on texture
+        # distinct enough never to trip the ambiguity test.
+        #
+        # Guarded by the score having given way at all, so a healthy track with a marginally
+        # better neighbour is left alone.
+        if (gain is not None and gain > probe_gain and s < base * ambig_drop):
+            bad_run += 1
+            if first_bad is None:
+                first_bad = f
+            if bad_run >= settle:
+                return first_bad
+            recent.append(s)
+            if len(recent) > look:
+                recent.pop(0)
+            continue
+
+        if (mg is not None and mg < ambig_margin and s < base * ambig_drop
+                and better_exists):
             bad_run += 1
             if first_bad is None:
                 first_bad = f
@@ -487,7 +524,7 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
         if recent:
             prev = sorted(recent)[len(recent) // 2]
             fell = s < prev - min_fall
-        if s < floor and s < base * drop and fell:
+        if s < floor and s < base * drop and fell and better_exists:
             bad_run += 1
             if first_bad is None:
                 first_bad = f

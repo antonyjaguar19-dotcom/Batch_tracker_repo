@@ -205,6 +205,16 @@ def main():
          + [(86, 0.951, 0.104), (87, 0.928, 0.067), (88, 0.949, 0.075), (89, 0.938, 0.065),
             (90, 0.859, 0.006), (91, 0.797, 0.006), (92, 0.725, 0.006),
             (93, 0.708, 0.032), (94, 0.621, 0.029), (95, 0.498, 0.037)], 91),
+        # PERSPECTIVE. A feature approaching camera stops resembling the patch taken when
+        # it was small and far away -- the score collapses exactly like drift does. What
+        # separates them is the fourth field: whether a better match exists nearby. These
+        # two rows are IDENTICAL in score and margin and differ only in that.
+        ("approaching camera: score collapses, nothing better nearby",
+         [(f, 0.95, 0.20, 0.01) for f in range(1, 40)]
+         + [(f, 0.90 - 0.03 * (f - 40), 0.18, 0.02) for f in range(40, 55)], None),
+        ("drift: the same collapse, but a better match sits nearby",
+         [(f, 0.95, 0.20, 0.01) for f in range(1, 40)]
+         + [(f, 0.90 - 0.03 * (f - 40), 0.18, 0.45) for f in range(40, 55)], 44),
         ("SH006 wire: the artist's own track, same margin, score holds",
          [(f, 0.95, 0.15) for f in range(1, 86)]
          + [(86, 0.951, 0.104), (87, 0.930, 0.067), (88, 0.954, 0.075), (89, 0.950, 0.065),
