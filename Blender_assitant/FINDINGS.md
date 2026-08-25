@@ -1634,3 +1634,48 @@ degenerate-box threshold (0.6-1.8x of seed) used to count failures is a reading 
 measured boundary. And the earlier scale-watch fix (`lost` -> `unknown`) means a collapsing box
 no longer gets cut back; the clamp is now what prevents the degenerate state instead, which is
 a better place to stop it but was not the reasoning at the time.
+
+### The addon's settings never reached the artist's own markers (2026-08-25, SH012)
+
+Found from a diagnostic report written by the artist -- the first time in this whole
+investigation that their actual scene could be read rather than approximated.
+
+The report showed a selected track carrying **`pattern_match = KEYFRAME`** while the clip's
+defaults said `PREV_FRAME`.
+
+`track_core.apply_settings` writes the clip's `default_*` settings, and Blender reads those
+when a track is **created**. A marker the artist placed earlier keeps whatever it was made
+with. The operator overrode `motion_model` per track -- with a comment making exactly the
+right argument, *"an artist's existing markers carry whatever model they were made with"* --
+and stopped there. `pattern_match`, `correlation_min`, `use_brute`, `use_normalization` and
+`frames_limit` were never applied.
+
+This project had already measured the cost. From `track_core.Opts`: KEYFRAME dies **2.6-2.9x
+more often** than PREV_FRAME on real plates, because it matches the seed patch forever while
+appearance drifts. The addon's whole measured configuration was being skipped on precisely
+the tracks an artist places by hand.
+
+Reproduced from the report's own numbers -- seed (1750, 731), 21 px pattern, 71 px search,
+SH012:
+
+| pattern_match | span | ends at | why it stopped |
+|---|---|---|---|
+| KEYFRAME (theirs) | **158** of 328 | f158, (1838, 725) | **82 px inside frame** -- died |
+| PREV_FRAME | **224** of 328 | f224, (1909, 708) | 11 px from edge -- left frame |
+
+`f158` and `82 px from edge` match the artist's report exactly, so this is their track, not
+something resembling it. **+42 % span, and the failure mode changes from dying mid-shot to
+running until the feature leaves the plate.**
+
+Every setting is now applied per track, and each change is printed:
+`[assist] Track: pattern_match KEYFRAME->PREV_FRAME`. Taking over an artist's settings
+silently is its own kind of wrong even when the change is right.
+
+The same report also showed **scene frame_end 250 against a 328-frame clip**. Not a tracking
+limit -- the operator uses `clip.frame_duration` -- but it decides what can be scrubbed, so a
+track running to f300 looks like it stopped at the end of the range. Now a panel warning.
+
+**What this does not settle:** the fix asserts the addon's configuration over the artist's on
+tracks they made themselves. That is consistent with `apply_settings`' stated intent
+("nothing here may be inherited") and it is now announced rather than silent, but an artist
+who deliberately chose KEYFRAME for a reason will be overruled.

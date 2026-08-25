@@ -61,6 +61,13 @@ def warnings_for(context, clip):
             out.append(("ERROR", "Proxy %s -- tracking precision is reduced" % size))
     if clip.filepath.startswith("//"):
         out.append(("INFO", "Clip path is relative to the .blend"))
+    # A scene range shorter than the clip is not a tracking limit here -- the operator uses
+    # `clip.frame_duration` -- but it decides what the artist can SEE and scrub, so a track
+    # that ran to frame 300 looks like it stopped at the end of the range. Seen in a real
+    # diagnostic report: scene end 250 against a 328-frame clip.
+    if context.scene.frame_end < clip.frame_duration:
+        out.append(("INFO", "Scene ends at %d but the clip is %d frames"
+                    % (context.scene.frame_end, clip.frame_duration)))
     if clip.frame_duration <= 1:
         out.append(("ERROR", "Clip reports %d frame -- is this a sequence?"
                     % clip.frame_duration))

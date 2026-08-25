@@ -360,11 +360,44 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._patterns[tr.name] = {"frame": fr[0], "cx": cx, "cy": cy,
                                        "w": pw, "h": ph}
             self._search_px[tr.name] = marker_search_px(m, w, h)
-            if self.animate_scale:
-                # Per track, not only as a scene default: an artist's existing markers carry
-                # whatever model they were made with, and a `Loc` track would silently opt
-                # out of the whole watch.
+            # Every tracking setting, per track -- not only as a clip default. This is the
+            # same argument `apply_settings` makes and it was only half applied: the clip's
+            # `default_*` settings are read when a track is CREATED, so a marker the artist
+            # placed earlier keeps whatever it was made with and the addon's measured
+            # configuration never reaches it.
+            #
+            # Found in a diagnostic report from a real session: a track carrying
+            # `pattern_match = KEYFRAME` while the clip default said PREV_FRAME. This
+            # project's own measurement (see `track_core.Opts`) is that KEYFRAME dies
+            # **2.6-2.9x more often** on real plates, because it matches the seed patch
+            # forever while appearance drifts. That track died at f158 with the feature 82 px
+            # inside the frame, and nothing in the addon had touched the setting responsible.
+            changed = []
+            if self.animate_scale and tr.motion_model != "LocScale":
+                # A `Loc` track would silently opt out of the whole scale watch.
+                changed.append("motion_model %s->LocScale" % tr.motion_model)
                 tr.motion_model = "LocScale"
+            if tr.pattern_match != self._opts.pattern_match:
+                changed.append("pattern_match %s->%s"
+                               % (tr.pattern_match, self._opts.pattern_match))
+                tr.pattern_match = self._opts.pattern_match
+            if abs(tr.correlation_min - self._opts.correlation) > 1e-4:
+                changed.append("correlation %.2f->%.2f"
+                               % (tr.correlation_min, self._opts.correlation))
+                tr.correlation_min = self._opts.correlation
+            if not tr.use_brute:
+                changed.append("brute on")
+                tr.use_brute = True
+            if not tr.use_normalization:
+                changed.append("normalization on")
+                tr.use_normalization = True
+            if tr.frames_limit:
+                changed.append("frames_limit %d->0" % tr.frames_limit)
+                tr.frames_limit = 0
+            if changed:
+                # Say what was taken over. Changing an artist's settings silently is its own
+                # kind of wrong, even when the change is right.
+                print("[assist] %s: %s" % (tr.name, ", ".join(changed)))
             self._records.append({"t": tr, "id": tr.name, "kind": "", "alive": True,
                                   "w": w, "h": h, "seed_frame": fr[0],
                                   "seed_pat": (float(pw), float(ph))})
