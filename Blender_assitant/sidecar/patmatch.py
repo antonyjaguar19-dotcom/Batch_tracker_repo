@@ -28,6 +28,8 @@ not only compared against a threshold: a run of near-threshold misses means the 
 wrong for that plate, and the artist can see it rather than guess.
 """
 
+import math
+
 import numpy as np
 
 
@@ -321,7 +323,49 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40,
     return out
 
 
-def hold_check(plate, patch, offset, path, radius=3.0):
+def peak_margin(img, patch, cx, cy, offset=(0.0, 0.0), radius=120.0, sep=30.0):
+    """How much better is the best match than the best OTHER match nearby?
+
+    A high correlation score means nothing on repeating texture. Measured on SH006, where a
+    thin wire crosses the feature and the track walks onto a lookalike 52 px away: the score
+    stays 0.90+ while the two candidates converge to within 0.006 of each other. At that
+    point the pixels do not determine the position and any answer is a coin toss.
+
+    `sep` keeps the runner-up from being the same peak one pixel over.
+
+    Returns (best, second, margin) or (best, None, None) when nothing is far enough away.
+    """
+    import cv2                                                        # noqa: PLC0415
+    if img is None:
+        return None, None, None
+    ih, iw = img.shape
+    ph, pw = patch.shape
+    r = max(1, int(round(radius)))
+    ccx, ccy = cx + offset[0], cy + offset[1]
+    x0 = int(round(ccx - pw / 2.0)) - r
+    y0 = int(round(ccy - ph / 2.0)) - r
+    x1, y1 = x0 + pw + 2 * r, y0 + ph + 2 * r
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(iw, x1), min(ih, y1)
+    if (x1 - x0) < pw or (y1 - y0) < ph:
+        return None, None, None
+    sc = cv2.matchTemplate(img[y0:y1, x0:x1], patch, cv2.TM_CCOEFF_NORMED)
+    if not np.isfinite(sc).any():
+        return None, None, None
+    sc = np.nan_to_num(sc, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    order = np.dstack(np.unravel_index(np.argsort(-sc, axis=None), sc.shape))[0]
+    by, bx = order[0]
+    best = float(sc[by, bx])
+    bxp, byp = x0 + bx + pw / 2.0, y0 + by + ph / 2.0
+    for yy, xx in order[1:]:
+        px, py = x0 + xx + pw / 2.0, y0 + yy + ph / 2.0
+        if math.hypot(px - bxp, py - byp) >= sep:
+            second = float(sc[yy, xx])
+            return best, second, best - second
+    return best, None, None
+
+
+def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0):
     """Score the artist's own patch at every position a track claims, in frame order.
 
     Blender tracks with PREV_FRAME: each frame is matched against the one before it. That is
@@ -347,14 +391,17 @@ def hold_check(plate, patch, offset, path, radius=3.0):
     for f, x, y in path:
         img = _gray(plate.frame(int(f) - 1))
         if img is None:
-            out.append((int(f), None))
+            out.append((int(f), None, None))
             continue
         got = match_in(img, patch, float(x), float(y), radius=radius, offset=offset)
-        out.append((int(f), None if got is None else float(got[2])))
+        _b, _s, mg = peak_margin(img, patch, float(x), float(y), offset=offset,
+                                 radius=margin_radius)
+        out.append((int(f), None if got is None else float(got[2]), mg))
     return out
 
 
-def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=0.20):
+def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=0.20,
+               ambig_margin=0.05, ambig_drop=0.85):
     """The first frame where a track stopped being on the artist's feature.
 
     Two conditions, and the second is what keeps this honest on difficult footage. An
@@ -372,7 +419,9 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
 
     Returns the frame number, or None.
     """
-    good = [s for _f, s in scores if s is not None]
+    # `scores` may be [(frame, score)] or [(frame, score, margin)].
+    scores = [(r[0], r[1], (r[2] if len(r) > 2 else None)) for r in scores]
+    good = [s for _f, s, _m in scores if s is not None]
     if not good:
         return None
     # The baseline comes from the track's FIRST `head` scored frames, not the median of all
@@ -386,7 +435,7 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
     # the wrong frames define what normal looks like -- and nothing can then fall below half
     # of it. The head of a track is the part anchored to the frame the artist seeded, which
     # is the only part known to be their feature.
-    head_scores = [s for _f, s in scores if s is not None][:max(1, int(head))]
+    head_scores = [s for _f, s, _m in scores if s is not None][:max(1, int(head))]
     base = sorted(head_scores)[len(head_scores) // 2]
     # And it has to be a FALL, not a slide. A feature going soft -- defocus, a light change,
     # a plate getting grainier -- declines gently and is still the artist's feature; an
@@ -397,9 +446,28 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
     recent = []
     bad_run = 0
     first_bad = None
-    for f, s in scores:
+    for f, s, mg in scores:
         if s is None:
             continue
+        # AMBIGUITY. A margin this small means the plate itself cannot say which of two
+        # places the feature is -- measured on SH006, a wire crossing the feature leaves two
+        # candidates 52 px apart within 0.006 of each other. The margin alone cannot condemn
+        # a track: it is a property of the PLATE and reads identically for a correct track
+        # and a drifting one at the same frame. What separates them is the score at the
+        # position the track claims. Measured at f91-95 there: the drifting track scores
+        # 0.80 -> 0.50 while the artist's own hand track holds 0.91 -> 0.89, with the same
+        # margin. Both conditions, or neither.
+        if (mg is not None and mg < ambig_margin and s < base * ambig_drop):
+            bad_run += 1
+            if first_bad is None:
+                first_bad = f
+            if bad_run >= settle:
+                return first_bad
+            recent.append(s)
+            if len(recent) > look:
+                recent.pop(0)
+            continue
+
         fell = True
         if recent:
             prev = sorted(recent)[len(recent) // 2]

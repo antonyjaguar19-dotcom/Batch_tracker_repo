@@ -248,7 +248,7 @@ def job_hold(payload):
                 continue
             scores = patmatch.hold_check(plate, patch, off, path_pts)
             lost = patmatch.first_loss(scores, floor=floor, drop=drop)
-            got = [s for _f, s in scores if s is not None]
+            got = [r[1] for r in scores if r[1] is not None]
             results.append({
                 "id": r["id"],
                 "lost_at": lost,
@@ -256,13 +256,17 @@ def job_hold(payload):
                 "score_first": round(got[0], 3) if got else None,
                 "score_last": round(got[-1], 3) if got else None,
                 "score_median": round(sorted(got)[len(got) // 2], 3) if got else None,
-                "scores": [[f, (None if s is None else round(s, 3))] for f, s in scores],
+                "scores": [[r[0], (None if r[1] is None else round(r[1], 3)),
+                            (None if len(r) < 3 or r[2] is None else round(r[2], 3))]
+                           for r in scores],
             })
             if lost:
-                job.say("%s: left your feature at f%d (was %.2f, became %.2f)"
-                        % (r["id"], lost,
-                           got[0] if got else 0.0,
-                           next((s for f, s in scores if f == lost and s is not None), 0.0)))
+                at = next((r for r in scores if r[0] == lost), None)
+                job.say("%s: left your feature at f%d (was %.2f, became %.2f, margin %s)"
+                        % (r["id"], lost, got[0] if got else 0.0,
+                           (at[1] if at and at[1] is not None else 0.0),
+                           ("%.3f" % at[2]) if at and len(at) > 2 and at[2] is not None
+                           else "n/a"))
         n = sum(1 for r in results if r.get("lost_at"))
         job.say("%d of %d track(s) drifted off the feature" % (n, len(results)))
         return {"tracks": results}

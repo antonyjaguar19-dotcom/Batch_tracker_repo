@@ -863,8 +863,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             print("[assist] %s stopped being your feature at f%d (was %.2f, became %.2f) "
                   "-- %d frame(s) of drift removed, re-acquire takes it from here"
                   % (res["id"], lost, res.get("score_first") or 0.0,
-                     next((sc for f, sc in (res.get("scores") or [])
-                           if f == lost and sc is not None), 0.0), len(gone)))
+                     next((r[1] for r in (res.get("scores") or [])
+                           if r[0] == lost and r[1] is not None), 0.0), len(gone)))
 
     # ---------------------------------------------------------------- scale drift
 

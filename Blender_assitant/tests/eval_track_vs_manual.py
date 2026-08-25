@@ -80,10 +80,21 @@ def main():
                     help="beyond this the marker is on something else, not merely imprecise. "
                          "A wrong-feature landing measures in the hundreds; a human clicking "
                          "4K frames disagrees by a few")
+    ap.add_argument("--track", default="",
+                    help="which track in the manual file (default: the first)")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 
-    name, pts = read_3de(a.manual)[0]
+    all_tracks = read_3de(a.manual)
+    if a.track:
+        hit = [t for t in all_tracks if t[0] == a.track]
+        if not hit:
+            log("no track named %r -- file has %s"
+                % (a.track, ", ".join(t[0] for t in all_tracks)))
+            sys.exit(2)
+        name, pts = hit[0]
+    else:
+        name, pts = all_tracks[0]
     clip = bpy.data.movieclips.load(os.path.abspath(a.plate))
     w, h = clip.size
     truth = {f: (x, h - y) for f, x, y in pts}          # 3DE y-UP -> image y-DOWN
@@ -243,10 +254,20 @@ def main():
     # Disagreeing with a human click by a few px on a 3840-wide plate is PRECISION, and the
     # reference has its own noise at that scale. They are reported apart and only the first
     # fails the gate.
+    # Only frames the reference actually COVERS can be judged. A hand track that stops at
+    # f250 says nothing about f251 -- counting those as wrong measures where the artist
+    # stopped clicking, not where the tracker went. Inside the range, a missing sample IS
+    # meaningful: it is a frame the artist deliberately left out because the feature was
+    # hidden, and a marker there is on something else.
+    lo_t, hi_t = min(truth), max(truth)
+    beyond = 0
     errs = []
     pairs = []
     off_feature = []
     for f, (x, y) in sorted(ours.items()):
+        if f < lo_t or f > hi_t:
+            beyond += 1
+            continue
         if f not in truth:
             off_feature.append((f, None))
             continue
@@ -290,6 +311,9 @@ def main():
         log("    f%-4d %s" % (f, "hand track has no sample -- occluded" if e is None
                               else "%.0f px out" % e))
     log("MISSED (left as a gap)     : %d" % missed)
+    if beyond:
+        log("beyond the reference       : %d frame(s) past f%d, not judged"
+            % (beyond, hi_t))
     if gave_up:
         log("NOTE: the loop gave up early on min_resume_len")
     log("TRACK vs HAND TRACK: %s" % ("FAIL" if off_feature else "PASS"))

@@ -196,6 +196,20 @@ def main():
          [(f, max(0.45, 0.95 - 0.02 * f)) for f in range(1, 30)], None),
         ("occlusion late in a long healthy track",
          [(f, 0.9) for f in range(1, 100)] + [(f, 0.15) for f in range(100, 110)], 100),
+        # Ambiguity: a wire crosses the feature and a lookalike 52 px away becomes as good
+        # an answer. Measured on SH006. The margin alone is a property of the PLATE and
+        # reads the same for a correct track and a drifting one, so both conditions must
+        # hold -- a tight margin AND a score that has given way at the claimed position.
+        ("SH006 wire: drifting track, tight margin AND falling score",
+         [(f, 0.95, 0.15) for f in range(1, 86)]
+         + [(86, 0.951, 0.104), (87, 0.928, 0.067), (88, 0.949, 0.075), (89, 0.938, 0.065),
+            (90, 0.859, 0.006), (91, 0.797, 0.006), (92, 0.725, 0.006),
+            (93, 0.708, 0.032), (94, 0.621, 0.029), (95, 0.498, 0.037)], 91),
+        ("SH006 wire: the artist's own track, same margin, score holds",
+         [(f, 0.95, 0.15) for f in range(1, 86)]
+         + [(86, 0.951, 0.104), (87, 0.930, 0.067), (88, 0.954, 0.075), (89, 0.950, 0.065),
+            (90, 0.902, 0.006), (91, 0.906, 0.006), (92, 0.893, 0.006),
+            (93, 0.931, 0.032), (94, 0.911, 0.029), (95, 0.886, 0.037)], None),
     ):
         check("hold: %s" % name, fl(scores) == expect,
               "got %s, expected %s" % (fl(scores), expect))

@@ -2081,3 +2081,94 @@ steps. Not built, not measured.
   landing further out than that keeps its bias.
 * 2.4 px of offset remains and is attributed to the artist's click vs the correlator. That is
   an inference from run 1, not a measurement of either.
+
+### A wire crossed the feature and a high score meant nothing (2026-08-25, SH006 Track.002)
+
+The artist: *"a thin wire across the street crosses the pattern and the track drifts along
+with the wire, but the pattern I gave is still in the frame."* Then they hand-tracked the same
+feature for **250 frames** — the longest reference this project has, and the first that
+reaches past f64 at all.
+
+Measured, assist against hand track:
+
+```
+f1-65    err ~4.3 px      f85   1.48 px
+f70-85   err 1.2-1.5 px   f90   6.66 px
+                          f93  10.64 px     first over 10
+                          f95  12.64 px
+```
+
+The divergence starts around **f88**, not f77 — the wire crosses at 77, the consequence
+arrives ten frames later.
+
+**Nothing already built could see it.** Three probes, all clean at f77:
+
+| test | at f77 | what it would show |
+|---|---|---|
+| seed patch NCC | 0.976 | wrong feature -> low |
+| correlation-surface shape (PREV_FRAME) | ratio 0.55, localised | a wire ridge -> <0.15 |
+| motion jump | steps 9-12 px | a jump -> 3x the median |
+
+The aperture hypothesis was wrong: neither the seed template nor the PREV_FRAME template
+produces a ridge. The score then declines gradually, which `first_loss` deliberately exempts
+as the defocus case.
+
+**What did move: a lookalike 52 px away.** The margin between the best match and the best
+other match collapses — 0.132 at f77, 0.073 at f85, **0.006 at f90**. On repeating texture a
+high score means nothing, because there are two equally good answers.
+
+### The margin alone cannot condemn a track
+
+Checked against the artist's own hand track, and this is why their file mattered: at f91
+**both** tracks see a margin of 0.006. It is a property of the PLATE, not of the tracker.
+Cutting on it alone would have cut their own correct work — and would also have fired at f10
+of the other hand-tracked feature, where the margin is 0.048 at a perfectly good position.
+
+What separates them is the score at the position each track CLAIMS:
+
+| frame | assist NCC | hand-track NCC | margin |
+|---|---|---|---|
+| f91 | **0.797** | 0.906 | 0.006 |
+| f93 | **0.708** | 0.931 | 0.032 |
+| f95 | **0.498** | 0.886 | 0.037 |
+
+So the trigger is both or neither: `margin < 0.05` **and** score below `0.85x` the baseline
+the track set at its own head. That cuts the drifting track at f91 and leaves the artist's
+alone. Both are pinned in `tests/test_scale_drift.py`.
+
+### Result on both references
+
+| | reference 1 (2 occlusions, 47 frames) | reference 2 (wire, 250 frames) |
+|---|---|---|
+| on the feature | 43 (91 %) | **235 (94 %)** |
+| off the feature | **0** | **0** |
+| gaps | 4 | 15 |
+| precision p50 | 4.1 px | **0.8 px** |
+| constant offset | 2.5 px | **0.8 px** |
+
+The wire track now reaches f255. The artist's own assist output for the same feature died at
+f95 with 12.6 px of error.
+
+Reference 1 lost two frames to gaps (45 -> 43) when the ambiguity trigger went in. Frames
+turning into honest gaps rather than wrong data is the trade that was asked for.
+
+### Two bugs found on the way, both mine
+
+* `peak_margin` used `math.hypot` and `patmatch.py` never imported `math`. `hold_check` threw,
+  the sidecar returned an error, the operator's fallback carried on WITHOUT cutting, and
+  reference 1 silently regressed to 29 off-feature frames. **Every unit test still passed**,
+  because they feed `first_loss` synthetic tuples and never call `hold_check` — the same shape
+  as the panel test that never reached the branch holding a bad icon. The check existed and
+  did not touch the code path.
+* The harness counted frames past the reference's LAST frame as off-feature. A hand track that
+  stops at f250 says nothing about f251; that measured where the artist stopped clicking.
+  Inside the range a missing sample still counts — that is a frame deliberately left out
+  because the feature was hidden, so a marker there is on something else.
+
+### What this does not settle
+
+* One wire, one track. `ambig_margin = 0.05` and `ambig_drop = 0.85` separate cleanly here —
+  0.797 against 0.906 — but that is one crossing.
+* The margin costs a wide correlation per frame per track, on top of the existing one. Not
+  profiled.
+* 15 gaps on reference 2 are unexamined; some may be recoverable with a smaller `gap`.
