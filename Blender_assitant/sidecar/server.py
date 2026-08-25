@@ -596,6 +596,7 @@ def job_reacquire(payload):
                             "first_match_frame": None,
                             "scanned": int(hit["scanned"]),
                             "verified": False,
+                            "candidates": hit.get("candidates") or [],
                             "match_note": ("your pattern only reaches %.2f here, under the "
                                            "%.2f you set -- CoTracker says the feature is "
                                            "visible, so this is its best guess for you to "
@@ -681,6 +682,9 @@ def job_reacquire(payload):
                             "first_match_frame": first_frame,
                             "scanned": scanned,
                             "verified": True,
+                            # Alternatives, so a wrong landing costs a keypress instead of
+                            # the track. The best is what `frame`/`x`/`y` already hold.
+                            "candidates": hit.get("candidates") or [],
                             "match_note": note,
                             "pattern_std": None if pattern_std.get(r["id"]) is None
                                            else round(pattern_std[r["id"]], 2),

@@ -69,6 +69,13 @@ class FakeSelf:
         self.went = "done:%s" % why
         return {"FINISHED"}
 
+    def _place_candidate(self, a):
+        # The real one re-plants a marker; the rule under test is which candidate is chosen.
+        self.placed = (a["id"], a["alts"][a["alt_i"]]["frame"])
+
+    def report(self, level, msg):
+        self.reported = (level, msg)
+
     def _drop_resume(self, name, frame):
         self.dropped.append((name, frame))
         for r in self._records:
@@ -139,14 +146,42 @@ def main():
     else:
         log("%-30s ok" % "last drop ends the run")
 
-    # 7. SPACE must NOT accept. Pinned separately because it used to.
+    # 7. N cycles to the next candidate, and says so when there is only one rather than
+    #    silently doing nothing -- an artist pressing it needs to know it was heard.
+    s = FakeSelf(ops_assist.CLIP_OT_btr_assist_track, two)
+    s._awaiting[0]["alts"] = [{"frame": 10, "x": 1.0, "y": 2.0, "score": 0.8},
+                              {"frame": 25, "x": 3.0, "y": 4.0, "score": 0.7}]
+    s._awaiting[0]["alt_i"] = 0
+    r = tick(s, None, Event("N"))
+    if s._awaiting[0].get("alt_i") != 1 or s.went != "show":
+        fail("N did not move to the next candidate: alt_i=%r went=%s"
+             % (s._awaiting[0].get("alt_i"), s.went))
+    else:
+        log("%-30s ok" % "N cycles to the next match")
+    # Wraps rather than falling off the end.
+    tick(s, None, Event("N"))
+    if s._awaiting[0].get("alt_i") != 0:
+        fail("N did not wrap: alt_i=%r" % (s._awaiting[0].get("alt_i"),))
+    else:
+        log("%-30s ok" % "N wraps back to the first")
+    # A single candidate must not be dropped or advanced.
+    s2 = FakeSelf(ops_assist.CLIP_OT_btr_assist_track, two)
+    s2._awaiting[0]["alts"] = [{"frame": 10, "x": 1.0, "y": 2.0, "score": 0.8}]
+    s2._awaiting[0]["alt_i"] = 0
+    r = tick(s2, None, Event("N"))
+    if r != {"RUNNING_MODAL"} or len(s2._awaiting) != 2 or s2.went is not None:
+        fail("N with one candidate changed state: %r went=%s" % (r, s2.went))
+    else:
+        log("%-30s ok" % "N with one candidate is a no-op")
+
+    # 8. SPACE must NOT accept. Pinned separately because it used to.
     s = FakeSelf(ops_assist.CLIP_OT_btr_assist_track, two)
     if tick(s, None, Event("SPACE")) != {"PASS_THROUGH"} or len(s._awaiting) != 2:
         fail("SPACE still accepts -- it is playback")
     else:
         log("%-30s ok" % "SPACE is playback, not accept")
 
-    if ops_assist.ANSWER_KEYS != frozenset(("RET", "NUMPAD_ENTER", "D", "A")):
+    if ops_assist.ANSWER_KEYS != frozenset(("RET", "NUMPAD_ENTER", "D", "A", "N")):
         fail("ANSWER_KEYS changed: %r" % (ops_assist.ANSWER_KEYS,))
 
     log("CONFIRM KEYS: %s" % ("FAIL" if FAILURES else "PASS"))

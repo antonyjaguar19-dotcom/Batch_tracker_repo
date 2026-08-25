@@ -1755,3 +1755,63 @@ not, and an occlusion at f100 of a long healthy track does.
   turning, a light change -- has not been tested and is exactly where this would cut wrongly.
 * The check runs once per pass, over the whole track, so drift is tracked before it is
   removed. Frame-exact detection during tracking would need the check inside the loop.
+
+### One answer was not enough: N cycles the candidates (2026-08-25, SH006)
+
+The artist checked the resume the loop proposed -- frame 17 -- and confirmed by eye that it
+was **the wrong feature**, while the real reappearance was frame 25. Their suggestion, and it
+is the right shape: snap to the best match, then let them press a key for the next one.
+
+The alternatives existed and were being discarded twice over.
+
+**First, the sweep stopped looking.** `find_reappearance` resolves at the first frame over
+`min_match` plus `settle`, then marks the job done. On this track that was frames 17-21, so
+frame 25 was never scored at all. It now keeps SCORING for `collect` frames past the
+crossing -- those frames cannot change the answer, only fill the candidate list.
+
+**Second, every score was thrown away.** The sweep computed a correlation for every frame it
+looked at and kept only the best. `top_candidates` now keeps the best few, each at least
+`min_gap` frames from the others so the list spans the window instead of returning six frames
+of the same peak.
+
+Measured on the artist's own seed, through the real operator:
+
+```
+LIVE_01: 6 candidate(s) to cycle with N --
+   f17(0.84), f26(0.99), f29(0.98), f45(0.95), f42(0.95), f48(0.94)
+```
+
+The wrong landing they found is candidate 1. **f26 at 0.99 is one keypress away**, against
+the frame 25 they report by eye.
+
+In the confirm phase: `ENTER` accepts, **`N` cycles to the next candidate** (wrapping, so
+cycling past the right one comes back to it), `D` drops, `A` accepts the rest, `ESC` stops.
+The prompt shows `[2/6]` so the artist knows where they are in the list. Choosing a candidate
+re-plants the marker at that frame and position, keeping the artist's own box.
+
+### A rule that was nearly changed by accident
+
+Scoring past the crossing initially let a later, higher-scoring frame win the resume itself --
+the proposal moved from f17/0.84 to f26/0.97, which is the *right answer* on this shot. It is
+also **best-over-the-window**, a different rule from the documented "first over the line, not
+best", whose stated reason is that skipping frames costs the artist hand-tracking.
+
+Reverted: only the `settle` frames may improve the answer, and the collect frames feed
+candidates only. Getting a better result is not a reason to change a decided rule silently,
+and one shot is not enough to overturn it -- but the evidence is now recorded, because it is
+the only measurement this project has that bears on it:
+
+| | frame | score | artist's verdict |
+|---|---|---|---|
+| first over the line (shipped) | 17 | 0.84 | **wrong feature** |
+| best over 45 frames | 26 | 0.97 | matches their observed f25 |
+
+If that holds on more shots, the default is worth revisiting. It needs more than one.
+
+### What this does not settle
+
+* One artist verdict on one occlusion. Whether the best-scoring candidate is usually right is
+  unmeasured, and the match score is already known NOT to predict landing accuracy.
+* `collect = 40` frames of extra scoring costs decode time on every re-acquire, unmeasured.
+* Candidates are ranked by score. Given the score does not predict accuracy, an artist may
+  still have to walk the whole list -- the ordering is a convenience, not a claim.

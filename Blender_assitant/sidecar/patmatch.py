@@ -175,7 +175,7 @@ def best_candidate(plate, patch, offset, candidates, radius=32.0):
     return best[0], best[1], best[2], best[3], tried
 
 
-def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
+def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40, on_status=None):
     """When does each feature come back, and where?
 
     This is the answer to "Blender lost it -- skip ahead to where it is again". Each job is
@@ -201,14 +201,17 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
     Jobs are processed in whatever order they are given and share the decode, so the cost is
     one pass over the window regardless of how many tracks are looking.
 
+    `collect` frames keep being scored AFTER a job resolves, so the alternatives in
+    `candidates` reach past the first crossing. They do not affect which frame is returned.
+
     Returns {id: {"frame", "x", "y", "score", "first_frame", "scanned", "best_seen",
-                  "best_frame"}} -- `frame` is None when the feature never came back, and
-    the `best_*` fields say how close it got, which is what makes a refusal readable.
+                  "best_frame", "candidates"}} -- `frame` is None when the feature never came
+    back, and the `best_*` fields say how close it got, which makes a refusal readable.
     """
     say = on_status or (lambda m: None)
     state = {}
     for j in jobs:
-        state[j["id"]] = {"job": j, "path": dict(j["path"]), "done": False,
+        state[j["id"]] = {"job": j, "path": dict(j["path"]), "done": False, "seen": [], "collect_left": int(collect),
                           "frame": None, "x": None, "y": None, "score": None,
                           "first_frame": None, "settle_left": 0, "scanned": 0,
                           "best_seen": -1.0, "best_frame": None,
@@ -239,6 +242,10 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
             if got is None:
                 continue
             x, y, sc = got
+            # Every frame that was scored, kept. The sweep already did this work and threw
+            # it away, which is why a refused resume used to leave an artist with one wrong
+            # answer and no second opinion. See `top_candidates`.
+            s["seen"].append((int(f), float(x), float(y), float(sc)))
             if sc > s["best_seen"]:
                 s["best_seen"], s["best_frame"] = sc, int(f)
                 s["best_x"], s["best_y"] = x, y
@@ -251,11 +258,26 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
                 s["frame"], s["x"], s["y"], s["score"] = int(f), x, y, sc
                 s["settle_left"] = int(settle)
                 continue
-            if sc > s["score"]:
+            # Only the SETTLE frames may improve the answer. The collect frames after them
+            # exist to fill `candidates` and must not quietly turn this into
+            # best-over-the-window -- that is a different rule with a documented reason
+            # against it, and changing it by accident is how a behaviour nobody chose ships.
+            if s["settle_left"] > 0 and sc > s["score"]:
                 s["frame"], s["x"], s["y"], s["score"] = int(f), x, y, sc
             s["settle_left"] -= 1
             if s["settle_left"] <= 0:
-                s["done"] = True
+                # Resolved -- but keep SCORING for a while. The first crossing is the answer
+                # this function returns, and it is not always the right one: measured on
+                # SH006 the sweep resolved at frame 17 and the artist confirmed by eye that
+                # it was the wrong feature, while the real reappearance was frame 25. Stopping
+                # at the crossing meant 25 was never scored and could not be offered as an
+                # alternative. These extra frames change nothing about the resume; they exist
+                # so `top_candidates` has somewhere else to point.
+                if s["collect_left"] > 0:
+                    s["collect_left"] -= 1
+                else:
+                    s["done"] = True
+                s["settle_left"] = 0
         if all(s["done"] for s in state.values()):
             break
 
@@ -265,7 +287,8 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
                   "first_frame": s["first_frame"], "scanned": s["scanned"],
                   "best_seen": None if s["best_seen"] < -0.5 else float(s["best_seen"]),
                   "best_frame": s["best_frame"],
-                  "best_x": s["best_x"], "best_y": s["best_y"]}
+                  "best_x": s["best_x"], "best_y": s["best_y"],
+                  "candidates": top_candidates(s["seen"])}
     return out
 
 
@@ -354,6 +377,34 @@ SCALE_MARGIN = 0.05
 #: scale of p50 0.97, p90 1.08, p99 1.33 -- so 1.25 keeps the ordinary breathing of a
 #: healthy track out of the "bad-box" bucket.
 CLEAN_BAND = 1.25
+
+
+def top_candidates(seen, k=6, min_gap=3, floor=0.2):
+    """The best few places the feature might be, as alternatives to offer the artist.
+
+    A re-acquire lands on the wrong feature often enough that one answer is not enough --
+    measured on SH006, the top match was frame 17 and the artist confirmed by eye that it was
+    the wrong feature entirely, while the real reappearance was frame 25. The sweep had
+    already scored frame 25; nothing kept it.
+
+    `min_gap` stops the list being six frames of the same peak: adjacent frames of one
+    reappearance score almost identically and would fill every slot with the same answer.
+    Candidates are taken best-first, each at least `min_gap` frames from every one already
+    taken, so the list spans the window instead of clustering.
+
+    Ranked by score, NOT by frame. The artist is choosing between places, and the most
+    likely one should be the first thing they see.
+    """
+    out = []
+    for f, x, y, sc in sorted(seen, key=lambda r: -r[3]):
+        if sc < floor:
+            break
+        if any(abs(f - g) < min_gap for g, _x, _y, _s in out):
+            continue
+        out.append((int(f), float(x), float(y), float(sc)))
+        if len(out) >= k:
+            break
+    return [{"frame": f, "x": x, "y": y, "score": round(sc, 3)} for f, x, y, sc in out]
 
 
 def _resized(patch, scale, min_side=7, max_side=512):

@@ -100,7 +100,11 @@ SOFT_SEED_STD = 8.0
 #: SPACE used to accept, and is deliberately gone: it is playback. Now that navigation
 #: passes through, an artist pressing it to watch the motion would have silently accepted
 #: the proposal instead of looking at it.
-ANSWER_KEYS = frozenset(("RET", "NUMPAD_ENTER", "D", "A"))
+#:
+#: N cycles to the next candidate. One answer is not enough: measured on SH006 the top match
+#: was frame 17, the artist confirmed by eye that it was the wrong feature entirely, and the
+#: real reappearance was frame 25 -- which the sweep had already scored and nothing kept.
+ANSWER_KEYS = frozenset(("RET", "NUMPAD_ENTER", "D", "A", "N"))
 
 
 def _clip(context):
@@ -1151,10 +1155,12 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tr.select_search = on
         self._phase = "confirm"
         score = "n/a" if a["score"] is None else "%.2f" % a["score"]
+        alts = a.get("alts") or []
+        nth = ("  [%d/%d]" % (a.get("alt_i", 0) + 1, len(alts))) if len(alts) > 1 else ""
         kind = "NOT VERIFIED, your call" if a.get("unverified") else "match %s" % score
-        msg = ("%s found again at frame %d (%s) -- ENTER track on   "
+        msg = ("%s found again at frame %d (%s)%s -- ENTER track on   N next match   "
                "D drop   A accept all %d   ESC stop"
-               % (a["id"], a["frame"], kind, len(self._awaiting)))
+               % (a["id"], a["frame"], kind, nth, len(self._awaiting)))
         self._status(context, msg)
         # ...and in the editor itself. The status bar alone is why this phase was mistaken
         # for a hang. Navigation still works while this is up.
@@ -1162,10 +1168,42 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                       % (a["id"], a["frame"],
                          ("pattern only reached %s -- NOT verified, your call" % score)
                          if a.get("unverified") else "match %s" % score),
-                      "ENTER  track on      D  drop      A  accept all %d      ESC  stop"
-                      % len(self._awaiting),
+                      ("ENTER  track on      N  next match%s      D  drop      "
+                       "A  accept all %d      ESC  stop") % (nth, len(self._awaiting)),
                       "zoom and pan as normal -- nothing is frozen"])
         return {"RUNNING_MODAL"}
+
+    def _place_candidate(self, a):
+        """Move this track's proposed resume onto candidate `alt_i`, keeping the artist's box.
+
+        Re-planted rather than nudged: a candidate is a different FRAME as well as a different
+        position, so the old marker has to go or the track carries two heads.
+        """
+        rec = next((r for r in self._records if r["id"] == a["id"]), None)
+        if rec is None:
+            return
+        tr = rec["t"]
+        w, h = self._clip.size
+        old_m = tr.markers.find_frame(int(a["frame"]), exact=True)
+        geom = None
+        if old_m is not None:
+            geom = (tuple(tuple(c) for c in old_m.pattern_corners),
+                    tuple(old_m.search_min), tuple(old_m.search_max))
+            if len(tr.markers) > 1:
+                tr.markers.delete_frame(int(a["frame"]))
+        cand = a["alts"][a["alt_i"]]
+        u, v = image_px_to_uv(float(cand["x"]), float(cand["y"]), w, h)
+        m = tr.markers.insert_frame(int(cand["frame"]), co=(u, v))
+        m.mute = False
+        if geom is not None:
+            m.pattern_corners, m.search_min, m.search_max = geom
+        a["frame"] = int(cand["frame"])
+        a["score"] = cand.get("score")
+        rec["seed_frame"] = int(cand["frame"])
+        # Keep the report honest: this track resumed HERE, not where it was first proposed.
+        fr = self._resumed.get(a["id"])
+        if fr:
+            fr[-1] = int(cand["frame"])
 
     def _drop_resume(self, name, frame):
         """Delete the proposed segment and stop re-acquiring that track."""
@@ -1190,6 +1228,17 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             return {"RUNNING_MODAL"}     # swallow the release of a key we consumed
         if key in ("RET", "NUMPAD_ENTER"):
             self._awaiting.pop(0)
+        elif key == "N":
+            # Next candidate for THIS track. Wraps, so cycling past the right one comes back
+            # to it rather than costing the track to a mis-key.
+            a = self._awaiting[0]
+            alts = a.get("alts") or []
+            if len(alts) < 2:
+                self.report({"INFO"}, "no other candidate for %s" % a["id"])
+                return {"RUNNING_MODAL"}
+            a["alt_i"] = (a["alt_i"] + 1) % len(alts)
+            self._place_candidate(a)
+            return self._show_current(context)
         elif key == "D":
             a = self._awaiting.pop(0)
             self._drop_resume(a["id"], a["frame"])
@@ -1246,19 +1295,37 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # the pattern check could not vouch for it, so the one thing that must not happen
             # is it being taken on the artist's behalf.
             unverified = res.get("verified") is False
+            # Alternatives, so a wrong landing costs a keypress instead of the track.
+            # The proposal the sidecar chose goes FIRST, then the alternatives by score.
+            # N should walk away from what is already on screen, not jump somewhere else on
+            # the first press.
+            planted = {"frame": int(res["frame"]), "x": float(res["x"]),
+                       "y": float(res["y"]), "score": res.get("match_score")}
+            alts = [planted] + [c for c in (res.get("candidates") or [])
+                                if int(c.get("frame", -1)) != planted["frame"]]
+            if not alts:
+                alts = [{"frame": int(res["frame"]), "x": float(res["x"]),
+                         "y": float(res["y"]), "score": res.get("match_score")}]
             if unverified:
                 self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
                                        "score": res.get("match_score"),
-                                       "occluded": occluded, "unverified": True})
+                                       "occluded": occluded, "unverified": True,
+                                       "alts": alts, "alt_i": 0})
             elif self.confirm_only_occluded and occluded <= 0:
                 self._auto_kept += 1
             else:
                 self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
                                        "score": res.get("match_score"),
-                                       "occluded": occluded, "unverified": False})
+                                       "occluded": occluded, "unverified": False,
+                                       "alts": alts, "alt_i": 0})
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
             sc = res.get("match_score")
             self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))
+            if len(alts) > 1:
+                print("[assist] %s: %d candidate(s) to cycle with N -- %s"
+                      % (res["id"], len(alts),
+                         ", ".join("f%d(%.2f)" % (c["frame"], c["score"] or 0.0)
+                                   for c in alts[:6])))
             print("[assist] %s died f%s -> back at f%d (first over the line f%s, "
                   "%d frame(s) swept)  match %s%s"
                   % (res["id"], res.get("last_good_frame"), int(res["frame"]),
