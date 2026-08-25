@@ -102,6 +102,7 @@ class CLIP_PT_btr_3de(bpy.types.Panel):
         col.operator("clip.btr_import_3de", text="Import 3DE file", icon="IMPORT")
         col.operator("clip.btr_export_3de", text="Export 3DE file", icon="EXPORT")
         layout.operator("clip.btr_check_3de", text="Check tracks", icon="INFO")
+        layout.operator("clip.btr_diagnose", text="Write diagnostic report", icon="TEXT")
         layout.label(text="Gaps are kept in both directions.")
 
 
