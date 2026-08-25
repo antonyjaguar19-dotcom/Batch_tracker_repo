@@ -30,6 +30,13 @@ ASSIST = os.path.abspath(os.path.join(HERE, ".."))
 #: It is a second opinion on one spot, not a search -- widen it and a nearby lookalike can
 #: answer for the artist's feature.
 VERIFY_RADIUS = 6.0
+
+#: How far below `min_match` still counts as a NEAR MISS worth showing the artist rather than
+#: discarding. Measured two ways: on the SH004 known-answer cases the pattern gate refuses
+#: 7 % of resumes that are CORRECT, and on SH013 the gate refused every foreground resume at
+#: 0.45-0.54 while CoTracker produced a path each time. A near miss is never accepted on the
+#: artist's behalf -- it is proposed, always confirmed, and labelled with the score it got.
+UNVERIFIED_MARGIN = 0.15
 VERSION = "0.1.0"
 
 TOKEN = ""
@@ -466,6 +473,44 @@ def job_reacquire(payload):
                     # only the first is worth spending another CoTracker pass on.
                     best = hit["best_seen"]
                     ran_out = path[-1][0] >= frame_hi
+
+                    # NEAR MISS. The pattern gate said no, but it is the only thing that
+                    # said no: CoTracker still calls the feature visible here, and the patch
+                    # came close. Killing the track on that is how a hard plate ends up with
+                    # nothing at all -- measured on SH013, every foreground resume was
+                    # refused at 0.45-0.54 and every track stayed dead. So offer it, mark it
+                    # UNVERIFIED, and let the artist look. It is never auto-accepted.
+                    near = (best is not None
+                            and best >= (min_match - UNVERIFIED_MARGIN)
+                            and hit.get("best_frame")
+                            and hit.get("best_x") is not None)
+                    seen = bool(near and vm.get(int(hit["best_frame"]), False))
+                    if near and not seen:
+                        # Worth saying out loud. "Nothing reached 0.60" reads as a tracker
+                        # that gave up; "0.52, and CoTracker says the feature is not there"
+                        # is a different statement, and the artist should get the second one.
+                        job.say("%s: best %.2f at f%s, but CoTracker calls the feature NOT "
+                                "visible there -- not offered"
+                                % (r["id"], best, hit.get("best_frame")))
+                    if seen:
+                        bf = int(hit["best_frame"])
+                        occl = sum(1 for ff in range(lg, bf) if not vm.get(ff, True))
+                        resumes.append({
+                            "id": r["id"], "frame": bf,
+                            "x": float(hit["best_x"]), "y": float(hit["best_y"]),
+                            "last_good_frame": lg, "gap_frames": int(bf - lg),
+                            "occluded_frames": int(occl),
+                            "match_score": round(float(best), 3),
+                            "locate_score": round(float(best), 3),
+                            "first_match_frame": None,
+                            "scanned": int(hit["scanned"]),
+                            "verified": False,
+                            "match_note": ("your pattern only reaches %.2f here, under the "
+                                           "%.2f you set -- CoTracker says the feature is "
+                                           "visible, so this is its best guess for you to "
+                                           "judge, not a verified match"
+                                           % (best, min_match))})
+                        continue
                     misses.append({
                         "id": r["id"],
                         "score": None if best is None else round(float(best), 3),
@@ -544,6 +589,7 @@ def job_reacquire(payload):
                                              else round(float(hit["score"]), 3)),
                             "first_match_frame": first_frame,
                             "scanned": scanned,
+                            "verified": True,
                             "match_note": note,
                             "pattern_std": None if pattern_std.get(r["id"]) is None
                                            else round(pattern_std[r["id"]], 2),

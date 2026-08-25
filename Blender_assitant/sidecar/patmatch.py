@@ -211,7 +211,11 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
         state[j["id"]] = {"job": j, "path": dict(j["path"]), "done": False,
                           "frame": None, "x": None, "y": None, "score": None,
                           "first_frame": None, "settle_left": 0, "scanned": 0,
-                          "best_seen": -1.0, "best_frame": None}
+                          "best_seen": -1.0, "best_frame": None,
+                          # Where the best-scoring frame put it, even when that score never
+                          # reached the gate. A refusal that cannot say WHERE it looked
+                          # cannot be turned into anything an artist could judge.
+                          "best_x": None, "best_y": None}
 
     frames = sorted({f for j in jobs for f, _ in j["path"]})
     if not frames:
@@ -237,6 +241,7 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
             x, y, sc = got
             if sc > s["best_seen"]:
                 s["best_seen"], s["best_frame"] = sc, int(f)
+                s["best_x"], s["best_y"] = x, y
             if s["first_frame"] is None:
                 if sc < min_match:
                     continue
@@ -259,7 +264,8 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
         out[k] = {"frame": s["frame"], "x": s["x"], "y": s["y"], "score": s["score"],
                   "first_frame": s["first_frame"], "scanned": s["scanned"],
                   "best_seen": None if s["best_seen"] < -0.5 else float(s["best_seen"]),
-                  "best_frame": s["best_frame"]}
+                  "best_frame": s["best_frame"],
+                  "best_x": s["best_x"], "best_y": s["best_y"]}
     return out
 
 

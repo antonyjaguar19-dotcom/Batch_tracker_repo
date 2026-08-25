@@ -916,14 +916,17 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tr.select_search = on
         self._phase = "confirm"
         score = "n/a" if a["score"] is None else "%.2f" % a["score"]
-        msg = ("%s found again at frame %d (match %s) -- ENTER track on   "
+        kind = "NOT VERIFIED, your call" if a.get("unverified") else "match %s" % score
+        msg = ("%s found again at frame %d (%s) -- ENTER track on   "
                "D drop   A accept all %d   ESC stop"
-               % (a["id"], a["frame"], score, len(self._awaiting)))
+               % (a["id"], a["frame"], kind, len(self._awaiting)))
         self._status(context, msg)
         # ...and in the editor itself. The status bar alone is why this phase was mistaken
         # for a hang. Navigation still works while this is up.
-        overlay.show(["%s found again at frame %d   (match %s)"
-                      % (a["id"], a["frame"], score),
+        overlay.show(["%s found again at frame %d   (%s)"
+                      % (a["id"], a["frame"],
+                         ("pattern only reached %s -- NOT verified, your call" % score)
+                         if a.get("unverified") else "match %s" % score),
                       "ENTER  track on      D  drop      A  accept all %d      ESC  stop"
                       % len(self._awaiting),
                       "zoom and pan as normal -- nothing is frozen"])
@@ -1004,12 +1007,20 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # guide calls VISIBLE is the case the numbers cover; one across an occlusion is
             # the case the confirm phase was built for, and it still stops.
             occluded = int(res.get("occluded_frames") or 0)
-            if self.confirm_only_occluded and occluded <= 0:
+            # An UNVERIFIED resume is always asked about. The whole reason it exists is that
+            # the pattern check could not vouch for it, so the one thing that must not happen
+            # is it being taken on the artist's behalf.
+            unverified = res.get("verified") is False
+            if unverified:
+                self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
+                                       "score": res.get("match_score"),
+                                       "occluded": occluded, "unverified": True})
+            elif self.confirm_only_occluded and occluded <= 0:
                 self._auto_kept += 1
             else:
                 self._awaiting.append({"id": res["id"], "frame": int(res["frame"]),
                                        "score": res.get("match_score"),
-                                       "occluded": occluded})
+                                       "occluded": occluded, "unverified": False})
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
             sc = res.get("match_score")
             self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))
@@ -1062,6 +1073,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             tail = ", match %.2f-%.2f (min %.2f)" % (min(sc), max(sc), self.min_match)
         elif self.verify_pattern:
             tail = ", pattern check found nothing to check"
+        n_unver = sum(1 for v in (self._scores or {}).values()
+                      for _f, sc in v if sc is not None and sc < self.min_match)
+        if n_unver:
+            tail += ", %d unverified (you confirmed them)" % n_unver
         if self._widened:
             tail += (", %d search box(es) widened to %.0f px for plate motion"
                      % (len(self._widened), max(t for _, _, t in self._widened)))

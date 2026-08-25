@@ -1461,3 +1461,89 @@ thing the artist runs.**
   the deliberate trade: the artist confirms re-acquires anyway, and no automatic deletion is
   worth the case above. Unmeasured on SH004 whether those 3 tracks now survive as bad data.
 * Everything here is span. No accuracy number exists for SH013.
+
+### A refused resume killed the track; now it asks (2026-08-24)
+
+The pattern gate is the only thing standing between a CoTracker path and a resumed track, and
+when it says no the track ends for good. Two measurements say that is too final:
+
+* on the SH004 known-answer cases the gate refuses **7 % of resumes that are correct**
+  (seed patch at the track's own box size, scored at a position known to be right);
+* on SH013 it refused **every** foreground resume at 0.45-0.54 while CoTracker produced a
+  path each time, and every one of those tracks stayed dead.
+
+So a NEAR MISS -- within `UNVERIFIED_MARGIN = 0.15` of the gate -- is now offered as a resume
+marked `verified: False`, on one extra condition: **CoTracker must independently call the
+feature visible at that frame**. Two signals have to agree that something is there before the
+artist is asked about it.
+
+An unverified resume is **always** confirmed. It ignores `confirm_only_occluded`, and the
+prompt says what it is rather than showing a score that would read as endorsement:
+
+```
+<track> found again at frame N   (pattern only reached 0.52 -- NOT verified, your call)
+```
+
+No gate moved. `min_match` still decides what counts as verified; what changed is that
+falling short of it produces a question instead of a dead track.
+
+### It correctly declines, too
+
+On SH013 the near miss did NOT fire, and the log now says why:
+
+```
+USER_01: best 0.52 at f26, but CoTracker calls the feature NOT visible there -- not offered
+```
+
+Those foreground points had swept off the plate. The patch half-matched something; CoTracker
+knew the feature was gone; the two signals disagreed and nothing was offered. The old message
+("nothing reached 0.60") read like a tracker giving up, which is a different and misleading
+statement.
+
+Forced positive case, SH004 with the gate raised to 0.99 so correct resumes fall under it:
+
+```
+ref014  back at f94   first over the line fNone   match 0.94
+ref048  back at f136  first over the line fNone   match 0.98
+ref052  back at f131  first over the line fNone   match 0.98
+final spans [131, 133, 147, 160, 160] of 160
+```
+
+Three tracks that would have ended, proposed instead.
+
+### The leash idea, measured and dropped
+
+The artist reported that **native Blender cannot track SH013's foreground by hand either** --
+independent confirmation of the NCC measurement. The obvious response was to let the guide
+carry the track (`track_job` has a leash; the operator sets it to 0). That needed CoTracker to
+be good on that content, so closure was measured -- track forward, track back, see where it
+lands:
+
+| point | span | closure px | frames CoTracker calls visible |
+|---|---|---|---|
+| FG_a | 1-60 | 6565 | 12/60 |
+| FG_c | 1-60 | 5838 | 23/60 |
+| MID | 60-180 | **3.4** | 93/121 |
+| BG | 60-180 | **2.7** | 121/121 |
+
+**The foreground rows are meaningless and must not be read as "CoTracker is bad there."**
+Those points leave the frame — measured separately, they exit in 13-47 frames — and a round
+trip through a point that left the plate returns nonsense. CoTracker reporting them visible
+for only 12-24 frames is it being *right*.
+
+What the valid rows say: on features that stay in frame CoTracker closes to 2.7-3.4 px over
+121 frames. Respectable, and beside the point — Blender already tracks those same features for
+154-302 frames at sub-pixel precision since the watch fix.
+
+So the leash has no case on this shot: the foreground cannot be carried by anything because it
+exits, and the midground does not need carrying. Not built. The assumption it rested on —
+that foreground features persist and merely tracked badly — was never true.
+
+### What this does not settle
+
+* The 7 % figure is from SH004 known-answer cases; how often a near miss is CORRECT on real
+  footage is unmeasured, and every one still costs the artist a decision.
+* `UNVERIFIED_MARGIN = 0.15` is a judgement, not a measurement. Too wide and it manufactures
+  questions; too narrow and it changes nothing.
+* An unverified resume that the artist accepts is indistinguishable downstream from a verified
+  one. The end report counts them separately; the track file does not.
