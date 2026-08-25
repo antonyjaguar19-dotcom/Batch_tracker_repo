@@ -174,6 +174,29 @@ def job_motion(payload):
             raise RuntimeError("could not read enough frames to measure motion")
         job.say("motion: p95 %.1f px/frame over the plate, worst cell %.1f"
                 % (mo["global_p95"], max(max(r) for r in mo["p95"])))
+
+        # Contrast of each seed's own patch, on its own frame. Measured on SH013 over a
+        # 30-seed grid: patches with std >= 8 ran a median 113 frames, under 8 a median of
+        # ~25, and every seed that died before frame 25 had a median std of 4.4. It is not
+        # a gate -- an artist may have good reason to track a soft feature -- but it is the
+        # difference between "the tracker is broken" and "there is nothing there to hold",
+        # and it costs one patch read per seed to say so BEFORE the take.
+        import patmatch                                              # noqa: PLC0415
+        contrast = {}
+        for sd in (payload.get("seeds") or []):
+            try:
+                ref = patmatch.reference_patch(plate, int(sd["frame"]), float(sd["cx"]),
+                                               float(sd["cy"]), float(sd["w"]),
+                                               float(sd["h"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ref is not None:
+                contrast[sd["id"]] = float(ref[0].std())
+        if contrast:
+            weak = sorted((v, k) for k, v in contrast.items() if v < 8.0)
+            job.say("contrast: %d seed(s) measured, %d below 8 (soft)"
+                    % (len(contrast), len(weak)))
+        mo["contrast"] = contrast
         return mo
     return fn
 

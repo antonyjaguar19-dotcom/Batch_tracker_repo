@@ -1547,3 +1547,35 @@ that foreground features persist and merely tracked badly — was never true.
   questions; too narrow and it changes nothing.
 * An unverified resume that the artist accepts is indistinguishable downstream from a verified
   one. The end report counts them separately; the track file does not.
+
+### What a seed has to hold, measured (2026-08-24, SH013)
+
+Reported: *"the track stopped at frame 12, feature still mid-frame."* Not the frame-edge case
+the earlier fixes explained, so a 30-seed grid was run across the plate in the shipped
+config. 11 of 30 died before frame 25, most with the feature well inside frame.
+
+The predictor is **contrast**, not motion:
+
+| patch std | seeds | median span |
+|---|---|---|
+| < 4 | 11 | 26 |
+| 4-8 | 9 | 23 |
+| 8-15 | 10 | **113** |
+
+Seeds dying before frame 25: median std **4.4**. Seeds running 100+ frames: median **10.6**.
+For scale, artist-placed features on SH004 measure **std 40-64**. SH013 is uniform brown dirt
+at 59.94 fps and nothing on it reads above 15.
+
+The motion pre-flight now also reads each seed's own patch and reports **both** numbers for
+**every** seed, not only the ones that trip a threshold — because the case that prompted this
+tripped neither. A seed at 33 px/frame (under the 35 warning) with std 9.8 (over the 8
+warning) died at frame 11. Neither number was extreme; the combination was hopeless. Two
+binary thresholds tuned on one shot cannot say that, and the numbers themselves can.
+
+The soft warning remains for genuinely empty patches and quotes what it is worth. It is not a
+gate: an artist may have reason to track a soft feature, and refusing would be the tool
+overruling them on their own plate.
+
+**What this does not settle:** the rule is one shot, n=30, spans only. Whether std predicts
+span on footage that is not uniform dirt is untested, and the two numbers are reported rather
+than combined precisely because there is not enough evidence to combine them honestly.

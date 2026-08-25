@@ -83,6 +83,13 @@ MAX_SEARCH_FRAC = 0.25
 #: in the tracker moved it.
 FAST_SEED_PX = 35.0
 
+#: Pattern-box standard deviation below which a seed is worth warning about. Measured on
+#: SH013 over a 30-seed grid: std >= 8 ran a median 113 frames, 4-8 a median 23, under 4 a
+#: median 26, and every seed dying before frame 25 had a median std of 4.4. Artist-placed
+#: features on SH004 measure 40-64, so this is a low bar deliberately -- it catches "there
+#: is nothing here", not "this is not a great feature".
+SOFT_SEED_STD = 8.0
+
 #: The only events the confirm phase consumes. EVERYTHING else passes through to the clip
 #: editor, because the question it asks -- "is that your feature?" -- is answered by zooming
 #: in, panning, and scrubbing, and swallowing every event to protect four keys made Blender
@@ -396,7 +403,13 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         try:
             client.ensure(self._root, bpy.path.abspath(p.python_exe) if p else "",
                           p.port if p else 0)
-            r = client.start_motion(self._root, clip_info(context, self._clip))
+            # The artist's own boxes ride along, so one pre-flight answers both "can the
+            # box reach?" and "is there anything in it to hold?".
+            seeds = [{"id": k, "frame": v["frame"], "cx": v["cx"], "cy": v["cy"],
+                      "w": v["w"], "h": v["h"]}
+                     for k, v in (self._patterns or {}).items()]
+            r = client.start_motion(self._root, clip_info(context, self._clip),
+                                    seeds=seeds)
         except client.SidecarError as exc:
             # Not fatal. A plate whose motion cannot be measured still tracks with the
             # built-in sizes, which is exactly what happened before this existed.
@@ -426,7 +439,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._opts.motion_headroom = MOTION_HEADROOM
             self._opts.motion_cap_frac = MAX_SEARCH_FRAC
             self._widen_boxes(context)
+            self._report_seeds(context)
             self._warn_fast_seeds(context)
+            self._warn_soft_seeds(context)
         self._start_tracking(context)
         return {"RUNNING_MODAL"}
 
@@ -453,7 +468,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             i = min(gx - 1, max(0, int(x / max(1.0, float(w)) * gx)))
             j = min(gy - 1, max(0, int(y / max(1.0, float(h)) * gy)))
             p95 = float(mo["p95"][j][i])
-            self._seed_motion[rec["id"]] = p95
+            self._seed_motion[rec["id"]] = p95          # every seed, widened or not
             pat_w = (max(c[0] for c in m.pattern_corners)
                      - min(c[0] for c in m.pattern_corners)) * w
             pat_h = (max(c[1] for c in m.pattern_corners)
@@ -471,6 +486,51 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._widened.append((rec["id"], have, want))
             print("[assist] %s: plate moves %.0f px/frame here, search box %.0f -> %.0f px"
                   % (rec["id"], p95, have, want))
+
+    def _report_seeds(self, context):
+        """Print what was measured at every seed, not only the ones that trip a threshold.
+
+        Both thresholds missed the case that prompted this. A seed on SH013 measured 33
+        px/frame (under the 35 warning) with a patch std of 9.8 (over the 8 warning) and
+        died at frame 11 -- neither number was extreme, and their combination was still
+        hopeless. Two binary warnings tuned on one shot cannot express that, so the numbers
+        themselves go in the log and the artist can move a seed on the evidence.
+
+        For scale when reading these: artist-placed features on SH004 measure std 40-64 and
+        sit in cells moving 0-8 px/frame. SH013 is uniform brown dirt at 59.94 fps and
+        nothing on it reads above std 15.
+        """
+        con = (self._motion or {}).get("contrast") or {}
+        mot = self._seed_motion or {}
+        if not con and not mot:
+            return
+        for rec in self._records:
+            name = rec["id"]
+            print("[assist] %s: plate %.0f px/frame here, patch contrast std %.1f"
+                  % (name, mot.get(name, 0.0), con.get(name, 0.0)))
+
+    def _warn_soft_seeds(self, context):
+        """Say which seeds have too little contrast to hold, before the take is spent.
+
+        Measured on SH013 over a 30-seed grid: std >= 8 ran a median 113 frames, under 8 a
+        median of ~25, and the seeds that died before frame 25 had a median std of 4.4. For
+        scale, artist-placed features on SH004 measure std 40-64 -- this plate is uniform
+        brown dirt and there is very little anywhere on it for correlation to hold.
+
+        Not a gate. An artist may have a reason to track a soft feature, and refusing would
+        be the tool overruling them on their own plate. It is the difference between "the
+        tracker is broken" and "there is nothing there to hold".
+        """
+        con = (self._motion or {}).get("contrast") or {}
+        soft = sorted((v, k) for k, v in con.items() if v < SOFT_SEED_STD)
+        if not soft:
+            return
+        for std, name in soft:
+            print("[assist] %s has almost no contrast (std %.1f) -- tracks on patches this "
+                  "soft ran a median 25 frames where std 8+ ran 113" % (name, std))
+        self.report({"WARNING"},
+                    "%d seed(s) have very little contrast (down to std %.1f); expect short "
+                    "tracks there whatever the settings" % (len(soft), soft[0][0]))
 
     def _warn_fast_seeds(self, context):
         """Tell the artist which seeds sit where the plate will not hold a long track.
