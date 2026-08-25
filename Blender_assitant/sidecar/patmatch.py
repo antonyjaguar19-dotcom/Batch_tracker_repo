@@ -269,6 +269,76 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, on_status=None):
     return out
 
 
+def hold_check(plate, patch, offset, path, radius=3.0):
+    """Score the artist's own patch at every position a track claims, in frame order.
+
+    Blender tracks with PREV_FRAME: each frame is matched against the one before it. That is
+    what gives it precision, and it is also why an occluder captures a track without the
+    correlation ever failing -- the occluder slides in over a few frames and each step looks
+    like a small, plausible move. The track never dies, so nothing downstream ever asks for
+    a re-acquire, and the drift is written to the file as if it were data.
+
+    The question nobody was asking is whether it is still the ARTIST'S feature. Measured on
+    SH006, a seed occluded at frame 14:
+
+        f13  0.985    f14  0.908    f15  0.218    f16  0.210  ...  f22  0.178
+
+    A collapse from 0.91 to 0.22 in one frame. The signal does not need a careful threshold;
+    it needs to be looked at.
+
+    `radius` is deliberately tiny. This is not a search -- the position is Blender's and is
+    not in question here. It asks what is AT that position.
+
+    Returns [(frame, score or None), ...] in the order given.
+    """
+    out = []
+    for f, x, y in path:
+        img = _gray(plate.frame(int(f) - 1))
+        if img is None:
+            out.append((int(f), None))
+            continue
+        got = match_in(img, patch, float(x), float(y), radius=radius, offset=offset)
+        out.append((int(f), None if got is None else float(got[2])))
+    return out
+
+
+def first_loss(scores, floor=0.5, drop=0.5, settle=2):
+    """The first frame where a track stopped being on the artist's feature.
+
+    Two conditions, and the second is what keeps this honest on difficult footage. An
+    absolute floor alone would condemn every track on a low-contrast plate -- measured on
+    SH013, patches there score 0.53-0.72 against the very NEXT frame while tracking
+    perfectly well. So a loss is a score that is BOTH below `floor` and below `drop` times
+    what this track was holding before it. A track that never scored well cannot fall.
+
+    `settle` frames must agree before it counts, so one bad frame -- a grain hit, a lighting
+    step, a marker crossing a highlight -- does not cut a good track.
+
+    Returns the frame number, or None.
+    """
+    good = [s for _f, s in scores if s is not None]
+    if not good:
+        return None
+    # The baseline is what the track held while it was demonstrably working: the median of
+    # its own scores, which on a healthy track is high and on a hopeless one is not.
+    base = sorted(good)[len(good) // 2]
+    bad_run = 0
+    first_bad = None
+    for f, s in scores:
+        if s is None:
+            continue
+        if s < floor and s < base * drop:
+            bad_run += 1
+            if first_bad is None:
+                first_bad = f
+            if bad_run >= settle:
+                return first_bad
+        else:
+            bad_run = 0
+            first_bad = None
+    return None
+
+
 # ---------------------------------------------------------------- pattern drift
 
 #: A scaled reference has to beat the unscaled one by more than noise before "the feature

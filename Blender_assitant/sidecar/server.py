@@ -201,6 +201,74 @@ def job_motion(payload):
     return fn
 
 
+def job_hold(payload):
+    """Did each track stay on the artist's feature, and from which frame did it not?
+
+    One correlation per frame per track against the seed patch -- no model, no GPU. The
+    plate is decoded once per frame and shared across every track that wants it, the same
+    shape as the reappearance sweep.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+        out_dir = os.path.join(ASSIST, "logs", "hold", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        floor = float(params.get("floor", 0.5))
+        drop = float(params.get("drop", 0.5))
+
+        job.stage = "checking %d track(s) held their feature" % len(reqs)
+        results = []
+        for r in reqs:
+            pat = r.get("pattern") or {}
+            ref = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
+                                           float(pat["cx"]), float(pat["cy"]),
+                                           float(pat["w"]), float(pat["h"])) if pat else None
+            if ref is None:
+                results.append({"id": r["id"], "lost_at": None,
+                                "reason": "no pattern to check against"})
+                continue
+            patch, off = ref
+            std = float(patch.std())
+            path_pts = [(int(p[0]), float(p[1]), float(p[2])) for p in (r.get("path") or [])]
+            if not path_pts:
+                results.append({"id": r["id"], "lost_at": None, "reason": "no positions"})
+                continue
+            scores = patmatch.hold_check(plate, patch, off, path_pts)
+            lost = patmatch.first_loss(scores, floor=floor, drop=drop)
+            got = [s for _f, s in scores if s is not None]
+            results.append({
+                "id": r["id"],
+                "lost_at": lost,
+                "pattern_std": round(std, 2),
+                "score_first": round(got[0], 3) if got else None,
+                "score_last": round(got[-1], 3) if got else None,
+                "score_median": round(sorted(got)[len(got) // 2], 3) if got else None,
+                "scores": [[f, (None if s is None else round(s, 3))] for f, s in scores],
+            })
+            if lost:
+                job.say("%s: left your feature at f%d (was %.2f, became %.2f)"
+                        % (r["id"], lost,
+                           got[0] if got else 0.0,
+                           next((s for f, s in scores if f == lost and s is not None), 0.0)))
+        n = sum(1 for r in results if r.get("lost_at"))
+        job.say("%d of %d track(s) drifted off the feature" % (n, len(results)))
+        return {"tracks": results}
+    return fn
+
+
 def job_patcheck(payload):
     """Why did these pattern boxes change size -- the feature, or the tracker losing it?
 
@@ -688,7 +756,8 @@ class Handler(BaseHTTPRequestHandler):
                                              os._exit(0)), daemon=True).start()
             return None
 
-        if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion"):
+        if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
+                         "/jobs/hold"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -699,7 +768,8 @@ class Handler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 JOBS[job.id] = job
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
-                          "patcheck": job_patcheck, "motion": job_motion}[kind](payload))
+                          "patcheck": job_patcheck, "motion": job_motion,
+                          "hold": job_hold}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

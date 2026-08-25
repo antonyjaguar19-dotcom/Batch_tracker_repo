@@ -83,6 +83,12 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "nothing occluded the worst single frame was 6.66 px and none landed on "
                     "a different feature. Crossing a real occlusion has not been measured "
                     "that way and still stops for you")
+    hold_feature: BoolProperty(
+        name="Cut where it stops being your feature", default=True,
+        description="After tracking, check every frame against the pattern YOU seeded and "
+                    "cut the track where it stopped being that feature. An occluder captures "
+                    "a track without any single frame looking wrong, so it never dies and "
+                    "never asks for a re-acquire -- the drift just gets written to the file")
     stop_at_frame_edge: BoolProperty(
         name="Stop when the pattern leaves frame", default=True,
         description="End a track as soon as its pattern box reaches the edge of the plate, "
@@ -124,6 +130,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "hold_feature")
         layout.prop(self, "stop_at_frame_edge")
         layout.prop(self, "fit_search_box")
         layout.prop(self, "confirm_resumes")

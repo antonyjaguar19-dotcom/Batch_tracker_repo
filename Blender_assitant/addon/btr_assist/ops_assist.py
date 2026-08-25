@@ -216,6 +216,15 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "buys nothing. A resume that crosses a real occlusion has NOT been "
                     "measured that way and still stops. Turn this off to be asked about "
                     "every resume")
+    hold_feature: BoolProperty(
+        name="Cut where it stops being your feature", default=True,
+        description="After tracking, check every frame against the pattern YOU seeded and "
+                    "cut the track where it stopped being that feature. Blender matches each "
+                    "frame against the one before it, so an occluder slides in over a few "
+                    "frames without any single step looking wrong -- the track never dies, "
+                    "never asks for a re-acquire, and the drift is written to the file as if "
+                    "it were data. Measured on an occluded seed: your pattern scored 0.91 at "
+                    "frame 14 and 0.22 at frame 15, and the track carried on to frame 22")
     stop_at_frame_edge: BoolProperty(
         name="Stop when the pattern leaves frame", default=True,
         description="End a track as soon as its pattern box reaches the edge of the plate. "
@@ -290,6 +299,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
     _motion = None            # per-cell plate motion, px/frame, measured by the sidecar
     _seed_motion = None       # id -> px/frame where that seed sits
     _widened = None           # [(id, from_px, to_px)] for the report
+    _hold_done = False        # the identity check has run for this pass
+    _cut = None               # [(id, frame, n)] tracks cut off a lost feature
     _pending = None           # resumes awaiting insertion
     _fixes = None             # id -> how many times the scale watch has repaired it
     _drift = None             # [(id, frame, verdict, ...)] for the report
@@ -422,6 +433,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._motion = None
         self._seed_motion = {}
         self._widened = []
+        self._hold_done = False
+        self._cut = []
         self._fixes = {}
         self._drift = []
         self._backward_done = False
@@ -609,6 +622,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
 
     def _start_tracking(self, context):
         overlay.hide()
+        self._hold_done = False
         self._stats = {}
         # Re-baselined every pass. A track that restarts from a repair or a resume starts
         # with a different box, and a watch still holding the old baseline would flag its
@@ -641,7 +655,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
 
     def modal(self, context, event):
         if event.type == "ESC":
-            if self._phase in ("waiting", "drift", "motion"):
+            if self._phase in ("waiting", "drift", "motion", "hold"):
                 client.cancel(self._root, self._job)
             return self._done(context, "cancelled")
         try:
@@ -656,6 +670,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 return {"PASS_THROUGH"}
             if self._phase == "motion":
                 return self._tick_motion(context)
+            if self._phase == "hold":
+                return self._tick_hold(context)
             if self._phase == "tracking":
                 return self._tick_tracking(context)
             if self._phase == "waiting":
@@ -698,6 +714,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         if flagged:
             return self._ask_drift(context, flagged)
 
+        # Before anything trusts these markers: are they still the artist's feature? This
+        # runs on the whole pass at once, and what it finds is removed rather than reported,
+        # because a drifted marker in a track file is worse than a gap -- 3DE will happily
+        # solve to it.
+        if self.hold_feature and not self._hold_done:
+            if self._start_hold(context):
+                return {"RUNNING_MODAL"}
+            self._hold_done = True
+
+        return self._after_tracking(context)
+
+    def _after_tracking(self, context):
         if self.backward and not self._backward_done:
             self._status(context, "backward pass (not cancellable) ...")
             # Anchored on each track's ORIGINAL head, never on `seed_frame`: a repair or a
@@ -711,6 +739,100 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         if self._round >= self.rounds:
             return self._done(context, "finished")
         return self._ask_cotracker(context)
+
+    # ---------------------------------------------------------------- holding the feature
+
+    def _start_hold(self, context):
+        """Ask the plate whether each track is still on the feature the artist chose.
+
+        Returns False to carry straight on -- a failure here must not cost a run.
+        """
+        clip = self._clip
+        w, h = clip.size
+        reqs = []
+        for rec in self._records:
+            pat = self._patterns.get(rec["id"])
+            if not pat:
+                continue
+            tr = rec["t"]
+            path = []
+            for m in tr.markers:
+                if m.mute:
+                    continue
+                # Only frames from this track's own head onward, in frame order.
+                path.append([int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h])
+            path.sort()
+            if len(path) < 4:
+                continue
+            reqs.append({"id": rec["id"], "pattern": pat, "path": path})
+        if not reqs:
+            return False
+        p = prefs.get(context)
+        try:
+            client.ensure(self._root, bpy.path.abspath(p.python_exe) if p else "",
+                          p.port if p else 0)
+            r = client.start_hold(self._root, clip_info(context, clip), reqs)
+        except client.SidecarError as exc:
+            print("[assist] could not check the tracks against your pattern (%s)" % exc)
+            return False
+        self._job = r["id"]
+        self._phase = "hold"
+        self._status(context, "checking %d track(s) are still your feature ..." % len(reqs))
+        return True
+
+    def _tick_hold(self, context):
+        st = client.poll(self._root, self._job)
+        if st["state"] in ("queued", "running"):
+            self._status(context, "%s  (%.0fs)" % (st.get("stage") or "checking",
+                                                   st.get("seconds", 0)))
+            return {"RUNNING_MODAL"}
+        self._hold_done = True
+        if st["state"] == "cancelled":
+            return self._done(context, "cancelled")
+        if st["state"] == "error":
+            print("[assist] feature check failed: %s" % st["error"]["message"])
+        else:
+            self._apply_hold(context, (st.get("result") or {}).get("tracks") or [])
+        return self._after_tracking(context)
+
+    def _apply_hold(self, context, results):
+        """Cut each track at the frame it stopped being the artist's feature.
+
+        This DELETES markers, which the addon otherwise refuses to do -- and the difference
+        from the verdict that was removed for deleting good work is evidence. There, a patch
+        that could not be found anywhere was treated as proof the track was lost; it is not,
+        and on low-contrast footage a healthy track reads the same. Here the patch is scored
+        AT the position the track claims, frame by frame, and the finding is a fall: 0.91 at
+        one frame, 0.22 at the next, against a baseline the track itself set. A score that
+        was never high cannot fall, so a plate where nothing correlates well produces no
+        cuts -- checked in `patmatch.first_loss`.
+
+        The cut frames are drift. Leaving them muted would still put them in front of the
+        artist as something to judge; leaving them live would put them in the track file.
+        """
+        by_id = {r["id"]: r for r in self._records}
+        for res in results:
+            lost = res.get("lost_at")
+            if not lost:
+                continue
+            rec = by_id.get(res["id"])
+            if rec is None:
+                continue
+            tr = rec["t"]
+            gone = [m.frame for m in tr.markers if m.frame >= int(lost)]
+            for f in gone:
+                if len(tr.markers) <= 1:
+                    break
+                tr.markers.delete_frame(f)
+            # Dead, and anchored on the last frame that WAS the feature -- which is exactly
+            # what re-acquire needs to search from.
+            rec["alive"] = False
+            self._cut.append((res["id"], int(lost), len(gone)))
+            print("[assist] %s stopped being your feature at f%d (was %.2f, became %.2f) "
+                  "-- %d frame(s) of drift removed, re-acquire takes it from here"
+                  % (res["id"], lost, res.get("score_first") or 0.0,
+                     next((sc for f, sc in (res.get("scores") or [])
+                           if f == lost and sc is not None), 0.0), len(gone)))
 
     # ---------------------------------------------------------------- scale drift
 
@@ -1190,6 +1312,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                       for _f, sc in v if sc is not None and sc < self.min_match)
         if n_unver:
             tail += ", %d unverified (you confirmed them)" % n_unver
+        if self._cut:
+            tail += (", %d track(s) cut where they left your feature (%d frame(s) of drift)"
+                     % (len(self._cut), sum(n for _i, _f, n in self._cut)))
         if self._widened:
             tail += (", %d search box(es) widened to %.0f px for plate motion"
                      % (len(self._widened), max(t for _, _, t in self._widened)))

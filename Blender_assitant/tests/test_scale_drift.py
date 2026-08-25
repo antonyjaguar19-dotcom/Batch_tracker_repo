@@ -167,6 +167,39 @@ def main():
     check("a big offset alone decides nothing", cd(0.95, None, 25.0, 1.1) == "clean")
     check("shrink is judged like growth", cd(0.95, None, 0.2, 1.0 / 1.5) == "bad-box")
 
+    # ------------------------------------------------------ holding the feature
+    # `first_loss` decides whether a track is still on the artist's feature at all.
+    #
+    # The SH006 row is measured, not invented: a seed occluded at frame 14, scored against
+    # the artist's own patch at every position the track claimed. 0.91 at f14, 0.22 at f15 --
+    # while Blender's own correlation was satisfied the whole way, because PREV_FRAME only
+    # ever compares to the frame before, and an occluder sliding in over a few frames never
+    # looks like a failure.
+    #
+    # The SH013 row is why this is not a plain threshold. Patches on that plate score
+    # 0.53-0.72 against the very NEXT frame while tracking perfectly well; an absolute floor
+    # would cut every track on it. A loss has to be a FALL from what the track itself was
+    # holding, and a score that was never high cannot fall.
+    fl = patmatch.first_loss
+    for name, scores, expect in (
+        ("SH006 occlusion at f15",
+         [(1, 1.00), (2, .995), (3, .995), (4, .996), (5, .995), (6, .994), (7, .996),
+          (8, .993), (9, .968), (10, .846), (11, .833), (12, .951), (13, .985), (14, .908),
+          (15, .218), (16, .210), (17, .192), (18, .168), (19, .169), (20, .161)], 15),
+        ("SH013 low contrast never drifts",
+         [(f, 0.55 + 0.1 * ((f % 3) - 1)) for f in range(1, 40)], None),
+        ("one bad frame does not cut a good track",
+         [(f, 0.10 if f == 10 else 0.95) for f in range(1, 20)], None),
+        ("two bad frames in a row is the real thing",
+         [(f, 0.10 if f in (10, 11) else 0.95) for f in range(1, 20)], 10),
+        ("gentle decline (defocus) is still the feature",
+         [(f, max(0.45, 0.95 - 0.02 * f)) for f in range(1, 30)], None),
+        ("occlusion late in a long healthy track",
+         [(f, 0.9) for f in range(1, 100)] + [(f, 0.15) for f in range(100, 110)], 100),
+    ):
+        check("hold: %s" % name, fl(scores) == expect,
+              "got %s, expected %s" % (fl(scores), expect))
+
     print("\n%d check(s) failed" % len(FAILURES) if FAILURES else "\nall checks passed")
     return 1 if FAILURES else 0
 

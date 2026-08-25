@@ -133,6 +133,7 @@ class CLIP_PT_btr_main(_Base):
             op.confirm_resumes = p.confirm_resumes
             op.fit_search_box = p.fit_search_box
             op.stop_at_frame_edge = p.stop_at_frame_edge
+            op.hold_feature = p.hold_feature
             op.confirm_only_occluded = p.confirm_only_occluded
             op.animate_scale = p.animate_scale
             op.watch_scale = p.watch_scale
@@ -173,6 +174,9 @@ class CLIP_PT_btr_opts(_Base):
             return
         layout.use_property_split = True
         layout.use_property_decorate = False
+
+        col = layout.column(heading="Quality", align=True)
+        col.prop(p, "hold_feature", text="Cut where it leaves my feature")
 
         col = layout.column(heading="While tracking", align=True)
         col.prop(p, "fit_search_box", text="Fit box to plate motion")

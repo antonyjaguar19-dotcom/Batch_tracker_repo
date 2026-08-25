@@ -121,6 +121,15 @@ def start_motion(assist_root, clip_info, params=None, seeds=None):
                     timeout=30.0)
 
 
+def start_hold(assist_root, clip_info, reqs, params=None):
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/hold",
+                    {"clip": clip_info, "requests": reqs, "params": params or {}},
+                    timeout=30.0)
+
+
 def poll(assist_root, job_id):
     info = read_portfile(assist_root)
     if info is None:

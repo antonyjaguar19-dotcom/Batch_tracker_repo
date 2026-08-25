@@ -1679,3 +1679,79 @@ track running to f300 looks like it stopped at the end of the range. Now a panel
 tracks they made themselves. That is consistent with `apply_settings`' stated intent
 ("nothing here may be inherited") and it is now announced rather than silent, but an artist
 who deliberately chose KEYFRAME for a reason will be overruled.
+
+### The occluder captured the track and nothing asked whether it was still the feature (2026-08-25, SH006)
+
+The first real occlusion any measurement in this project has had. From the artist's own
+diagnostic report: seed at frame 1, occluded at 14, reappearing at 25 -- and the track ran
+**continuously to frame 22** and was never re-acquired.
+
+`live runs [[1, 22]]`. It never died. That is the whole failure: Blender tracks with
+PREV_FRAME, each frame matched against the one before it, so an occluder sliding in over a
+few frames never produces a step that looks wrong. Correlation stays satisfied, the track
+stays alive, nothing downstream asks for a re-acquire, and the drift is written to the file
+as though it were data.
+
+Reproduced from the report's own numbers -- seed (3559, 197), 41.2 px pattern, 113.1 px
+search -- and scored against the artist's own patch at every position the track claimed:
+
+| frame | seed NCC | | frame | seed NCC |
+|---|---|---|---|---|
+| 13 | 0.985 | | 15 | **0.218** |
+| 14 | 0.908 | | 16 | 0.210 |
+| | | | 22 | 0.178 |
+
+**0.91 to 0.22 in one frame.** The reproduction ends at (3814, 72) -- the same position the
+artist's report records for frame 22, so this is their track, not something resembling it.
+
+The signal was always there. Nobody was asking the question.
+
+### What shipped: hold the feature, or stop
+
+`/jobs/hold` scores the artist's seed patch at every position a track claims, in frame order,
+with a 3 px radius -- this is not a search, the position is Blender's and is not in question;
+it asks what is AT that position. `first_loss` finds where the track stopped being that
+feature, and the operator **deletes the drift** and hands the track to re-acquire from the
+last frame that was genuinely the feature.
+
+Two conditions, and the second is what makes it safe:
+
+* the score is below an absolute floor (0.5), **and**
+* below half of what that track was holding before it -- its own median.
+
+An absolute floor alone would condemn every track on SH013, where patches score 0.53-0.72
+against the very NEXT frame while tracking perfectly well. **A score that was never high
+cannot fall.** Two frames must agree, so a grain hit or a lighting step does not cut a good
+track.
+
+This deletes markers, which the addon otherwise refuses to do, and the difference from the
+`lost` verdict removed earlier is *evidence*. There, a patch that could not be found anywhere
+was treated as proof a track was lost -- it is not, and a healthy track on poor footage reads
+identically. Here the patch is scored at the position the track claims, frame by frame, and
+the finding is a **fall** against a baseline the track itself set.
+
+Live through the real operator on the artist's seed:
+
+```
+LIVE_01 stopped being your feature at f15 (was 1.00, became 0.34)
+        -- 10 frame(s) of drift removed, re-acquire takes it from here
+LIVE_01 died f14 -> back at f17, match 0.84
+live markers 14 (f1..f14)
+```
+
+14 clean frames and a proposal to judge, instead of 22 frames of which 8 are wrong.
+
+`tests/test_scale_drift.py` pins six cases including both measured plates: SH006 cuts at 15,
+SH013 never cuts, one bad frame does not cut, two in a row does, a gentle defocus decline does
+not, and an occlusion at f100 of a long healthy track does.
+
+### What this does not settle
+
+* The resume it then proposed was frame 17, while the artist reports the feature returning at
+  25. Whether f17 is a partial reappearance or a wrong landing is unknown -- it is a proposal
+  the artist confirms, and occluded resumes always ask, but it has not been judged.
+* The floor (0.5) and the fall ratio (0.5) come from one measured occlusion with an enormous
+  margin. Footage where a feature genuinely changes appearance while staying itself -- a face
+  turning, a light change -- has not been tested and is exactly where this would cut wrongly.
+* The check runs once per pass, over the whole track, so drift is tracked before it is
+  removed. Frame-exact detection during tracking would need the check inside the loop.
