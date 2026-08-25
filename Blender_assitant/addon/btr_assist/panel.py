@@ -27,6 +27,13 @@ def _version_str():
     return ".".join(str(int(x)) for x in v) if v else "?"
 
 
+def _build_str():
+    """Never raise inside draw() -- same rule as `_version_str`."""
+    import sys
+    pkg = sys.modules.get(__package__)
+    return str(getattr(pkg, "BUILD", "?") if pkg else "?")
+
+
 def warnings_for(context, clip):
     """Conditions that silently corrupt a result, in the order they bite."""
     out = []
@@ -71,7 +78,8 @@ class CLIP_PT_btr_main(bpy.types.Panel):
         # a new zip and re-enabling can leave the OLD code running until a restart -- with
         # nothing anywhere to say so. And SEQUENCE vs MOVIE decides how the plate path is
         # sent to the sidecar; getting it wrong sent a folder instead of a file.
-        box.label(text="v%s   source: %s" % (_version_str(), clip.source))
+        box.label(text="v%s  build %s   source: %s"
+                       % (_version_str(), _build_str(), clip.source))
 
         for level, msg in warnings_for(context, clip):
             layout.label(text=msg, icon="ERROR" if level == "ERROR" else "INFO")

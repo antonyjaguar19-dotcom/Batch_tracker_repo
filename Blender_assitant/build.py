@@ -55,6 +55,23 @@ def version_from_source(path):
     return "%s.%s.%s" % (m.group(1), m.group(2), m.group(3) or "0") if m else "0.1.0"
 
 
+def stamp_build(stage):
+    """Write a build id into the packaged __init__, so the panel can prove what is loaded.
+
+    A version number moves on release; this moves on every build. Without it "the addon says
+    v0.5.0" answers nothing when every fix that day shipped under 0.5.0.
+    """
+    import datetime
+    p = os.path.join(stage, "__init__.py")
+    with open(p, encoding="utf-8") as fh:
+        src = fh.read()
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    src = src.replace('BUILD = "dev"', 'BUILD = "%s"' % stamp, 1)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    return stamp
+
+
 def write_paths_json(stage):
     """Bake the repo-side paths into the package.
 
@@ -100,6 +117,7 @@ def build(exe):
             shutil.copy2(os.path.join(root, fn), dst)
 
     write_paths_json(stage)
+    stamp = stamp_build(stage)
     with open(os.path.join(stage, "blender_manifest.toml"), "w",
               encoding="utf-8", newline="\n") as fh:
         fh.write(MANIFEST.format(pkg_id=PKG_ID, version=version, name=NAME,
@@ -114,6 +132,7 @@ def build(exe):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, stage)
                 z.write(full, os.path.join(PKG_ID, rel))
+    print("build %s" % stamp)
     print("built %s  (%.1f KB)" % (os.path.basename(zip_path),
                                    os.path.getsize(zip_path) / 1024))
 

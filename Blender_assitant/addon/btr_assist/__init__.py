@@ -22,7 +22,7 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
@@ -35,6 +35,12 @@ bl_info = {
 # executing and survives. The literal above stays literal so build.py's version_from_source
 # regex keeps the manifest and the source from disagreeing.
 VERSION = bl_info["version"]
+
+#: Stamped by build.py at package time. The version number alone could not answer "am I
+#: running the fix?" -- three separate times in one session a change looked ineffective
+#: because Blender or the sidecar was still holding the old code, and a version that only
+#: moves on release cannot distinguish those. This moves on every build.
+BUILD = "dev"
 
 from . import ops_3de, ops_assist, ops_seed, overlay, panel, prefs
 
