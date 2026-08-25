@@ -84,9 +84,25 @@ def main():
         area.spaces.active.clip = clip
     region = next(r for r in area.regions if r.type == "WINDOW")
 
-    panels = [c for c in bpy.types.Panel.__subclasses__()
-              if c.__name__.startswith("CLIP_PT_btr")]
-    log("panels found: %s" % sorted(p.__name__ for p in panels))
+    # Walk the whole subclass TREE, not `Panel.__subclasses__()`, which returns direct
+    # subclasses only. The moment the panels grew a shared base class they vanished from
+    # that list and this test went green having drawn nothing at all.
+    def descend(cls, seen):
+        for sub in cls.__subclasses__():
+            if sub not in seen:
+                seen.add(sub)
+                descend(sub, seen)
+        return seen
+
+    panels = sorted((c for c in descend(bpy.types.Panel, set())
+                     if c.__name__.startswith("CLIP_PT_btr")),
+                    key=lambda c: c.__name__)
+    log("panels found: %s" % [p.__name__ for p in panels])
+    # A discovery that finds nothing must FAIL. Reporting PASS for zero panels is how this
+    # test hid a rewrite of every panel in the addon.
+    if not panels:
+        log("PANEL DRAW: FAIL -- no panels discovered")
+        sys.exit(1)
 
     failures = []
     with bpy.context.temp_override(window=win, area=area, region=region,
