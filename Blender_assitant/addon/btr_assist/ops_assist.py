@@ -177,9 +177,12 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                       "CoTracker where it went and resume it there for you to confirm")
 
     rounds: IntProperty(
-        name="Re-acquire rounds", default=3, min=0, max=10,
+        name="Re-acquire rounds", default=8, min=0, max=50,
         description="A resumed track can die again. Each round tracks, then re-acquires "
-                    "whatever is still short of the end")
+                    "whatever is still short of the end. One occlusion needs one round; a "
+                    "hand-tracked reference on SH006 has TWO in 64 frames and there is no "
+                    "reason a shot cannot have five. The old cap of 10 was reached before "
+                    "the track was")
     gap: IntProperty(
         name="Gap (frames)", default=3, min=1, max=60,
         description="How far past the failure to resume. The frames in between stay empty "
@@ -1031,8 +1034,22 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # simply not trackable.
             prev = (self._resumed or {}).get(tr.name)
             if prev and self.min_resume_len and (f1 - prev[-1]) < self.min_resume_len:
-                self._gave_up.add(tr.name)
-                continue
+                # A short segment is not the same thing as no progress. The rule exists
+                # because a point that died to blur re-acquires and dies again immediately,
+                # so the loop crawls forward a few frames per round forever -- but measured
+                # on the artist's SH006 hand track, the run BETWEEN two occluders is eight
+                # frames long and entirely legitimate. Judging on length alone abandons that
+                # track before it ever reaches the second return.
+                #
+                # So give up only when the loop is not getting anywhere: a short segment AND
+                # a resume that barely advanced on the last one.
+                advanced = int(prev[-1]) - int(prev[-2]) if len(prev) > 1 else None
+                if advanced is not None and advanced < self.min_resume_len:
+                    self._gave_up.add(tr.name)
+                    print("[assist] %s: giving up -- %d frame(s) tracked and the last two "
+                          "resumes were only %d frame(s) apart"
+                          % (tr.name, f1 - prev[-1], advanced))
+                    continue
             # Normally the search starts from where Blender died. But if the previous round
             # swept its whole window without finding the feature, it handed back where the
             # guide thought the point was at the end of that window: start there instead and

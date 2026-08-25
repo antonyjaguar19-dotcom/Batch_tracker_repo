@@ -83,6 +83,10 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "nothing occluded the worst single frame was 6.66 px and none landed on "
                     "a different feature. Crossing a real occlusion has not been measured "
                     "that way and still stops for you")
+    rounds: IntProperty(
+        name="Re-acquire rounds", default=8, min=0, max=50,
+        description="How many times a track may be re-acquired. One occlusion needs one; a "
+                    "shot can easily have several")
     hold_feature: BoolProperty(
         name="Cut where it stops being your feature", default=True,
         description="After tracking, check every frame against the pattern YOU seeded and "
@@ -130,6 +134,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "rounds")
         layout.prop(self, "hold_feature")
         layout.prop(self, "stop_at_frame_edge")
         layout.prop(self, "fit_search_box")

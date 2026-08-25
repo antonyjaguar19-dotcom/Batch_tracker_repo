@@ -354,14 +354,18 @@ def hold_check(plate, patch, offset, path, radius=3.0):
     return out
 
 
-def first_loss(scores, floor=0.5, drop=0.5, settle=2):
+def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=0.20):
     """The first frame where a track stopped being on the artist's feature.
 
     Two conditions, and the second is what keeps this honest on difficult footage. An
     absolute floor alone would condemn every track on a low-contrast plate -- measured on
     SH013, patches there score 0.53-0.72 against the very NEXT frame while tracking
     perfectly well. So a loss is a score that is BOTH below `floor` and below `drop` times
-    what this track was holding before it. A track that never scored well cannot fall.
+    what this track was holding AT ITS START. A track that never scored well cannot fall.
+
+    On the artist's SH006 reference this puts the cut at f33 -- the first frame of their
+    second occlusion -- and leaves f32 (0.608, a real frame in their hand track) alone,
+    because 0.6 x 0.99 = 0.594 sits between them.
 
     `settle` frames must agree before it counts, so one bad frame -- a grain hit, a lighting
     step, a marker crossing a highlight -- does not cut a good track.
@@ -371,15 +375,36 @@ def first_loss(scores, floor=0.5, drop=0.5, settle=2):
     good = [s for _f, s in scores if s is not None]
     if not good:
         return None
-    # The baseline is what the track held while it was demonstrably working: the median of
-    # its own scores, which on a healthy track is high and on a hopeless one is not.
-    base = sorted(good)[len(good) // 2]
+    # The baseline comes from the track's FIRST `head` scored frames, not the median of all
+    # of them. Measured on the artist's SH006 reference, a track that drifted after its
+    # second occlusion:
+    #
+    #     baseline from the whole track   0.61   <- half the track was already drift
+    #     baseline from the first 14      0.99
+    #
+    # By the time this runs, the drift is IN the scores, so a median over all of them lets
+    # the wrong frames define what normal looks like -- and nothing can then fall below half
+    # of it. The head of a track is the part anchored to the frame the artist seeded, which
+    # is the only part known to be their feature.
+    head_scores = [s for _f, s in scores if s is not None][:max(1, int(head))]
+    base = sorted(head_scores)[len(head_scores) // 2]
+    # And it has to be a FALL, not a slide. A feature going soft -- defocus, a light change,
+    # a plate getting grainier -- declines gently and is still the artist's feature; an
+    # occluder arrives. Measured on the SH006 reference the second occlusion reads
+    # 0.86 -> 0.61 -> 0.35 across two frames, while a defocus decline moves about 0.02 a
+    # frame. Requiring the drop to be at least `min_fall` below the recent level separates
+    # them without another threshold on the score itself.
+    recent = []
     bad_run = 0
     first_bad = None
     for f, s in scores:
         if s is None:
             continue
-        if s < floor and s < base * drop:
+        fell = True
+        if recent:
+            prev = sorted(recent)[len(recent) // 2]
+            fell = s < prev - min_fall
+        if s < floor and s < base * drop and fell:
             bad_run += 1
             if first_bad is None:
                 first_bad = f
@@ -388,6 +413,11 @@ def first_loss(scores, floor=0.5, drop=0.5, settle=2):
         else:
             bad_run = 0
             first_bad = None
+        # Only frames that were ACCEPTED shape the recent level, so a drift cannot quietly
+        # become the new normal one frame at a time.
+        recent.append(s)
+        if len(recent) > look:
+            recent.pop(0)
     return None
 
 

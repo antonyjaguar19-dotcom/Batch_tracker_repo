@@ -1873,3 +1873,90 @@ claims -- landing inside the occlusion is the failure the reference was brought 
 * The resume lands at f26 while the artist resumed at f25. One frame of the return is left to
   the gap. `gap = 3` starts the search at f17 and f25 did not survive candidate spacing.
 * The hand track has a second gap at f33-39 that nothing here has been tested against.
+
+### N occlusions, not one (2026-08-25, SH006)
+
+The artist: *"there might be n number of occlusions on the same track not one or two."* Their
+hand track has two in 64 frames -- runs `[[1,14],[25,32],[40,64]]`.
+
+`tests/eval_track_vs_manual.py` drives the whole loop from the reference's own seed and scores
+every frame against it. Three numbers, because they are different questions: **on the feature**,
+**off the feature** (frames the artist must hunt down and delete -- worse than missing, a
+confident wrong number solves), and **missed** (an honest gap, which 3DE solves across).
+
+First run, 2 occlusions:
+
+```
+round 0: resumed at f26          first occlusion crossed
+round 1: cut at f54              should have been f33
+ON 21 (45%)   OFF 21   MISSED 12
+```
+
+It crossed the first occlusion and tracked straight through the second, producing 21 frames of
+drift.
+
+### The baseline was defined by the drift
+
+`first_loss` asks whether a score has fallen below what the track "was holding", and took that
+baseline as the **median of all the track's scores**. The check runs after the pass -- so by
+then the drift is IN the scores:
+
+```
+baseline from the whole track   0.61      <- half the track was already drift
+baseline from the first 14      0.99
+```
+
+At 0.61 the threshold is 0.30 and the occluded frames, scoring 0.35, sail through. **The wrong
+frames were defining what normal looked like.** The baseline now comes from the head of the
+track, which is the part anchored to the frame the artist seeded and the only part known to be
+their feature.
+
+That alone over-corrected and began cutting a gentle defocus decline, so a loss must also be a
+**fall**: at least 0.20 below the recent level. Measured, the second occlusion reads
+`0.86 -> 0.61 -> 0.35` across two frames; a defocus slides about 0.02 a frame. Only frames that
+were ACCEPTED update the recent level, so a drift cannot become the new normal one frame at a
+time.
+
+After:
+
+```
+round 0: resumed at f26
+round 1: cut at f33              the second occlusion, correctly
+round 1: resumed at f41
+ON 45 (96%)   OFF 0   MISSED 2
+constant offset +2.5, -2.2 px    scatter 2.2 px rms
+```
+
+The two missed frames are f25 and f40 -- the first frame of each return, lost to `gap = 3`.
+
+The 3.3 px constant offset is the artist and the correlator settling on slightly different
+points OF THE SAME FEATURE; it is the same point every frame and harmless to a solve. The
+scatter, 2.2 px, is the number to compare against Blender's own 2.20 px vs hand tracks.
+
+### A threshold that was measuring the wrong thing
+
+The gate first counted anything over 5 px as WRONG, and reported 3 failures -- all at exactly
+5.0 px, with the best "recovered" frame also at 5.0 px. The same population, split by a line
+invented before the reference existed. Landing on the wrong feature is hundreds of px;
+disagreeing with a human click on a 3840-wide plate is a few. The gate now fails only on
+**off the feature** (>25 px, or a frame the hand track has no sample for) and reports precision
+separately, split into offset and scatter so one cannot hide the other.
+
+### Two defaults that assumed one occlusion
+
+* `rounds` was 3, capped at 10, and not exposed in the panel at all. Now 8, cap 50, and in
+  Options. A shot with five occluders was not configurable.
+* `min_resume_len = 12` abandons a track whose resumed segment is shorter than 12 frames. **The
+  reference's middle run is EIGHT frames.** The rule exists for a real failure -- a point that
+  died to blur re-acquires and dies again immediately, so the loop crawls forward a few frames
+  per round forever -- but length alone cannot tell that from a short window between two
+  occluders. It now gives up only on lack of PROGRESS: a short segment AND two consecutive
+  resumes that barely advanced.
+
+### What this does not settle
+
+* One track, one shot, two occlusions. `min_resume_len`'s new progress rule is reasoned, not
+  measured -- the reference never triggers it.
+* The 0.20 fall and the 10-frame head are judgements fitted to one reference.
+* f25 and f40 are lost to `gap = 3`. A smaller gap would recover them and has not been tested.
+* Nothing here measures what happens with several tracks at once, where the sidecar batches.
