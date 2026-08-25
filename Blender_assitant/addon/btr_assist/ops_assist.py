@@ -216,6 +216,14 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "buys nothing. A resume that crosses a real occlusion has NOT been "
                     "measured that way and still stops. Turn this off to be asked about "
                     "every resume")
+    stop_at_frame_edge: BoolProperty(
+        name="Stop when the pattern leaves frame", default=True,
+        description="End a track as soon as its pattern box reaches the edge of the plate. "
+                    "The pattern is what correlates, so once part of it is off the frame "
+                    "there is nothing there to match -- and Blender does not stop, it "
+                    "solves a SMALLER box and keeps returning positions while the track "
+                    "walks off the feature. The search box is not tested: it routinely "
+                    "hangs off the plate and Blender copes")
     fit_search_box: BoolProperty(
         name="Fit search box to the plate", default=True,
         description="Measure how far the plate actually moves between frames and widen any "
@@ -318,6 +326,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # watches a constant, and animating scale without watching it is how a box
             # quietly swells onto the background for forty frames.
             motion_model="LocScale" if self.animate_scale else "",
+            edge_stop=bool(self.stop_at_frame_edge),
+            # The watch's own "too far from your box" number, reused as a hard bound so the
+            # box cannot reach a degenerate size in the first place. One number, two uses.
+            scale_clamp=(float(self.scale_ratio) if self.animate_scale else 0.0),
             watch_scale=bool(self.watch_scale and self.animate_scale),
             scale_rate=float(self.scale_rate),
             scale_ratio=float(self.scale_ratio))
@@ -354,7 +366,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 # out of the whole watch.
                 tr.motion_model = "LocScale"
             self._records.append({"t": tr, "id": tr.name, "kind": "", "alive": True,
-                                  "w": w, "h": h, "seed_frame": fr[0]})
+                                  "w": w, "h": h, "seed_frame": fr[0],
+                                  "seed_pat": (float(pw), float(ph))})
         if not self._records:
             self.report({"ERROR"}, "the selected tracks have no usable markers")
             return {"CANCELLED"}
@@ -637,10 +650,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 break
         st = self._stats
         self._status(context,
-                     "round %d: frame %d/%d   %d live   %d dead   %d flagged   %d refit"
+                     "round %d: frame %d/%d   %d live   %d dead   %d flagged   %d at edge"
                      % (self._round + 1, st.get("frame", 0), st.get("total", 0),
                         st.get("alive", 0), st.get("deaths", 0), st.get("flagged", 0),
-                        st.get("refit", 0)))
+                        st.get("edge", 0)))
         if not (done or st.get("done")):
             return {"RUNNING_MODAL"}
 
@@ -845,6 +858,13 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                                       self._n_frames, self.tail):
             seed = self._seeds_px.get(tr.name)
             if seed is None or tr.name in self._gave_up:
+                continue
+            rec = next((r for r in self._records if r["id"] == tr.name), None)
+            if rec is not None and rec.get("edge_stopped"):
+                # It did not fail, it left. Every sweep for it would be looking off-plate.
+                self._gave_up.add(tr.name)
+                print("[assist] %s reached the edge of frame at f%d -- finished, not lost"
+                      % (tr.name, rec["edge_stopped"]))
                 continue
             # Did the LAST resume actually buy anything? A point that died to blur rather
             # than to an occluder re-acquires fine and dies again straight away, so without

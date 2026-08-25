@@ -101,6 +101,12 @@ class Opts:
         self.watch_scale = False
         # Per-cell plate motion from the sidecar, or None. With None this loop is
         # byte-identical to what it was -- which is what keeps the parity gate meaningful.
+        # Stop a track when its PATTERN box reaches the edge of the plate. Off here so the
+        # headless path and the parity gate are unchanged; the operator turns it on.
+        self.edge_stop = False
+        # Hard bounds on how far LocScale may take the pattern box from the size the artist
+        # set, as a ratio either way. 0 disables. See `clamp_pattern`.
+        self.scale_clamp = 0.0
         self.motion = None
         self.motion_headroom = 1.5
         self.motion_cap_frac = 0.25
@@ -178,6 +184,68 @@ def attach_watch(records, opts, frame=None):
         r["watch"] = ScaleWatch(size_of(pattern_px(m, r["w"], r["h"])),
                                 rate=opts.scale_rate, ratio=opts.scale_ratio,
                                 onset=opts.scale_onset)
+
+
+def clamp_pattern(marker, w, h, seed_w, seed_h, ratio):
+    """Keep the pattern box within `ratio` of the size the artist set, both ways.
+
+    Under `LocScale` Blender solves a size every frame, and on low-contrast footage that
+    solve is not stable: measured over 30 seeds on SH013, seven tracks ended with a pattern
+    box between **0.3 px and 2.0 px** -- 0.01x to 0.07x of the 28 px they were seeded with --
+    and one ballooned to 237 px (8.5x). A sub-pixel pattern is not tracking anything, and the
+    track does not die; it keeps returning positions, so the span looks excellent. Those
+    tracks are the "302 of 303 frames" successes, and most of their frames are drift with a
+    marker attached.
+
+    Totals over the same 30 seeds: `Loc` produced 1660 tracked frames with no degenerate box;
+    `LocScale` produced 2414, of which the extra came largely from boxes that had collapsed.
+    Longer, and worth less.
+
+    Position is NOT touched -- only the box. Same rule as the search-box re-fit and the
+    watch's `bad-box` repair: geometry is what the evidence supports correcting, the position
+    stays Blender's measurement.
+
+    Returns the clamped width in px, or 0.0 if nothing changed.
+    """
+    if ratio <= 1.0 or seed_w <= 0.0 or seed_h <= 0.0:
+        return 0.0
+    xs = [c[0] for c in marker.pattern_corners]
+    ys = [c[1] for c in marker.pattern_corners]
+    pw = (max(xs) - min(xs)) * w
+    ph = (max(ys) - min(ys)) * h
+    if pw <= 0.0 or ph <= 0.0:
+        pw, ph = seed_w, seed_h
+    lo_w, hi_w = seed_w / ratio, seed_w * ratio
+    lo_h, hi_h = seed_h / ratio, seed_h * ratio
+    nw = min(hi_w, max(lo_w, pw))
+    nh = min(hi_h, max(lo_h, ph))
+    if abs(nw - pw) < 0.5 and abs(nh - ph) < 0.5:
+        return 0.0
+    hu, hv = nw / 2.0 / w, nh / 2.0 / h
+    marker.pattern_corners = ((-hu, -hv), (hu, -hv), (hu, hv), (-hu, hv))
+    return nw
+
+
+def pattern_outside(marker, w, h):
+    """Is any part of this marker's PATTERN box off the plate?
+
+    The pattern is what correlates. Once part of it is outside the frame there is nothing
+    there to match, and Blender does not stop -- under `LocScale` it solves a SMALLER box
+    instead, keeps returning a position, and the track walks off the feature while still
+    looking alive. Measured on SH013 a track ended 15 px from the frame edge with its pattern
+    already shrunk from 28.0 px to 23.9, and the frames before it are the drift.
+
+    The SEARCH box is deliberately not tested. It routinely hangs off the plate and Blender
+    copes -- a track was measured running to 1 px from the edge with a 167 px search box --
+    so stopping on that would cut every edge-bound track short for no reason.
+    """
+    xs = [c[0] for c in marker.pattern_corners]
+    ys = [c[1] for c in marker.pattern_corners]
+    x0 = (marker.co[0] + min(xs)) * w
+    x1 = (marker.co[0] + max(xs)) * w
+    y0 = (marker.co[1] + min(ys)) * h
+    y1 = (marker.co[1] + max(ys)) * h
+    return x0 < 0.0 or y0 < 0.0 or x1 > float(w) or y1 > float(h)
 
 
 def motion_at(mo, x, y, w, h):
@@ -312,7 +380,8 @@ def seed_tracks(clip, seeds, opts, tracks=None):
         m.co = (float(s["u"]), float(s["v"]))
         set_geom(m, pat, srch, w, h)
         made.append({"t": t, "id": s["id"], "kind": kind, "pat": pat, "srch": srch,
-                     "alive": True, "w": w, "h": h, "seed_frame": int(s["frame"])})
+                     "alive": True, "w": w, "h": h, "seed_frame": int(s["frame"]),
+                     "seed_pat": (float(pat), float(pat))})
     return made
 
 
@@ -389,7 +458,8 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
     running = []
     st = stats if stats is not None else {}
     st.update({"deaths": 0, "clamped": 0, "entered": 0, "calls": 0, "flagged": 0,
-               "refit": 0, "frame": 0, "total": len(frames), "alive": 0, "done": False})
+               "refit": 0, "edge": 0, "boxclamp": 0, "frame": 0, "total": len(frames),
+               "alive": 0, "done": False})
 
     for i, f in enumerate(frames):
         newly = live.pop(f, [])
@@ -414,6 +484,23 @@ def track_job(ctx, records, n_frames, guide, opts, backwards=False, stats=None):
                 r["alive"] = False
                 st["deaths"] += 1
                 continue
+            # Keep the pattern box a plausible size BEFORE anything reads it -- the edge
+            # test, the watch and the next step all ask how big it is.
+            if opts.scale_clamp > 1.0:
+                sp = r.get("seed_pat")
+                if sp and clamp_pattern(m, r["w"], r["h"], sp[0], sp[1], opts.scale_clamp):
+                    st["boxclamp"] += 1
+
+            # The pattern box has reached the edge of the plate. Stop -- but keep this
+            # marker: the position Blender just measured is not wrong, it is the LAST one
+            # measured by a box that was still fully on the plate's side of the line. What
+            # comes after it is the drift, and nothing is deleted to establish that.
+            if opts.edge_stop and pattern_outside(m, r["w"], r["h"]):
+                r["alive"] = False
+                r["edge_stopped"] = int(nxt)
+                st["edge"] += 1
+                continue
+
             # Re-fit the search box to where the feature has GOT to, not where it started.
             # Before the scale watch and the leash on purpose: both of those judge a marker
             # that has already been placed, while this decides whether the NEXT step can

@@ -176,6 +176,7 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
             op.min_match = p.min_match
             op.confirm_resumes = p.confirm_resumes
             op.fit_search_box = p.fit_search_box
+            op.stop_at_frame_edge = p.stop_at_frame_edge
             op.confirm_only_occluded = p.confirm_only_occluded
             op.animate_scale = p.animate_scale
             op.watch_scale = p.watch_scale
@@ -185,6 +186,7 @@ class CLIP_PT_btr_assist(bpy.types.Panel):
 
         if p is not None:
             sub = layout.column(align=True)
+            sub.prop(p, "stop_at_frame_edge", text="Stop at frame edge")
             sub.prop(p, "fit_search_box", text="Fit search box to plate")
             sub.prop(p, "confirm_resumes", text="Confirm each re-acquire")
             row_c = sub.row()

@@ -1579,3 +1579,58 @@ overruling them on their own plate.
 **What this does not settle:** the rule is one shot, n=30, spans only. Whether std predicts
 span on footage that is not uniform dirt is untested, and the two numbers are reported rather
 than combined precisely because there is not enough evidence to combine them honestly.
+
+### The box shrank and the track drifted, with the span still looking fine (2026-08-24)
+
+The artist's diagnosis, and it is correct: *"the pattern box goes smaller and drifts away."*
+They proposed ending the track when the box hits the frame border. Both halves were measured
+and only one of them is where the damage is.
+
+**The border rule changes nothing here.** Implemented (`edge_stop`, on by default) and run over
+30 seeds: **0 of 30 tracks stopped earlier**, including four whose markers end OFF the plate
+(-18, -2, -23, -49 px). Blender already stops at or just past the border on this footage, so
+the rule fires on the frame the track was ending anyway. It is kept because a pattern box
+straddling the frame edge is correlating against nothing and that is worth refusing on
+principle -- but it earned no frames, and saying otherwise would be inventing a result.
+
+**The collapse is everywhere, not at the border.** Pattern box over each track's life, 30
+seeds, `LocScale`, shipped config:
+
+| trk | span | seed px | end px | end/seed | first under 60 % |
+|---|---|---|---|---|---|
+| P04 | 251 | 28.0 | **0.3** | 0.01 | f173 |
+| P07 | 303 | 28.0 | **0.7** | 0.03 | f38 |
+| P00 | 302 | 28.0 | **1.5** | 0.06 | f78 |
+| P12 | 71 | 28.0 | **0.6** | 0.02 | f40 |
+| P16 | 58 | 28.0 | 237.4 | **8.47** | - |
+
+A 0.3 px pattern is not tracking anything, and the track does not die -- it keeps returning
+positions. **This invalidates span as a success measure, including numbers reported earlier in
+this file.** P07 "ran the full 303-frame shot" with its box collapsed by frame 38; roughly 265
+of those frames are drift with a marker attached.
+
+Totals over the same 30 seeds:
+
+| config | tracked frames | degenerate boxes |
+|---|---|---|
+| `Loc` | 1660 | 0 |
+| `LocScale` (shipped) | 2535 | **13 of 30** |
+| `LocScale` + clamp | **2037** | **0** |
+
+`LocScale`'s apparent 875-frame advantage over `Loc` was mostly collapsed boxes. Clamping the
+box to within `scale_ratio` of the size the artist set removes every degenerate case and still
+beats `Loc` by 377 honest frames, so scale tracking keeps its value rather than being switched
+off.
+
+`clamp_pattern` touches the box only, never the position -- the same rule as the search-box
+re-fit and the watch's `bad-box` repair: geometry is what the evidence supports correcting.
+It reuses `scale_ratio`, the watch's own "too far from your box" number, so one setting bounds
+both what is flagged and what is possible. `Opts.scale_clamp` defaults to 0 (off), so the
+headless path and the parity gate are unchanged.
+
+**What this does not settle:** still spans, not accuracy -- there is no reference on SH013, so
+"honest frames" means "the box was a plausible size", not "the marker was on the feature". The
+degenerate-box threshold (0.6-1.8x of seed) used to count failures is a reading aid, not a
+measured boundary. And the earlier scale-watch fix (`lost` -> `unknown`) means a collapsing box
+no longer gets cut back; the clamp is now what prevents the degenerate state instead, which is
+a better place to stop it but was not the reasoning at the time.

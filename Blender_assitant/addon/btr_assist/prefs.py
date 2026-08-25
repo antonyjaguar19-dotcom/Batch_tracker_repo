@@ -83,6 +83,11 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "nothing occluded the worst single frame was 6.66 px and none landed on "
                     "a different feature. Crossing a real occlusion has not been measured "
                     "that way and still stops for you")
+    stop_at_frame_edge: BoolProperty(
+        name="Stop when the pattern leaves frame", default=True,
+        description="End a track as soon as its pattern box reaches the edge of the plate, "
+                    "rather than letting Blender shrink the box and keep going while the "
+                    "track drifts off the feature")
     fit_search_box: BoolProperty(
         name="Fit search box to the plate", default=True,
         description="Measure how far the plate moves between frames and widen any search box "
@@ -119,6 +124,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "stop_at_frame_edge")
         layout.prop(self, "fit_search_box")
         layout.prop(self, "confirm_resumes")
         sub_c = layout.row()
