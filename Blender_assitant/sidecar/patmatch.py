@@ -175,7 +175,8 @@ def best_candidate(plate, patch, offset, candidates, radius=32.0):
     return best[0], best[1], best[2], best[3], tried
 
 
-def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40, on_status=None):
+def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40,
+                      band=0.04, on_status=None):
     """When does each feature come back, and where?
 
     This is the answer to "Blender lost it -- skip ahead to where it is again". Each job is
@@ -184,19 +185,37 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40, on_stat
 
     where `path` is the guide's predicted position for EVERY frame after the failure, in
     frame order. The sweep walks those frames ONCE, decoding each frame a single time and
-    testing every job still looking, and resolves a job at the FIRST frame whose correlation
-    against `patch` reaches `min_match`.
+    testing every job still looking, and resolves a job at the EARLIEST frame that scores
+    within `band` of the best score it saw.
 
     `patch` is the LOCALISATION reference and is normally the feature as the track last saw
     it, not as it was seeded -- the caller decides. This function does not check identity;
     finding where something is and deciding whether it is the right something are separate
     questions, answered with different pictures. See `server.py`'s reacquire handler.
 
-    First, not best. Best-over-the-whole-window would skip past a perfectly good return in
-    favour of a marginally sharper frame fifty frames later, and every frame it skipped is a
-    frame the artist has to track by hand. But the first frame over the line is often the
-    feature only half back, so once one passes, the next `settle` frames are also scored and
-    the best of that short run wins -- earliest return, best landing within it.
+    This used to be FIRST over the line, on the reasoning that best-over-the-window would
+    skip past a perfectly good return for a marginally sharper frame fifty frames later, and
+    every skipped frame is one the artist tracks by hand. Measured against the first hand
+    track this project has through an occlusion (SH006, feature hidden f15-24, back at f25):
+
+        chosen by "first over the line"   f17  score 0.84   INSIDE the occlusion, no
+                                                            hand-track sample exists there
+        every other candidate             f26  0.99   1.7 px from the hand track
+                                          f31  0.98   1.4 px
+                                          f45  0.95   1.2 px
+
+    The "perfectly good return" the old rule protected was the occluder. Every alternative
+    was on the feature within 2.4 px; only the selection was wrong.
+
+    So: the earliest frame scoring within `band` of the best. That keeps what the old rule
+    was defending -- it will not skip to frame 45 when 26 is just as good -- while refusing
+    a marginal crossing when something clearly better exists. On the case above it picks
+    f26 (0.99) over f31 (0.98) and never considers f17 (0.84).
+
+    A caution that still stands: a score is comparable WITHIN one sweep, where every
+    candidate is the same patch against the same track. It is NOT comparable across tracks
+    or shots -- measured separately, the worst landings across a reference set scored
+    0.85-0.98. This rule only ever compares within a sweep.
 
     Jobs are processed in whatever order they are given and share the decode, so the cost is
     one pass over the window regardless of how many tracks are looking.
@@ -283,6 +302,16 @@ def find_reappearance(plate, jobs, min_match=0.60, settle=4, collect=40, on_stat
 
     out = {}
     for k, s in state.items():
+        # Pick the earliest frame within `band` of the best this sweep saw. `first_frame`
+        # keeps recording the first crossing, so a report can still say where it started.
+        cands = [c for c in top_candidates(s["seen"], k=24, min_gap=1)
+                 if c["score"] >= min_match]
+        if cands:
+            best = max(c["score"] for c in cands)
+            pick = min((c for c in cands if c["score"] >= best - band),
+                       key=lambda c: c["frame"])
+            s["frame"], s["x"], s["y"] = pick["frame"], pick["x"], pick["y"]
+            s["score"] = pick["score"]
         out[k] = {"frame": s["frame"], "x": s["x"], "y": s["y"], "score": s["score"],
                   "first_frame": s["first_frame"], "scanned": s["scanned"],
                   "best_seen": None if s["best_seen"] < -0.5 else float(s["best_seen"]),

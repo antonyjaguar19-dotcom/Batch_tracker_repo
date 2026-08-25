@@ -1815,3 +1815,61 @@ If that holds on more shots, the default is worth revisiting. It needs more than
 * `collect = 40` frames of extra scoring costs decode time on every re-acquire, unmeasured.
 * Candidates are ranked by score. Given the score does not predict accuracy, an artist may
   still have to walk the whole list -- the ordering is a convenience, not a claim.
+
+### The candidates were right; the rule that chose between them was not (2026-08-25, SH006)
+
+The artist hand-tracked the occluded feature. **The first reference this project has for an
+occlusion** -- everything before it was scored against Blender's own output, a synthetic
+plate, or Lucas-Kanade, and none of those can say whether a resume landed on the right thing.
+
+`reacquretracke_manual.txt`, runs `[[1, 14], [25, 32], [40, 64]]`. It ends at f14 and resumes
+at f25.
+
+That alone confirms two things shipped earlier on thinner evidence:
+
+* the hold check cut the track at **f15** -- the frame after the hand track's first run ends;
+* CoTracker queried at the artist's seed reported the feature back at **f25** -- the frame the
+  hand track resumes on.
+
+Then the measurement that mattered. Every candidate scored against the hand track:
+
+| chosen by | frame | score | error vs hand track |
+|---|---|---|---|
+| **"first over the line" (was shipped)** | f17 | 0.84 | **no hand sample -- inside the occlusion** |
+| | f26 | 0.99 | **1.7 px** |
+| | f31 | 0.98 | 1.4 px |
+| | f45 | 0.95 | 1.2 px |
+| | f42 | 0.95 | 1.3 px |
+| | f48 | 0.94 | 2.4 px |
+
+**Every alternative was on the feature within 2.4 px.** The sweep, the localisation patch and
+the candidate list were all working. The single wrong thing was which candidate got picked.
+
+The old rule -- first frame over `min_match` -- was defending against skipping past a good
+return for a marginally sharper frame later, at the cost of frames the artist then tracks by
+hand. On this shot the "good return" it was defending was the occluder.
+
+Now: **the earliest frame scoring within `band` (0.04) of the best in that sweep.** It still
+refuses to skip to f45 when f26 is as good -- it picks f26 over f31 -- and never considers
+f17. Measured after the change:
+
+```
+the loop proposes f26 (match 0.973)  ->  1.7 px from the hand track, ON the feature
+```
+
+A caution kept in the code: a score is comparable **within one sweep**, where every candidate
+is the same patch against the same track. It is NOT comparable across tracks -- measured on
+the SH004 known-answer set, the worst landings scored 0.85-0.98. This rule only ever compares
+within a sweep, which is why it is sound here and would not be as a global threshold.
+
+`tests/eval_reacquire.py` makes the reference a gate: the resume must land on a frame the hand
+track actually has, and within 5 px of it. Both conditions matter and they are different
+claims -- landing inside the occlusion is the failure the reference was brought in to catch.
+
+### What this does not settle
+
+* One occlusion, one track, one shot. The band (0.04) is a judgement; the evidence says only
+  that 0.84 must lose to 0.99.
+* The resume lands at f26 while the artist resumed at f25. One frame of the return is left to
+  the gap. `gap = 3` starts the search at f17 and f25 did not survive candidate spacing.
+* The hand track has a second gap at f33-39 that nothing here has been tested against.
