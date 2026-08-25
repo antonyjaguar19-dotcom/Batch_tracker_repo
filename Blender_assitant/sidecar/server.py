@@ -246,7 +246,8 @@ def job_hold(payload):
             if not path_pts:
                 results.append({"id": r["id"], "lost_at": None, "reason": "no positions"})
                 continue
-            scores = patmatch.hold_check(plate, patch, off, path_pts)
+            scores = patmatch.hold_check(plate, patch, off, path_pts,
+                                         probe_radius=float(params.get("probe_radius", 0.0)))
             lost = patmatch.first_loss(scores, floor=floor, drop=drop)
             got = [r[1] for r in scores if r[1] is not None]
             results.append({
@@ -257,7 +258,9 @@ def job_hold(payload):
                 "score_last": round(got[-1], 3) if got else None,
                 "score_median": round(sorted(got)[len(got) // 2], 3) if got else None,
                 "scores": [[r[0], (None if r[1] is None else round(r[1], 3)),
-                            (None if len(r) < 3 or r[2] is None else round(r[2], 3))]
+                            (None if len(r) < 3 or r[2] is None else round(r[2], 3)),
+                            (None if len(r) < 4 or r[3] is None else round(r[3], 3)),
+                            (None if len(r) < 5 or r[4] is None else round(r[4], 1))]
                            for r in scores],
             })
             if lost:

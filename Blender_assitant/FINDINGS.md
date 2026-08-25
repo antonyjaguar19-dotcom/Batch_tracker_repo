@@ -2172,3 +2172,72 @@ turning into honest gaps rather than wrong data is the trade that was asked for.
 * The margin costs a wide correlation per frame per track, on top of the existing one. Not
   profiled.
 * 15 gaps on reference 2 are unexamined; some may be recoverable with a smaller `gap`.
+
+### QC: does the track still end on the pattern it started with? (2026-08-25)
+
+The artist: *"always compare the pattern that the track ends at with the pattern on which the
+user seeds, to check if the track is correctly tracked. Use this as one of the QC methods."*
+
+The one question asked of a FINISHED track, and the addon had no way to answer it. Every other
+check here judges a track while the assist loop is building it — the scale watch, the hold
+check, the jump check. A track tracked by hand, imported from 3DE, or made before any of this
+existed got nothing at all.
+
+### The obvious version is wrong, and the artist's own files prove it
+
+First attempt: correlate the seed patch at the last frame, compare against what it scored over
+the track's opening, fail below 75 %.
+
+```
+NOT ON IT  Track.002: ends at 0.49 (49 % of its own)     the drifting assist track
+NOT ON IT  Track.003: ends at 0.72 (73 % of its own)     the ARTIST'S OWN HAND TRACK
+```
+
+Their 250-frame hand track is on the feature the whole way, and still ends at 0.72 — because
+over 250 frames a feature legitimately changes: perspective, light, scale. **An end-vs-start
+ratio punishes long tracks for the plate doing what plates do.** Any threshold that passes
+0.72 and fails 0.49 is being fitted to two numbers.
+
+### The question that survives appearance change
+
+Not *"does it still look the same"* but *"is there somewhere better it should be"*. A track
+sitting on its feature is at the local optimum even when its score has fallen. A track that
+slid off has a much better answer a short distance away:
+
+| track | last frame | at the claimed position | best within 60 px | gain |
+|---|---|---|---|---|
+| Track.002 (drifted) | f95 | 0.501 | **0.979, 23 px away** | **0.478** |
+| Track.003 (hand track) | f250 | 0.731 | 0.786 | **0.055** |
+
+An order of magnitude apart, and the reading does not care that the feature looks different.
+`PROBE_GAIN = 0.10` sits between them with room on both sides.
+
+The end-vs-opening ratio is still REPORTED — it is what an artist reads to see how much the
+feature has changed — but it is not the verdict.
+
+```
+NOT ON IT  Track.002: f1-95,  ends at 0.49 (49 % of its own) -- 0.97 sits 23 px away
+on it      Track.003: f1-250, ends at 0.72 (73 % of its own), and nothing better is nearby
+```
+
+### Deliberately read-only
+
+It reports and edits nothing. A QC pass that modifies what it is checking is not a QC pass —
+and earlier in this same week a check that DID edit deleted correct work and reported the
+deletion as a repair.
+
+Runs on any track in the clip, selected or all. **Assist ▸ 3DE tracks ▸ Check ends on my
+pattern.**
+
+`tests/test_qc_ends.py` drives the real operator on the artist's two files, imported into
+Blender from 3DE. The pair is what makes it a test rather than a threshold: both tracks meet
+the SAME ambiguous texture at the SAME frames, so anything separating them must be reading the
+track and not the plate.
+
+### What this does not settle
+
+* Two tracks, one shot. The gain separates 0.478 from 0.055 here; that is one comparison.
+* `PROBE_RADIUS = 60 px` is a judgement. A track that slid further than that reads as "nothing
+  better nearby" and passes.
+* It checks the LAST frame only. A track that wanders off and comes back would pass.
+* The probe costs one extra wide correlation per track per checked frame. Not profiled.

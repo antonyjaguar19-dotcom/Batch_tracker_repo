@@ -365,7 +365,8 @@ def peak_margin(img, patch, cx, cy, offset=(0.0, 0.0), radius=120.0, sep=30.0):
     return best, None, None
 
 
-def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0):
+def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
+               probe_radius=0.0):
     """Score the artist's own patch at every position a track claims, in frame order.
 
     Blender tracks with PREV_FRAME: each frame is matched against the one before it. That is
@@ -396,7 +397,21 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0):
         got = match_in(img, patch, float(x), float(y), radius=radius, offset=offset)
         _b, _s, mg = peak_margin(img, patch, float(x), float(y), offset=offset,
                                  radius=margin_radius)
-        out.append((int(f), None if got is None else float(got[2]), mg))
+        gain = dist = None
+        if probe_radius > 0.0 and got is not None:
+            # Is there somewhere BETTER nearby? The question that survives a feature
+            # legitimately changing appearance. A track sitting on its feature is at the
+            # local optimum even when its absolute score has fallen; a track that has slid
+            # off has a much better answer a short distance away. Measured on SH006 at each
+            # track's last frame: the drifted one scores 0.501 where 0.979 sits 23 px away,
+            # while the artist's hand track scores 0.731 with only 0.786 available -- a gain
+            # of 0.478 against 0.055.
+            near = match_in(img, patch, float(x), float(y), radius=probe_radius,
+                            offset=offset)
+            if near is not None:
+                gain = float(near[2]) - float(got[2])
+                dist = math.hypot(near[0] - float(x), near[1] - float(y))
+        out.append((int(f), None if got is None else float(got[2]), mg, gain, dist))
     return out
 
 

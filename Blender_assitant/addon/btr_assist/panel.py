@@ -214,6 +214,9 @@ class CLIP_PT_btr_3de(_Base):
         col.operator("clip.btr_import_3de", text="Import", icon="IMPORT")
         col.operator("clip.btr_export_3de", text="Export", icon="EXPORT")
         layout.operator("clip.btr_check_3de", text="Check tracks", icon="INFO")
+        # The QC an artist actually asks about a finished track: is it still on the thing
+        # they picked? Lives here rather than in Options because it is a thing you DO.
+        layout.operator("clip.btr_qc_ends", text="Check ends on my pattern", icon="CHECKMARK")
         layout.label(text="Gaps are kept in both directions.")
 
 

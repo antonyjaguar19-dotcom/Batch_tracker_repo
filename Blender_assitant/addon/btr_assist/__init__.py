@@ -42,9 +42,10 @@ VERSION = bl_info["version"]
 #: moves on release cannot distinguish those. This moves on every build.
 BUILD = "dev"
 
-from . import ops_3de, ops_assist, ops_diag, ops_seed, overlay, panel, prefs
+from . import (ops_3de, ops_assist, ops_diag, ops_qc, ops_seed, overlay,
+               panel, prefs)
 
-MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, panel)
+MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_qc, panel)
 
 
 def register():
