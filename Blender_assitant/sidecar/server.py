@@ -644,6 +644,25 @@ def job_reacquire(payload):
                         got = patmatch.match(plate, f, vpatch, x, y,
                                              radius=VERIFY_RADIUS, offset=voff)
                     score = None if got is None else float(got[2])
+                    if got is not None and score is not None and score >= min_match:
+                        # Take the POSITION too, not only the score. Localisation used the
+                        # feature as the track last saw it, and that patch was cut mid-track
+                        # -- its peak sits at a different sub-position within the feature
+                        # than the artist's own seed. Blender then carries that offset for
+                        # the whole resumed run.
+                        #
+                        # Measured on the artist's v002 output against their hand track:
+                        #     run f1-15   offset 2.34 px   (their click vs the correlator)
+                        #     run f29-33  offset 7.22 px
+                        #     run f41-64  offset 5.06 px
+                        # each run internally tight (0.2-0.4 px scatter) but each resume
+                        # landing at its own bias. Refining against the seed patch pulls
+                        # f29 from 7.14 px to 3.69 and f41 from 4.75 to 4.08, back toward
+                        # the run-1 baseline.
+                        #
+                        # Only within VERIFY_RADIUS, and only when the seed patch is
+                        # confident: this adjusts a sub-position, it does not go looking.
+                        x, y = float(got[0]), float(got[1])
                     if score is None:
                         # Cannot be judged -- the box does not fit at this size here. Say so
                         # rather than passing an unchecked resume off as verified.

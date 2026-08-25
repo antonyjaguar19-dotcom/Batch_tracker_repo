@@ -2011,3 +2011,73 @@ on a 40 px/frame track is.
 * One plate for the false-positive rate. 1 in 20 is not a measured rate, it is one observation.
 * A slow drift that never exceeds 3x the median is invisible to it. That case belongs to the
   appearance check, and the two are deliberately independent.
+
+### Every resume landed at its own offset (2026-08-25, SH006 v002)
+
+The artist, on a run where the re-acquire finally worked: *"the track is placed offset in the
+pattern when compared to the first frame."* Measured against their hand track, per RUN:
+
+| run | offset vs hand track | scatter inside the run |
+|---|---|---|
+| f1-15 | 2.34 px | 0.38 px |
+| f29-33 | **7.22 px** | 0.31 px |
+| f41-64 | **5.06 px** | 0.23 px |
+
+Each run is internally excellent -- a fifth of a pixel of scatter. But each one sits at its
+own constant bias, and Blender carries that bias for the whole run once it starts.
+
+Run 1's 2.34 px is the artist's click against the correlator's idea of the same feature, and
+is unavoidable. The extra 3-5 px on the resumed runs is ours.
+
+**Cause: the resume is planted at the peak of the LAST-GOOD patch.** That patch is cut
+mid-track, and its correlation peak sits at a different sub-position within the feature than
+the artist's original seed. The seed patch is already correlated at that position immediately
+afterwards, to verify identity -- and its peak POSITION was being discarded, only the score
+kept.
+
+Taking the position too, within `VERIFY_RADIUS` and only when the seed patch is confident:
+
+```
+f29   7.14 px -> 3.69 px   (seed NCC 0.96)
+f41   4.75 px -> 4.08 px   (seed NCC 0.93)
+```
+
+Whole-track, against the hand track:
+
+| | before | after |
+|---|---|---|
+| constant offset | +2.5, -2.2 (3.3 px) | **-0.8, +2.3 (2.4 px)** |
+| within 5 px | 93 % | **100 %** |
+| p50 | 4.6 px | 4.0 px |
+
+2.4 px is run 1's own baseline, so the resume-introduced bias is gone rather than reduced.
+
+This is deliberately NOT the peak-offset metric removed earlier. That one proposed MOVING an
+existing tracked marker onto a stale patch's peak, and was measured to drag healthy tracks
+tens of pixels. This places a NEW marker that has no position yet, within 6 px, only when the
+artist's own patch is confident there.
+
+### Search radius: dynamic in magnitude, never in direction
+
+Recorded because it was asked and the answer is not in one place:
+
+* **Tracking** -- dynamic per region AND per frame. `motion.measure` reports p95 motion on a
+  6x4 grid; the box is `2 * (p95 * 1.5 + pattern/2)`, capped at a quarter of plate width, and
+  `refit_search` re-fits it every frame from the cell the marker has reached. SH013: 55 -> 213
+  px. SH004's slow plate: stays 55.
+* **Re-acquire sweep** -- `clamp(search_px / 2, 8, 96)`, inherited from the marker's own box.
+* **Verify** -- fixed 6 px, deliberately: a second opinion on one spot, not a search.
+
+**None of them uses the motion VECTOR.** Magnitude only. A box centred on the last position
+must therefore cover motion in every direction while the feature travels in one, and a large
+box is exactly what lets a lookalike win. Predicting the next position from the track's own
+velocity would allow a much smaller box centred where the feature is going. `track_job`
+already has the clamping machinery (`opts.leash`) and `first_jump` already computes per-frame
+steps. Not built, not measured.
+
+### What this does not settle
+
+* Two resumes on one track. The refinement is bounded by `VERIFY_RADIUS = 6 px`; a resume
+  landing further out than that keeps its bias.
+* 2.4 px of offset remains and is attributed to the artist's click vs the correlator. That is
+  an inference from run 1, not a measurement of either.
