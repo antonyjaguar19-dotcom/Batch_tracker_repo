@@ -1960,3 +1960,54 @@ separately, split into offset and scatter so one cannot hide the other.
 * The 0.20 fall and the 10-frame head are judgements fitted to one reference.
 * f25 and f40 are lost to `gap = 3`. A smaller gap would recover them and has not been tested.
 * Nothing here measures what happens with several tracks at once, where the sidecar batches.
+
+### Motion does not lie: cutting jumps and slides without the plate (2026-08-25, SH006)
+
+The artist supplied both files for the same feature -- what they hand-tracked, and what the
+assistant produced beside it -- and named the two faults: *"the unwanted jumps and the
+unwanted slides."*
+
+Compared frame by frame, they are **the same signal at different sizes**:
+
+| frame | assist step | what it is |
+|---|---|---|
+| f15 | **39.5 px** against a recent median of 9 | the occluder arriving |
+| f20-23 | 28-34 px sustained | sliding along it |
+| f24 | **70.4 px** | |
+| f25-26 | -- | 120-129 px OFF the feature |
+| f27 | **116.5 px** | snapping back onto the feature by luck |
+
+**The hand track never steps more than 16 px.**
+
+None of this is visible to a correlation score. An occluder that resembles the feature keeps
+Blender satisfied the whole way -- which is precisely how the track survived to f33 without
+ever dying. The appearance check catches it only when the occluder looks *different*.
+
+`track_core.first_jump` reads the track's own positions. No plate, no sidecar, no GPU, so it
+runs even when the appearance check cannot. Each step is judged against **the track's own
+recent median**, not an absolute speed: a plate moving 40 px a frame everywhere is not
+jumping. Steps across a gap are skipped -- a resume is a new head. Six samples must exist
+first, or a track that starts slow and accelerates is cut on its own acceleration (measured:
+the artist's hand track trips at f5 without it).
+
+Chosen `k = 3.0`, floor 12 px, 6 samples. The separation on this reference is 39 px against a
+9 px median -- 4.3x -- so every parameter set in a sweep from k=2.5 to 4.0 gave the same
+answer, which means this shot does not discriminate between them. Conservative values were
+taken for that reason, not because they were fitted.
+
+False-positive check on SH013, where motion is genuinely 20-50 px/frame and varies: **1 of 20
+tracks** would be cut, and that one goes from a 1 px/frame median to a 17 px step, which is a
+real discontinuity.
+
+`tests/test_jump.py` pins both artist files: the hand track is never cut, the assist output is
+cut at f15, a gap is not a jump, a steady 40 px/frame track is not a jump, and a 400 px step
+on a 40 px/frame track is.
+
+### What this does not settle
+
+* The jump rule fires at f67 on the reference run -- past the hand track's end at f64 -- so on
+  this shot it never changed the scored result. It is proven against the artist's earlier
+  output, not against the current loop's.
+* One plate for the false-positive rate. 1 in 20 is not a measured rate, it is one observation.
+* A slow drift that never exceeds 3x the median is invisible to it. That case belongs to the
+  appearance check, and the two are deliberately independent.

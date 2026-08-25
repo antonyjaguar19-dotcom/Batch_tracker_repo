@@ -226,6 +226,53 @@ def clamp_pattern(marker, w, h, seed_w, seed_h, ratio):
     return nw
 
 
+def first_jump(path, k=3.0, floor=12.0, look=8, minimum=6):
+    """The first frame where a track moves out of character with its own motion.
+
+    Costs nothing and needs no plate: it reads the track's own positions. That matters
+    because the appearance check cannot see this case -- an occluder that looks like the
+    feature keeps the correlation happy while the marker is dragged somewhere it could not
+    physically have gone.
+
+    Measured against an artist's hand track and the assist output for the same feature
+    (SH006). Their hand track never steps more than 16 px. The assist output:
+
+        f15  step 39.5 px  against a recent median of 9    the occluder arriving
+        f20-23  steps 28-34 px                             sliding on it
+        f24  step 70.4 px
+        f27  step 116.5 px                                 snapping back by luck
+
+    Both of the artist's complaints -- "unwanted jumps" and "unwanted slides" -- are the
+    same signal at different sizes, and both are invisible to a correlation score.
+
+    Judged against the track's OWN recent median rather than an absolute speed, because a
+    plate that moves 40 px a frame everywhere is not jumping. `minimum` samples must exist
+    first: a track that starts slow and accelerates would otherwise be cut on its own
+    acceleration -- measured, the hand track above trips at f5 without it.
+
+    Steps ACROSS a gap are skipped. A resume is a new head, and the distance from the last
+    frame before an occlusion means nothing.
+
+    Returns (frame, step, median) or (None, None, None).
+    """
+    recent = []
+    prev = None
+    for f, x, y in path:
+        if prev is not None and int(f) == int(prev[0]) + 1:
+            step = math.hypot(x - prev[1], y - prev[2])
+            if len(recent) >= minimum:
+                med = sorted(recent)[len(recent) // 2]
+                if step > floor and step > k * max(med, 1.0):
+                    return int(f), step, med
+            recent.append(step)
+            if len(recent) > look:
+                recent.pop(0)
+        else:
+            recent = []
+        prev = (f, x, y)
+    return None, None, None
+
+
 def pattern_outside(marker, w, h):
     """Is any part of this marker's PATTERN box off the plate?
 

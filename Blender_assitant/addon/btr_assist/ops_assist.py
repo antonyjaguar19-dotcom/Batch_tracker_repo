@@ -725,7 +725,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         # runs on the whole pass at once, and what it finds is removed rather than reported,
         # because a drifted marker in a track file is worse than a gap -- 3DE will happily
         # solve to it.
+        # Motion first: it needs no plate and no sidecar, so a jump is cut even when the
+        # appearance check cannot run at all. An occluder that resembles the feature keeps
+        # correlation satisfied while dragging the marker somewhere it could not have gone.
         if self.hold_feature and not self._hold_done:
+            self._cut_jumps(context)
             if self._start_hold(context):
                 return {"RUNNING_MODAL"}
             self._hold_done = True
@@ -748,6 +752,27 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         return self._ask_cotracker(context)
 
     # ---------------------------------------------------------------- holding the feature
+
+    def _cut_jumps(self, context):
+        """Cut every track at its first out-of-character move. Plate-free."""
+        w, h = self._clip.size
+        for rec in self._records:
+            tr = rec["t"]
+            path = sorted([int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
+                          for m in tr.markers if not m.mute)
+            f, step, med = track_core.first_jump(path)
+            if not f:
+                continue
+            gone = [m.frame for m in tr.markers if m.frame >= int(f)]
+            for g in gone:
+                if len(tr.markers) <= 1:
+                    break
+                tr.markers.delete_frame(g)
+            rec["alive"] = False
+            self._cut.append((rec["id"], int(f), len(gone)))
+            print("[assist] %s jumped %.0f px at f%d against its own %.0f px/frame -- "
+                  "%d frame(s) removed, re-acquire takes it from here"
+                  % (rec["id"], step, f, med, len(gone)))
 
     def _start_hold(self, context):
         """Ask the plate whether each track is still on the feature the artist chose.

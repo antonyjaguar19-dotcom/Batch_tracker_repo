@@ -147,6 +147,17 @@ def main():
         if not live_frames(tr):
             break
 
+        # Motion check first -- plate-free, and it catches the occluder that keeps
+        # correlation happy while dragging the marker.
+        jpath = sorted([int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
+                       for m in tr.markers if not m.mute)
+        jf, jstep, jmed = track_core.first_jump(jpath)
+        if jf:
+            for g in [m.frame for m in tr.markers if m.frame >= int(jf)]:
+                if len(tr.markers) > 1:
+                    tr.markers.delete_frame(g)
+            log("round %d: jump cut at f%d (%.0f px vs its own %.0f)" % (rnd, jf, jstep, jmed))
+
         path = [[int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
                 for m in tr.markers if not m.mute]
         path.sort()
