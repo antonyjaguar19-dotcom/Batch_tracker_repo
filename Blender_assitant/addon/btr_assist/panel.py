@@ -149,7 +149,7 @@ class CLIP_PT_btr_main(_Base):
         if n_unread:
             box = layout.box()
             box.label(text="%d selected track(s) have unread resumes" % n_unread,
-                      icon="SEQUENCE_COLOR_03")
+                      icon="QUESTION")
             row = box.row(align=True)
             row.scale_y = 1.2
             row.operator("clip.btr_confirm_resumes", text="Keep",

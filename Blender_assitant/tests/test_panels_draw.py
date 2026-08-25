@@ -45,9 +45,27 @@ class StubLayout:
         self.alignment = "EXPAND"
         self.use_property_split = False
 
+    #: Every icon Blender actually has, read from the real enum. A stub that accepts any
+    #: keyword verifies that draw() RUNS, not that it runs in Blender -- and an icon name
+    #: that does not exist raises only in a live session. That is exactly how
+    #: `SEQUENCE_COLOR_03` reached an artist's screen with this test green.
+    ICONS = None
+
+    @classmethod
+    def _icons(cls):
+        if cls.ICONS is None:
+            import bpy
+            params = bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"]
+            cls.ICONS = {i.identifier for i in params.enum_items}
+        return cls.ICONS
+
     def __getattr__(self, name):
         def call(*a, **kw):
             self.calls += 1
+            icon = kw.get("icon")
+            if icon is not None and icon not in self._icons():
+                raise ValueError("icon %r does not exist in this Blender "
+                                 "(UILayout.%s)" % (icon, name))
             return self
         return call
 
@@ -104,15 +122,37 @@ def main():
         log("PANEL DRAW: FAIL -- no panels discovered")
         sys.exit(1)
 
+    # Tracks, because a panel's interesting branches are the CONDITIONAL ones and an empty
+    # clip reaches none of them. The clip is loaded fresh, so before this every state below
+    # was identical: 0 tracks, 0 selected, 0 unread -- and the branch that draws the
+    # Keep/Drop box was never executed by this test at all. That is how an icon name which
+    # does not exist in Blender 5.2 shipped to an artist with this file green.
+    def fixture(state):
+        obj = clip.tracking.objects.active
+        # `tracks.remove()` does not exist on this collection; the addon already carries the
+        # supported way to clear them.
+        three_de = sys.modules["%s.three_de" % EXT]
+        three_de.delete_all_tracks(bpy.context, clip)
+        if state == "empty":
+            return
+        tr = obj.tracks.new(name="T_plain", frame=1)
+        tr.markers[0].co = (0.5, 0.5)
+        tr.select = state in ("selected", "unread")
+        if state == "unread":
+            # A muted marker ahead of the seed is what a proposed resume looks like, and it
+            # is the only thing that makes the Keep/Drop box draw.
+            m = tr.markers.insert_frame(10, co=(0.55, 0.55))
+            m.mute = True
+
+    STATES = ("empty", "unselected", "selected", "unread")
+
     failures = []
     with bpy.context.temp_override(window=win, area=area, region=region,
                                    space_data=area.spaces.active,
                                    edit_movieclip=clip, scene=bpy.context.scene):
         for cls in panels:
-            for label, sel in (("no selection", False), ("with selection", True)):
-                if clip is not None:
-                    for t in clip.tracking.objects.active.tracks:
-                        t.select = sel
+            for label in STATES:
+                fixture(label)
                 try:
                     if hasattr(cls, "poll") and not cls.poll(bpy.context):
                         log("%-24s %-15s poll() False, skipped" % (cls.__name__, label))
