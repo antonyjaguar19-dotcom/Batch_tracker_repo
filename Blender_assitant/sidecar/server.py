@@ -345,6 +345,123 @@ def job_patcheck(payload):
     return fn
 
 
+
+def job_fix(payload):
+    """Find where a finished track slid off the artist's feature, and put it back.
+
+    The fault, in the artist's words: tracking is fine until something obstructs the feature,
+    and then the track just slides. Nothing downstream notices, because every frame still
+    correlates with the frame before it -- which is what a slide IS.
+
+    **The obvious check does not work on this plate.** Comparing the last frame's pattern
+    against the seed is the natural test and it passes a slid track without hesitating: the
+    artist's own seed patch scores 1.00 at a position 33.8 px off the feature, because the
+    texture repeats. Appearance cannot separate the feature from its neighbour here, and no
+    threshold on a score ever will.
+
+    Motion can. CoTracker is following the real feature, so a track that slides moves
+    differently from it, and over ten frames that difference is far larger than the guide's
+    own noise. `leash.find_slides` is that comparison; `leash.repair` re-seats the flagged
+    frames using the guide for WHERE and the artist's pattern box for exactly where.
+
+    The guide is anchored on the track's FIRST frame, which is the artist's own seed. If that
+    is wrong nothing here can help, and nothing here pretends to.
+
+    Reports. It never edits the clip -- the addon applies what comes back, so a repair can be
+    looked at and undone like any other edit.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        path_ = clip.get("path", "")
+        if not os.path.exists(path_):
+            raise FileNotFoundError("plate not found: %s" % path_)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+        if not reqs:
+            raise ValueError("no tracks to check")
+
+        out_dir = os.path.join(ASSIST, "logs", "fix", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path_, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        min_match = float(params.get("min_match", 0.60))
+        lookback = int(params.get("lookback", leash.SLIDE_LOOKBACK))
+        trust_px = float(params.get("trust_px", leash.TRUST_P90_PX))
+        max_side = int(params.get("max_side", 768))
+
+        results, notes = {}, {}
+        for r in reqs:
+            if job.cancel.is_set():
+                break
+            tid = r["id"]
+            raw = r.get("path") or []
+            if len(raw) < lookback + 2:
+                notes[tid] = ("too short to judge -- a slide is measured over %d frames"
+                              % lookback)
+                continue
+            path = {int(f): (float(x), float(y)) for f, x, y in raw}
+            fs = sorted(path)
+            pat = r.get("pattern") or {}
+            ref = patmatch.reference_patch(plate, int(pat.get("frame", fs[0])),
+                                           float(pat["cx"]), float(pat["cy"]),
+                                           float(pat["w"]), float(pat["h"])) if pat else None
+            if ref is None:
+                notes[tid] = "no pattern box to check against"
+                continue
+            patch, offset = ref
+
+            job.say("%s: guiding f%d-f%d" % (tid, fs[0], fs[-1]))
+            g = leash.compute(plate, fs[0], path[fs[0]], fs[0], fs[-1],
+                              max_side=max_side, trust_px=trust_px, on_status=job.say)
+            if not g["trusted"]:
+                # Without a guide worth believing there is nothing to compare the track
+                # against, and the pattern score demonstrably cannot stand in for it here.
+                notes[tid] = ("cannot check -- %s" % g["reason"])
+                results[tid] = []
+                continue
+
+            flagged = leash.find_slides(g["path"], path, lookback=lookback)
+            if not flagged:
+                notes[tid] = "follows the guide the whole way -- nothing to fix"
+                results[tid] = []
+                continue
+
+            def _m(ff, mx, my, rad, _p=patch, _o=offset):
+                return patmatch.pinned(plate, ff, _p, mx, my, radius=rad, offset=_o)
+
+            acts = leash.repair(_m, g["path"], path, flagged,
+                                min_match=min_match, lookback=lookback)
+            results[tid] = acts
+            n_s = sum(1 for a in acts if a["action"] == "snap")
+            n_c = sum(1 for a in acts if a["action"] == "cut")
+            worst = max((d for _f, d in flagged), default=0.0)
+            notes[tid] = ("slid from f%d, worst %.0f px off the guide -- %d frame(s) put "
+                          "back, %d to cut" % (flagged[0][0], worst, n_s, n_c))
+            job.say("%s: %s" % (tid, notes[tid]))
+
+        cotrack.free()
+        return {"tracks": results, "notes": notes, "lookback": lookback,
+                "min_match": min_match, "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_ctrack(payload):
     """Track a seed with CoTracker as the PRIMARY engine, pinned to the artist's pattern.
 
@@ -1264,7 +1381,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
                          "/jobs/hold", "/jobs/leash", "/jobs/report",
-                         "/jobs/pin", "/jobs/ctrack"):
+                         "/jobs/pin", "/jobs/ctrack", "/jobs/fix"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1278,7 +1395,8 @@ class Handler(BaseHTTPRequestHandler):
                           "patcheck": job_patcheck, "motion": job_motion,
                           "hold": job_hold, "leash": job_leash,
                           "report": job_report, "pin": job_pin,
-                          "ctrack": job_ctrack}[kind](payload))
+                          "ctrack": job_ctrack,
+                          "fix": job_fix}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

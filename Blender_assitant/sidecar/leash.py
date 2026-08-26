@@ -433,3 +433,130 @@ def fill_gap(matcher, guide, vis, closure, anchor_frame, anchor_px, resume_frame
     if len(filled) == len(span):
         return filled, ("%s (%s)" % (done, "; ".join(notes))) if notes else done
     return filled, "; ".join(notes)
+
+
+#: How many frames back a slide is measured over. A slide is slow by nature -- that is what
+#: makes it survive frame-to-frame correlation -- so one frame of it hides inside the guide's
+#: own per-frame noise (p90 2.02 px). Over a window the slide accumulates linearly while the
+#: noise grows with the square root, and they separate. Measured on the artist's hand track
+#: with a 77 px slide built into a copy of it:
+#:
+#:     K=5    tolerance 5.9 px    slide found at f100, but 2 FALSE flags on the hand track
+#:     K=10   tolerance 7.8 px    slide found at f108, 0 false flags
+#:     K=15   tolerance 9.3 px    slide found at f109, 0 false flags
+#:     K=20   tolerance 10.6 px   slide found at f112, 0 false flags
+#:
+#: Ten is the earliest window that never accuses a correct track.
+SLIDE_LOOKBACK = 10
+
+
+def find_slides(guide, path, lookback=SLIDE_LOOKBACK):
+    """Frames where a track has moved differently from the guide over the last `lookback`.
+
+    This is the detector for the fault the artist described: tracking is fine until something
+    obstructs the feature, and then the track just slides. Nothing downstream notices because
+    each frame still correlates with the one before it -- which is what a slide IS.
+
+    **Appearance cannot see it.** Measured on this plate, the artist's own seed patch scores
+    1.00 at a position 33.8 px off the feature: the texture repeats, so a slid marker matches
+    perfectly. Any check built on the pattern score alone -- including the end-of-track check
+    -- passes a slid track without hesitating.
+
+    Motion can. The guide is following the real feature, so a track that slides moves
+    differently from it, and over ten frames that difference is far larger than the guide's
+    own noise.
+
+    A FIXED lookback, never a re-anchor on agreement. Re-anchoring wherever the two agree
+    absorbs a slow slide one frame at a time and it never accumulates into anything visible --
+    the same trap as the recent-level pollution in `first_loss`, and it is what makes a slide
+    invisible in the first place.
+
+    `path` is {frame: (x, y)}. Returns [(frame, deviation_px), ...].
+    """
+    tol = tolerance(lookback)
+    out = []
+    for f in sorted(path):
+        a = f - int(lookback)
+        if a not in path or a not in guide or f not in guide:
+            continue
+        p = predict(guide, a, path[a], f)
+        if p is None:
+            continue
+        d = math.hypot(path[f][0] - p[0], path[f][1] - p[1])
+        if d > tol:
+            out.append((f, d))
+    return out
+
+
+def repair(matcher, guide, path, flagged, min_match=0.60, radius=None,
+           lookback=SLIDE_LOOKBACK):
+    """Put the flagged frames back on the artist's pattern, or say they must be cut.
+
+    Works from the last frame BEFORE the slide started -- the newest frame that was not
+    flagged -- because that is the last position anything vouches for. The guide says where
+    the feature went from there, and the artist's pattern box, allowed to warp, says exactly
+    where within a few pixels of that.
+
+    Returns [{"frame", "action", ...}] where action is "snap" or "cut". Reports only; the
+    caller applies it. A repair that edits what it is checking is not a repair -- it is a
+    second tracker with no reference.
+    """
+    if not flagged:
+        return []
+    bad = sorted(f for f, _ in flagged)
+    # A frame is only safe to work from if nothing in the window it was judged over is
+    # flagged; a frame just before a slide can already be sliding.
+    first = bad[0]
+    anchor_f = None
+    for f in sorted(path):
+        if f >= first - int(lookback):
+            break
+        anchor_f = f
+    if anchor_f is None:
+        return [{"frame": f, "action": "cut",
+                 "reason": "the slide starts before there is any verified frame to work from"}
+                for f in bad]
+
+    out = []
+    cur_f, cur_px = anchor_f, path[anchor_f]
+    for f in sorted(path):
+        if f <= anchor_f or f not in set(bad) and f < first:
+            continue
+        if f < first:
+            continue
+        p = predict(guide, cur_f, cur_px, f)
+        if p is None:
+            out.append({"frame": f, "action": "cut", "reason": "the guide stops here"})
+            continue
+        # If the track's OWN position already agrees with the guide from here, leave it
+        # alone. It is a real correlation peak from the tracker and is better than anything
+        # re-derived -- measured, re-snapping frames that were already right cost 0 px -> 2-4
+        # px. This also ends the repair naturally where the slide ends, instead of rewriting
+        # the whole tail of a track because of a fault in the middle of it.
+        keep_d = math.hypot(path[f][0] - p[0], path[f][1] - p[1])
+        if keep_d <= p[2]:
+            out.append({"frame": f, "action": "keep", "moved_px": 0.0})
+            cur_f, cur_px = f, (float(path[f][0]), float(path[f][1]))
+            continue
+        got = matcher(f, p[0], p[1], radius if radius else max(PROBE_MIN_PX, p[2] * PROBE_MULT))
+        if got is None:
+            out.append({"frame": f, "action": "cut",
+                        "reason": "your pattern box does not fit here"})
+            continue
+        snap = math.hypot(got[0] - p[0], got[1] - p[1])
+        if got[2] < min_match:
+            out.append({"frame": f, "action": "cut", "score": round(float(got[2]), 3),
+                        "reason": "your pattern only reaches %.2f here" % got[2]})
+            continue
+        if snap > p[2]:
+            out.append({"frame": f, "action": "cut", "score": round(float(got[2]), 3),
+                        "reason": "the best match is %.1f px from where the guide says the "
+                                  "feature went, outside the %.1f px it may be wrong by"
+                                  % (snap, p[2])})
+            continue
+        out.append({"frame": f, "action": "snap", "x": float(got[0]), "y": float(got[1]),
+                    "score": round(float(got[2]), 3),
+                    "moved_px": round(math.hypot(got[0] - path[f][0],
+                                                 got[1] - path[f][1]), 2)})
+        cur_f, cur_px = f, (float(got[0]), float(got[1]))
+    return out

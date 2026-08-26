@@ -573,6 +573,8 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
     return out
 
 
+
+
 def first_loss(scores, floor=0.5, drop=0.6, settle=5, head=10, look=5, min_fall=0.20,
                ambig_margin=0.05, ambig_drop=0.85, probe_gain=0.10):
     """The first frame where a track stopped being on the artist's feature.

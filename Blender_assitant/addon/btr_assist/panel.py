@@ -269,6 +269,9 @@ class CLIP_PT_btr_3de(_Base):
         # Works on any track, including ones tracked by hand or imported -- the pin does not
         # care how a track was made, only that its first frame is where the artist framed it.
         layout.operator("clip.btr_pin", text="Pin to my pattern", icon="PINNED")
+        # The one that answers "the track slid after the occluder". It is separate from the
+        # pin because the pin corrects a few pixels and this re-finds the feature entirely.
+        layout.operator("clip.btr_fix_slides", text="Find and fix slides", icon="TRACKING_REFINE_FORWARDS")
         layout.label(text="Gaps are kept in both directions.")
 
 

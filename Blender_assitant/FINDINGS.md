@@ -2901,3 +2901,92 @@ not a track. It goes to Blender instead of being tracked badly.
   licence. TAPNext++ (Apache-2.0) is vendored with weights present.
 * The scale watch is skipped under this engine -- it baselines against Blender's per-frame box
   and CoTracker never sets one -- so a box running away is not caught on this path.
+
+### The track slid, and the obvious check cannot see it (2026-08-26)
+
+Reported: *"tracking is going good till occlusion and once the track is obstructed by
+something, the track just slides."* Proposed fix: once tracking is complete, check whether the
+end frame's pattern matches the frame the artist seeded, allowing for perspective, and if not,
+find the pattern again and snap the track back.
+
+The diagnosis is right. The check is not, and this plate proves it.
+
+### A perfect match, 34 px off the feature
+
+A copy of the artist's 250-frame hand track with a known 77 px slide built into f100-f150, so
+every frame has a right answer. Scoring THEIR OWN seed patch at the slid positions:
+
+| frame | px from the true feature | their seed patch scores |
+|---|---|---|
+| f110 | 15.4 | 0.975 |
+| f122 | **33.8** | **1.000** |
+| f150 | 76.8 | 0.967 |
+
+The texture repeats, so a slid marker lands on something that matches the seed perfectly.
+Appearance cannot separate the feature from its neighbour here and no threshold on a score
+ever will -- which is also why the end-of-track QC pass has been letting slid tracks through.
+It was never able to see this fault.
+
+Warping does not rescue it either, and that was worth checking because it was a change made
+this same day: on the artist's real drifting track the warped score sits within 0.014 of the
+rigid one at every slid position, and both fall 0.975 -> 0.600 as it slides. The matcher is
+not the problem.
+
+### Motion can see it
+
+CoTracker is following the real feature, so a track that slides moves DIFFERENTLY from it.
+Over one frame that difference hides inside the guide's own noise (p90 2.02 px); over ten it
+does not, because the slide accumulates linearly and the noise grows with the square root.
+
+| window | slide found at | false flags on the artist's CORRECT hand track |
+|---|---|---|
+| 5 frames | f100 | **2** |
+| 10 frames | f108 | **0** |
+| 15 frames | f109 | 0 |
+| 20 frames | f112 | 0 |
+
+Ten frames is the earliest window that never accuses a correct track.
+
+A **fixed** lookback, never a re-anchor wherever track and guide agree. Re-anchoring on
+agreement absorbs a slow slide one frame at a time so it never accumulates into anything
+visible -- the same trap as the recent-level pollution in `first_loss`, and precisely what
+makes a slide invisible in the first place.
+
+### Repair, and the rule that stops it doing harm
+
+From the last frame before the slide began: the guide says where the feature went, the
+artist's pattern box says exactly where within a few pixels of that.
+
+| | on the feature |
+|---|---|
+| slid copy, before | 216 / 250 |
+| slid copy, after | **249 / 250** (55 put back, 1 cut) |
+| artist's hand track | **nothing flagged, nothing moved, nothing cut** |
+
+That control is half the test. A repair that improves a broken track while quietly rewriting a
+correct one is worse than no repair.
+
+**Where the track's own position already agrees with the guide it is kept, not re-derived.**
+It is a real correlation peak from the tracker and better than anything rebuilt -- re-snapping
+frames that were already right cost 0 px -> 2-4 px -- and it ends the repair naturally where
+the slide ends rather than rewriting the whole tail of a track because of a fault in the
+middle. Without this rule the same measurement came out **216 -> 196**: worse than doing
+nothing.
+
+### The version that was written first, and deleted
+
+An appearance-only repair -- score each frame against the seed, search wide where it fails,
+snap. On this footage it moved f95 from 12.6 px off the feature to 21.0 (a better SCORE on a
+worse POSITION) and recovered three frames out of thirty-four. It is deleted rather than kept
+behind a switch: two competing mechanisms where one is known not to work is not a choice, it
+is a trap.
+
+### What this does not settle
+
+* The slide is CONSTRUCTED. It is built from real footage and a real hand track, and its shape
+  -- a smooth linear drift -- is a guess at what an occluder does. A slide that jumps, or one
+  that tracks a mover at the same velocity as the guide, would not look like this.
+* If the guide cannot be trusted over the track's span, nothing is checked at all. On a shot
+  where CoTracker walks onto the occluder that is exactly when a slide is most likely.
+* The seed frame is assumed correct. Everything here is measured relative to it.
+* One plate, one artist, still.

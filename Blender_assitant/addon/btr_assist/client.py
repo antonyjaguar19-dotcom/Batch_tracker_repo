@@ -223,3 +223,13 @@ def start_ctrack(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/ctrack",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_fix(assist_root, clip_info, requests, params=None):
+    """Find where finished tracks slid off the artist's feature, and how to put them back."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/fix",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)
