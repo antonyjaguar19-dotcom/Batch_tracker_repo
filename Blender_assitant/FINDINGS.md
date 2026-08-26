@@ -2391,3 +2391,58 @@ and should not be presented as one.
   not been scored on a clean death, where last-good is known to be better.
 * The 2.3 px offset is attributed to click-vs-correlator by inference from two references, not
   measured directly.
+
+### CoTracker driving the track itself (2026-08-26)
+
+Asked: *"what if we use CoTracker directly for tracking, and Blender tracking as two
+separate modes?"* Worth a number rather than an opinion, and the number is already cheap to
+get: `cotrack.track_points` returns a position for EVERY frame on every re-acquire, and
+`resume_path` keeps one of them. "CoTracker as its own mode" is not a new capability, it is
+a decision to keep what is already computed.
+
+`tests/eval_cotracker_direct.py` scores that path against a hand track with the same rules
+as `eval_track_vs_manual.py`, so the two sit side by side.
+
+| | ref 1 — 2 occlusions (47 fr) | ref 2 — wire (250 fr) |
+|---|---|---|
+| assist loop | **46 (98 %)**, 0 off, 1 gap | 243 (97 %), 0 off, 7 gaps, **p50 3.4 px** |
+| CoTracker direct @768 | 14 (30 %), **50 off**, to 140 px | **250 (100 %)**, **0 off**, p50 **13.0 px** |
+| CoTracker direct @1920/1536 | 14 (30 %), 50 off | 243 (97 %), p50 14.4 px |
+
+**Identity is what it is good at.** 250/250 on the wire shot — the shot where the assist
+loop cuts 7 frames, and where the artist reported a slide at f77 and again at f90. It never
+left the feature once.
+
+**Precision is what it is bad at, and resolution does not fix it.** 13 px at 4K, and raising
+the long edge from 768 to 1536 made it WORSE — 13.0 -> 14.4 px, and it lost 7 frames it had
+at 768. CoTracker3 is trained near 512; a 4K plate fed in at 1536 is out of distribution.
+The instinct to "run it at full res for accuracy" is measurably backwards here.
+
+**Raw, it fails occlusions harder than the loop does.** 30 % on ref 1, ending 140 px out.
+It glides through the occluder and then tracks the occluder — there is nothing in the model
+that knows the artist's pattern. It works in the current design only because NCC verifies
+where it lands and refuses it when wrong, which is the whole reason the loop beats it 98 %
+to 30 % on the same footage.
+
+So as a replacement it is worse in both directions. What the numbers actually argue for is
+neither mode: keep the full path and use it as a **leash** — CoTracker says where the
+feature is within ~13 px on every frame, Blender's NCC refines to sub-pixel inside that
+window. A 13 px prior makes a 130 px slide structurally impossible, which turns the drift
+class from something detected after the fact into something that cannot happen.
+
+Two constraints on anything built from this:
+
+* **Licence.** CoTracker is CC-BY-NC — it restricts USE, not only redistribution. It is
+  already in the loop for re-acquisition; making it the tracker of record for delivered
+  tracks deepens that exposure. TAPNext++ (Apache-2.0) is vendored with weights present.
+* A genuine direct mode still earns its place on plates where Blender tracks nothing at all
+  — the SH013 motocross FG. 13 px beats no track.
+
+### What this does not settle
+
+* Two references, one shot, one feature each. Ref 2 has no true occlusion and ref 1 has two;
+  no reference here has fast FG motion, which is the case a direct mode is FOR.
+* The leash is reasoned from these numbers, not measured. 13 px is a p50 — the p90 is 22 px
+  and the max 24 px, so a leash sized on the median would be too tight on one frame in ten.
+* Chained windows re-query at the previous window's last position, so error compounds across
+  window seams. Ref 2 crossed two seams; a 600-frame shot would cross more.
