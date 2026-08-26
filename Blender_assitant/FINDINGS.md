@@ -2646,3 +2646,98 @@ to call it -- and that the restore works without the test planting the saved val
   scale, "screen pixels" and device pixels may differ; not checked on such a monitor.
 * A clip open in two editors at different zooms gets whichever the loop reaches last.
   Harmless -- the size only matters at the click -- but it is not defined behaviour.
+
+### Judging the SET of tracks: will this shot solve? (2026-08-26)
+
+The artist, on the assistant as a whole: *"since we are using AI i dont feel the assistant
+smart enough to help the artist."* Fair, and worth naming precisely before answering.
+
+**There is almost no AI in it.** One neural model, CoTracker, called in exactly two places --
+re-acquiring after a cut and bridging a gap. Every actual decision (is this still your
+feature, cut or not, is this resume real, is the guide trustworthy) is NCC correlation plus
+about twenty hand-set constants. Those constants were fitted to **two hand tracks, on one
+plate, from one artist**. That is the entire evidence base behind every "measured" claim made
+this month. It is not a system that has learned anything about tracking.
+
+**And it never looks at the shot.** This repo already runs Qwen2.5-VL over every plate for
+movers, occluders, bad-track regions and depth layers, and SAM3 turns those into mattes. The
+Blender assistant imports none of it -- checked, zero references. So it discovers that a bike
+crosses f14-25 by drifting onto the bike and failing.
+
+Asked which direction was worth building, the artist chose the one this section is about:
+judge the SET of tracks, not each track alone. The matchmove job rather than the track job.
+
+### Four questions, and the order they ruin a day
+
+* **How many tracks are live on each frame**, reported as RUNS rather than frames -- an
+  artist fixes a stretch, and eleven adjacent warnings are one fact printed eleven times.
+* **Where they are**, as the fraction of frames each ninth of the frame holds anything.
+* **Whether there is usable parallax at all.** If a homography explains the motion as well
+  as the epipolar geometry does, the pair carries no depth. This is the one that costs a
+  day, because a 3D solve on it does not fail loudly -- it yields a camera that looks nearly
+  right and drifts.
+* **Which tracks disagree with the motion everything else agrees on** -- a mover, or one
+  that has slid off. The ones a solver discards, named before the solve instead of after.
+
+No solve is run. Nothing is modified.
+
+### Proved on cameras whose answer is a fact, not a judgement
+
+Every case is generated from a camera model, so the right answer is known by construction:
+
+| synthetic shot | h_share | verdict | should be |
+|---|---|---|---|
+| translating past two depth planes | 0.57 | ok | ok |
+| nodal pan | 1.00 | degenerate | degenerate |
+| flat scene, translating camera | 1.00 | degenerate | degenerate |
+
+The flat case is the one that separates a real test from one that only detects rotation --
+and a wall or a road fills the frame far more often than a nodal pan turns up.
+
+**It also crashed OpenCV, which turned out to be the finding.** A fundamental matrix is not
+determined when every point lies on a plane; `findFundamentalMat` did not return None, it
+raised from inside `cv::Mat`. Untreated that takes the whole report down on one of the
+commonest shots there is. The failure is now caught and READ: a homography that fits where
+the epipolar geometry cannot even be estimated IS the degenerate case, stated as loudly as it
+can be.
+
+### The mover blind spot, stated rather than tuned away
+
+Six movers planted under a camera translating in X, so the epipolar lines run horizontal:
+
+```
+travelling  0.6 deg off horizontal   ->   0 of 12 pairs disagreed   MISSED
+travelling  2.4 deg off horizontal   ->  12 of 12 pairs disagreed   found
+travelling 13.5 deg off horizontal   ->  12 of 12 pairs disagreed   found
+```
+
+A point moving ALONG its own epipolar line is indistinguishable from a static point at
+another depth. No threshold reaches it, and the test now asserts what is true -- every mover
+with a component across the epipolar direction is found, with no false positives -- rather
+than asserting six and quietly settling for five. Real footage is kinder, because a camera
+rarely holds one baseline for a whole shot; a locked-off dolly with a car running parallel is
+exactly the shot where this says nothing.
+
+### And the eval earned its place immediately
+
+On real exports the report was confident, detailed and wrong. Every number is a fraction of
+the frame, so the wrong plate size does not fail -- SH008 is a **1920x1080** export
+(x 5..1916, y 10..1070), read against 3840x2160 it put every track in one quadrant and
+reported five of nine regions as having no coverage on any frame. Which is exactly what a
+badly covered shot looks like.
+
+Now guarded: if every track falls inside 55 % of the stated frame, the report says so before
+saying anything else. At its real size the same file reads believably -- 137 tracks, median 87
+live, parallax ok, 16 suspects, one genuine hole (bottom centre, covered on 14 % of frames).
+
+The first metric this project has that is not fitted to SH006.
+
+### What this does not settle
+
+* `PARALLAX_H_SHARE = 0.85` sits between 0.57 and 1.00 on synthetic data. No real shot with a
+  known-degenerate answer has been through it.
+* The floor of 8 simultaneous tracks is a working number, not a measured one.
+* "Suspect" means disagrees with the dominant geometry. It does not separate a track on a
+  truck from one that slid onto a lookalike -- both are things to look at, but they are not
+  the same problem.
+* Nothing is wired to the addon yet. This is the measured core only.
