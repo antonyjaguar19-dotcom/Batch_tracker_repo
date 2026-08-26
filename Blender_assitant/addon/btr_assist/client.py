@@ -174,3 +174,18 @@ def start_patcheck(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/patcheck",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_leash(assist_root, clip_info, request, params=None):
+    """A guide path for one track's whole span, with a trust verdict from round-trip closure.
+
+    One track per call, matching the sidecar: the verdict describes THAT path, and batching
+    would average a trustworthy guide with an untrustworthy one into a number true of
+    neither.
+    """
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/leash",
+                    {"clip": clip_info, "request": request, "params": params or {}},
+                    timeout=30.0)

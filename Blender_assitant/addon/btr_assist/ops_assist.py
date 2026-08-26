@@ -207,6 +207,21 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "preview -- against every candidate resume at full plate resolution, "
                     "and refuse the ones that are not the same feature. Off restores the "
                     "old behaviour: CoTracker's first visible frame is planted unchecked")
+    fill_gaps: BoolProperty(
+        name="Bridge the gap it crossed", default=True,
+        description="After a re-acquire, go back and fill the frames BETWEEN the cut and "
+                    "the resume -- but only where the guide can be shown to have stayed on "
+                    "your feature. A gap is not automatically an occlusion: on a 250-frame "
+                    "hand-tracked reference, 5 of the 7 frames the assist left empty sit "
+                    "where the feature is plainly visible and the artist HAS a sample, "
+                    "because the loop cut as a precaution at f91 and re-acquired at f96. "
+                    "Each bridged frame must pass four gates -- CoTracker's forward and "
+                    "return passes must agree over that gap, the feature must not be called "
+                    "covered, your own pattern must match, and the match must land where the "
+                    "guide predicted when searched from twice as far out. Measured across a "
+                    "real occlusion and a precautionary cut: 6 frames recovered, 0 planted "
+                    "on an occluder. Costs one extra CoTracker pass per group of deaths"
+    )
     confirm_resumes: BoolProperty(
         name="Confirm each re-acquire", default=True,
         description="When a feature is found again, jump the clip to that frame with the "
@@ -435,6 +450,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._misses = {}
         self._gave_up = set()
         self._continue_from = {}
+        # Frames planted from the guide between a cut and its resume, per
+        # track. Held separately because they belong to the resume that
+        # produced them: refusing that landing, or moving it to another
+        # candidate, invalidates the bridge that led to it.
+        self._filled = {}
         self._awaiting = []
         self._auto_kept = 0
         self._motion = None
@@ -1143,6 +1163,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         r = client.start_reacquire(self._root, clip_info(context, clip), reqs,
                                    {"frame_hi": self._n_frames,
                                     "verify_pattern": bool(self.verify_pattern),
+                                    "fill_gaps": bool(self.fill_gaps),
                                     "min_match": float(self.min_match)})
         self._job = r["id"]
         self._phase = "waiting"
@@ -1257,6 +1278,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     tuple(old_m.search_min), tuple(old_m.search_max))
             if len(tr.markers) > 1:
                 tr.markers.delete_frame(int(a["frame"]))
+        # The bridge was fitted to the gap that ended at the OLD frame. A different
+        # candidate is a different gap, so it cannot be carried across.
+        self._drop_fill(rec)
         cand = a["alts"][a["alt_i"]]
         u, v = image_px_to_uv(float(cand["x"]), float(cand["y"]), w, h)
         m = tr.markers.insert_frame(int(cand["frame"]), co=(u, v))
@@ -1271,6 +1295,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         if fr:
             fr[-1] = int(cand["frame"])
 
+    def _drop_fill(self, rec):
+        """Remove the guide-filled bridge frames for one track, if it has any."""
+        got = self._filled.pop(rec["id"], None)
+        if not got:
+            return
+        tr = rec["t"]
+        for f in got:
+            if len(tr.markers) <= 1:
+                break
+            if tr.markers.find_frame(int(f), exact=True) is not None:
+                tr.markers.delete_frame(int(f))
+
     def _drop_resume(self, name, frame):
         """Delete the proposed segment and stop re-acquiring that track."""
         rec = next((r for r in self._records if r["id"] == name), None)
@@ -1279,6 +1315,10 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         tr = rec["t"]
         for m in [m for m in tr.markers if m.frame >= int(frame)]:
             tr.markers.delete_frame(m.frame)
+        # The bridge was built from the same guide pass as the landing the artist just
+        # refused, and it sits BEFORE the resume frame, so the loop above does not reach it.
+        # Leaving it would keep frames whose only evidence has just been rejected.
+        self._drop_fill(rec)
         rec["alive"] = False
         self._gave_up.add(name)
         frames = self._resumed.get(name) or []
@@ -1385,6 +1425,33 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                                        "score": res.get("match_score"),
                                        "occluded": occluded, "unverified": False,
                                        "alts": alts, "alt_i": 0})
+            # ---- bridge the gap the guide covered ----------------------------------
+            # These are frames the sidecar has already correlated against the artist's own
+            # feature and found where the guide said they would be. Planted live, so the
+            # exported track is continuous instead of leaving the artist a hole to fill by
+            # hand -- which is what 5 of the artist's 7 missing frames actually were.
+            fills = res.get("fill") or []
+            if fills and old is not None:
+                got = []
+                for fr_ in fills:
+                    fu, fv = image_px_to_uv(float(fr_["x"]), float(fr_["y"]), w, h)
+                    fm = tr.markers.insert_frame(int(fr_["frame"]), co=(fu, fv))
+                    fm.mute = False
+                    # The artist's box, not Blender's default -- same rule as the resume.
+                    fm.pattern_corners = old.pattern_corners
+                    fm.search_min, fm.search_max = m.search_min, m.search_max
+                    got.append(int(fr_["frame"]))
+                self._filled.setdefault(res["id"], []).extend(got)
+                print("[assist] %s: bridged f%d-f%d from the guide (%d frame(s), "
+                      "match %.2f-%.2f)"
+                      % (res["id"], got[0], got[-1], len(got),
+                         min(x_["score"] for x_ in fills),
+                         max(x_["score"] for x_ in fills)))
+            elif res.get("fill_note"):
+                print("[assist] %s: gap f%s-f%d left alone -- %s"
+                      % (res["id"], res.get("last_good_frame"), int(res["frame"]),
+                         res["fill_note"]))
+
             self._resumed.setdefault(res["id"], []).append(int(res["frame"]))
             sc = res.get("match_score")
             self._scores.setdefault(res["id"], []).append((int(res["frame"]), sc))

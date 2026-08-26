@@ -82,6 +82,9 @@ def main():
                          "4K frames disagrees by a few")
     ap.add_argument("--track", default="",
                     help="which track in the manual file (default: the first)")
+    ap.add_argument("--no-fill", action="store_true",
+                    help="do not bridge the gap between a cut and its resume -- the "
+                         "behaviour before the leash existed")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -210,6 +213,7 @@ def main():
         st = wait(client.start_reacquire(ASSIST, ci, req,
                                          {"frame_hi": clip.frame_duration,
                                           "verify_pattern": True,
+                                          "fill_gaps": not a.no_fill,
                                           "min_match": a.min_match})["id"])
         if st["state"] != "done":
             log("round %d: re-acquire failed: %s" % (rnd, st.get("error")))
@@ -227,6 +231,21 @@ def main():
         mk.mute = False
         mk.pattern_corners = m.pattern_corners
         mk.search_min, mk.search_max = m.search_min, m.search_max
+        # Mirrors ops_assist._insert_resumes: the frames the guide bridged between the cut
+        # and the resume are planted with the artist's own box. If this is left out the eval
+        # scores a loop the addon does not run.
+        for fr_ in (rr.get("fill") or []):
+            fm = tr.markers.insert_frame(int(fr_["frame"]),
+                                         co=image_px_to_uv(float(fr_["x"]),
+                                                           float(fr_["y"]), w, h))
+            fm.mute = False
+            fm.pattern_corners = m.pattern_corners
+            fm.search_min, fm.search_max = m.search_min, m.search_max
+        if rr.get("fill"):
+            log("round %d: bridged f%d-f%d (%d frame(s))"
+                % (rnd, rr["fill"][0]["frame"], rr["fill"][-1]["frame"], len(rr["fill"])))
+        elif rr.get("fill_note"):
+            log("round %d: gap left alone -- %s" % (rnd, rr["fill_note"][:100]))
         rec["alive"] = True
         rec["seed_frame"] = int(rr["frame"])
         log("round %d: resumed at f%d (match %s)"

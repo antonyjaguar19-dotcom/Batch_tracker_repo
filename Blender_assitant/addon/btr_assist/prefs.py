@@ -69,6 +69,14 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         description="Correlate the pattern box you set -- the patch shown in the Track "
                     "panel preview -- against every candidate resume, at full plate "
                     "resolution, and refuse the ones that are not the same feature")
+    fill_gaps: BoolProperty(
+        name="Bridge the gap it crossed", default=True,
+        description="After a re-acquire, fill the frames between the cut and the resume "
+                    "where the guide can be shown to have stayed on your feature. A gap is "
+                    "not automatically an occlusion -- on a 250-frame hand-tracked "
+                    "reference, 5 of the 7 frames left empty were frames the artist HAS, "
+                    "because the loop cut at f91 as a precaution and re-acquired at f96. "
+                    "Costs one extra CoTracker pass per group of deaths")
     confirm_resumes: BoolProperty(
         name="Confirm each re-acquire", default=True,
         description="When a feature is found again, jump to that frame with the marker "

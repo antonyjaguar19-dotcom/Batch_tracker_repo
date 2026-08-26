@@ -66,7 +66,18 @@ def main():
                          "at the previous window's last position. This is what a real mode "
                          "would have to do on a long shot; 0 = one window over everything")
     ap.add_argument("--wrong-px", type=float, default=25.0)
+    ap.add_argument("--anchor", action="store_true",
+                    help="score the guide's DISPLACEMENT from the seed applied to the "
+                         "artist's own seed click, not the guide's absolute coordinates. "
+                         "This is how the resume already uses it, and it is what a leash "
+                         "would use -- it removes the constant offset between where a "
+                         "human clicks and where the model centres")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--drift-table", action="store_true",
+                    help="how far the guide's DISPLACEMENT over k frames disagrees with the "
+                         "artist's, for each k. This is what sizes a leash: the guide is "
+                         "re-anchored to the last frame the correlator was sure about, so "
+                         "only the gap since that frame accrues error -- not the whole shot")
     a = ap.parse_args()
 
     os.environ["BTR_COTRACKER_MAX_FRAMES"] = str(a.budget)
@@ -120,6 +131,13 @@ def main():
             if f0 >= hi:
                 break
 
+    if a.anchor:
+        g0 = ours.get(lo)
+        if g0 is None:
+            log("guide has no sample at the seed frame")
+            sys.exit(2)
+        ours = {f: (sx + (x - g0[0]), sy + (y - g0[1])) for f, (x, y) in ours.items()}
+
     errs, off_feature = [], []
     pairs = []
     for f, (x, y) in sorted(ours.items()):
@@ -151,6 +169,28 @@ def main():
                 v = "missed (gap)"
             log("%-6d %-18s %-18s %s" % (f, "%.0f,%.0f" % o if o else "-",
                                          "%.0f,%.0f" % t if t else "-", v))
+
+    if a.drift_table:
+        log("")
+        log("guide displacement error vs the hand track, by gap length")
+        log("%-6s %-7s %-8s %-8s %-8s %s" % ("gap", "n", "p50", "p90", "max", "px/frame @p90"))
+        for k in (1, 2, 3, 5, 8, 12, 20, 30, 50, 80, 120):
+            d = []
+            for f in truth:
+                f0 = f - k
+                if f0 not in truth or f not in ours or f0 not in ours:
+                    continue
+                gx = ours[f][0] - ours[f0][0]
+                gy = ours[f][1] - ours[f0][1]
+                tx = truth[f][0] - truth[f0][0]
+                ty = truth[f][1] - truth[f0][1]
+                d.append(((gx - tx) ** 2 + (gy - ty) ** 2) ** 0.5)
+            if not d:
+                continue
+            d.sort()
+            g = lambda pc: d[min(len(d) - 1, int(round(pc * (len(d) - 1))))]
+            log("%-6d %-7d %-8.2f %-8.2f %-8.2f %.3f"
+                % (k, len(d), g(.5), g(.9), d[-1], g(.9) / k))
 
     def q(v, pc):
         v = sorted(v)

@@ -2446,3 +2446,128 @@ Two constraints on anything built from this:
   and the max 24 px, so a leash sized on the median would be too tight on one frame in ten.
 * Chained windows re-query at the previous window's last position, so error compounds across
   window seams. Ref 2 crossed two seams; a 600-frame shot would cross more.
+
+### The leash: a guide for every frame, and knowing when to ignore it (2026-08-26)
+
+Asked for after the measurement in the previous section: use CoTracker's whole path, not the
+one number the re-acquire keeps. **The version that was pitched does not work, and the
+reason is worth more than the feature.**
+
+### Steering with it drags correct tracks off their feature
+
+The pitch was per-frame steering: CoTracker says where the feature is within ~13 px,
+Blender's NCC refines inside that window, and a 130 px slide becomes impossible. Re-anchored
+to the last confirmed frame the guide is genuinely tight -- its displacement over a short gap
+agrees with a hand track to 2.02 px at gap 1 and 7.20 px at gap 30, sublinear, so a `sqrt`
+tolerance fits it.
+
+On the 250-frame shot. On the 64-frame shot with two real occlusions the same model walks
+onto the OCCLUDER at the first cover and never returns: 4.54 px error at gap 1, 266 px by
+f64. A leash built from that path demanded a cut at **f27 of the artist's own hand track**.
+
+| | ref 1 (2 occlusions) | ref 2 (250 frames) |
+|---|---|---|
+| guide displacement error, gap 1 | **4.54 px** | 1.08 px |
+| guide displacement error, gap 30 | **127.90 px** | 4.03 px |
+
+Same model, same plate, same artist. A leash cannot be trusted unconditionally, and
+CoTracker's own visibility head does not separate the two cases -- it is a threshold on
+covered-ness, not on identity.
+
+### What does separate them: closure
+
+Track forward from the seed, then track BACK from where the forward pass ended, and compare.
+Using only what exists at runtime -- the backward query is the forward pass's own endpoint,
+never a known-good position:
+
+| shot | closure p50 / p90 / max | the guide's TRUE error p50 / max |
+|---|---|---|
+| 2 occlusions | 21.5 / **62.1** / 103.6 | 152.5 / 264.7 |
+| 250 frames | 8.5 / **11.1** / 12.7 | 5.1 / 12.2 |
+
+5.6x on p90. Closure badly UNDERSTATES the true error (21.5 against 152.5) because both
+passes share a model and therefore share its faults -- the same limitation
+`tools/make_lk_reference.py` records for round-trip closure. It is a detector, not a
+measurement, and it is only ever asked yes or no.
+
+### Trust has to be LOCAL, or it condemns a guide that is fine where it is used
+
+The guide's reliability falls off with distance from its query, and a fill only ever reaches
+a few frames. Over the whole 151-frame window after f90 the closure is 66.0 px --
+untrustworthy -- while over the five frames actually being filled it is 15.6 px and the leash
+is accurate to 2 px there. A verdict taken over the window throws away the frames it was
+computed to protect.
+
+### So the leash does not steer. It bridges.
+
+Where the loop cuts and re-acquires a few frames later, the frames in between are simply
+missing from the exported track. On the artist's 250-frame reference the gaps were f91-95 and
+f211-212 -- **and their hand track has a sample on every one of them.** The feature was
+visible the whole time; the loop cut as a precaution. That is 7 frames of work handed back to
+the artist by a tool that exists to remove it.
+
+Four gates, each earning its place on those two shots:
+
+* **closure over this gap** -- as above;
+* **CoTracker must call the feature visible.** Visibility is a report and not a gate
+  everywhere else in this codebase, and for good reason: using it to gate the SEARCH killed
+  whole tracks. A fill is optional, so a false negative costs an empty gap that was already
+  empty. Same signal, opposite cost;
+* **the peak, probed WIDER than the tolerance, must come back inside it.** Searching only as
+  far as the tolerance guarantees an in-range answer and proves nothing -- the same "is there
+  somewhere better" reasoning the hold check and the QC pass already use. This is the gate
+  that does the work: across a real occlusion the peak lands 3.7-19.8 px from the prediction,
+  across a precautionary cut 1.8-4.0 px;
+* **contiguity.** A fill that skipped a frame and carried on would be an island across an
+  occlusion -- markers on the occluder with correct-looking neighbours either side.
+
+### Filled from BOTH ends, because neither end is reliably the good one
+
+Working forward from the cut fails on exactly the case that matters. When a track dies to
+DRIFT, its last good frame is already on the wrong feature, so a guide queried there follows
+the wrong feature:
+
+```
+guide queried at the artist's hand-tracked f90   -> closure 15.2 px over the gap
+guide queried where Blender actually was at f90  -> closure 132.9 px
+```
+
+Same gap, same frames. The trust gate correctly refuses the second -- and correctly refuses
+to fill anything.
+
+The resume end has no such problem: it was correlated against the artist's own pattern and
+scored 0.96 before anything was planted. So the return pass is queried at the **verified
+resumes** rather than at the forward pass's endpoint, which costs nothing extra
+(`track_points` takes queries on different frames, so a group of tracks that came back at
+different moments is still one pass) and anchors the second opinion on evidence instead of on
+another guess.
+
+The closure gate then applies only to the cut-anchored guide -- the one with no independent
+support. Refusing the resume-anchored guide for disagreeing with it would be refusing the
+trustworthy end for disagreeing with the untrustworthy one, and closure cannot say which side
+is wrong. Per-frame evidence rules on that one, and the occlusion reference is the check that
+it is enough.
+
+### Both references, and the occlusion reference is the one that matters
+
+| | ref 1 (2 occlusions) | ref 2 (wire, 250 frames) |
+|---|---|---|
+| on the feature | **46 (98 %)** | **246 (98 %)** — was 243 |
+| off the feature | **0** | **0** |
+| gaps | **1** | **4** — was 7 |
+
+Every occlusion gap on ref 1 was refused, including on the un-gated backward walk. That is
+the result the whole design hangs on: a bridge across a real occlusion is a marker on the
+occluder, which is worse than the hole it fills.
+
+### What this does not settle
+
+* `TRUST_P90_PX = 25` sits between 11.1 and 62.1 -- two shots, one plate.
+* The closest call in the whole measurement is f33 on ref 1: NCC 0.881, peak 3.66 px from the
+  prediction against a 3.30 px tolerance. It is refused by 0.36 px. A slightly wider
+  tolerance plants a marker on an occluder.
+* Closure cannot see a guide that fails identically in both directions. Nothing here
+  overrides the pattern check for exactly that reason.
+* The fill costs one extra CoTracker pass per group of deaths. Not profiled against a real
+  batch of 20 tracks; measured only on single-track references.
+* Both references are the same plate and the same artist.

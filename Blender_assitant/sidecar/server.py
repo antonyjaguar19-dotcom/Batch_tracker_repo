@@ -15,6 +15,7 @@ could drive a service that reads client footage off a studio share.
 """
 
 import json
+import math
 import os
 import secrets
 import threading
@@ -344,6 +345,86 @@ def job_patcheck(payload):
     return fn
 
 
+def job_leash(payload):
+    """A guide path for a whole track, plus whether it may be believed.
+
+    Separate from `reacquire` on purpose. Re-acquire answers "where does this dead track
+    come back", runs a SHORT forward window around each death, and is asked once per
+    failure. The leash answers "where is this feature on every frame", covers the track's
+    whole span, and pays for a return pass on top -- roughly three times the GPU work. It
+    is only worth that when the answer will actually steer something, so the trust verdict
+    is computed here and the caller is expected to honour it.
+
+    One track per request: the leash is anchored to ONE seed and its closure describes THAT
+    path. Batching several would average trustworthy guides with untrustworthy ones into a
+    verdict true of neither.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        req = payload.get("request") or {}
+        params = payload.get("params") or {}
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+        if not req:
+            raise ValueError("no track to build a leash for")
+
+        out_dir = os.path.join(ASSIST, "logs", "leash", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        seed_f = int(req["seed_frame"])
+        seed_px = (float(req["seed_x"]), float(req["seed_y"]))
+        frame_hi = min(int(plate.count), int(params.get("frame_hi") or plate.count))
+        frame_lo = max(1, int(params.get("frame_lo") or 1))
+        # Cap the span rather than the frame count: the leash is only useful ahead of where
+        # the track has got to, and a 300-frame double pass is the thing that saturated the
+        # A4000. Everything past the cap is left to the existing re-acquire.
+        span = int(params.get("span", 150))
+        frame_hi = min(frame_hi, seed_f + span)
+        if frame_hi <= frame_lo:
+            raise ValueError("nothing to cover: f%d..f%d" % (frame_lo, frame_hi))
+
+        g = leash.compute(plate, seed_f, seed_px, frame_lo, frame_hi,
+                          max_side=int(params.get("max_side", 768)),
+                          chain=int(params.get("chain", 120)),
+                          trust_px=float(params.get("trust_px", leash.TRUST_P90_PX)),
+                          on_status=job.say)
+        job.say(g["reason"])
+        return {"id": req.get("id"),
+                "trusted": bool(g["trusted"]),
+                "reason": g["reason"],
+                "closure_p50": g["closure_p50"], "closure_p90": g["closure_p90"],
+                "closure_max": g["closure_max"],
+                "seed_frame": g["seed_frame"],
+                "frame_lo": g["frame_lo"], "frame_hi": g["frame_hi"],
+                # Sent as parallel lists, not a dict: JSON object keys are strings, and a
+                # frame number that survives the round trip as "17" is a bug waiting in the
+                # addon's int() calls.
+                "frames": [int(f) for f in sorted(g["path"])],
+                "xy": [[g["path"][f][0], g["path"][f][1]] for f in sorted(g["path"])],
+                "closure": [g["closure"].get(f, -1.0) for f in sorted(g["path"])],
+                "tol_a": leash.TOL_A, "tol_b": leash.TOL_B,
+                "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_reacquire(payload):
     """Where should each dead track be resumed? One CoTracker pass covers all of them.
 
@@ -358,6 +439,7 @@ def job_reacquire(payload):
         require_repo()
         import blio                                                  # noqa: PLC0415
         import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
         import patmatch                                              # noqa: PLC0415
 
         clip = payload.get("clip") or {}
@@ -406,6 +488,10 @@ def job_reacquire(payload):
         # died and run one short pass per group; each pass is ~120 frames whatever the clip
         # length, and the total work scales with the number of distinct failure points
         # rather than with the shot.
+        # Filling a gap costs a second CoTracker pass per group; off means the loop behaves
+        # exactly as it did before any of this existed.
+        fill_gaps = bool(params.get("fill_gaps", True))
+        spans, grouped = {}, {}
         order = sorted(reqs, key=lambda r: int(r["last_good_frame"]))
         groups, cur = [], []
         for r in order:
@@ -446,6 +532,9 @@ def job_reacquire(payload):
                                        on_status=job.say)
             for j, r in enumerate(grp):
                 per_req[r["id"]] = (sub["tracks"][j], sub["vis"][j])
+            spans[gi] = (lo, hi)
+            grouped[gi] = grp
+
         # ---- where does it come back? --------------------------------------------
         # CoTracker says where the point WOULD be on every frame; it does not say which
         # feature that is, and its visibility head does not say when the real one is back.
@@ -466,6 +555,8 @@ def job_reacquire(payload):
         resumes, misses = [], []
         jobs, meta, unverified, pattern_std = [], {}, [], {}
         verify_ref = {}          # id -> (seed patch, offset, box scale, localised?)
+        loc_ref = {}             # id -> (patch that localised, offset)
+        last_by_id = {}          # id -> where the track actually died
         for r in reqs:
             got = per_req.get(r["id"])
             if got is None:
@@ -483,6 +574,7 @@ def job_reacquire(payload):
                                "reason": "the guide has no position after frame %d" % lg})
                 continue
             meta[r["id"]] = (tm, vm, lg, last_px, path)
+            last_by_id[r["id"]] = last_px
 
             pat = r.get("pattern") or {}
             ref = patmatch.reference_patch(
@@ -538,6 +630,11 @@ def job_reacquire(payload):
                 vscale = 1.0
             verify_ref[r["id"]] = (patch, offset, vscale, loc is not None)
             jpatch, joffset = (loc if loc is not None else (patch, offset))
+            # The fill correlates with whatever localised the resume. Its frames sit right
+            # against the cut, where "the feature as the track last saw it" is the closest
+            # available picture of it -- the same reason localisation prefers that patch,
+            # and the reason a drift cut sends no last_box and lands back on the seed patch.
+            loc_ref[r["id"]] = (jpatch, joffset)
             jobs.append({"id": r["id"], "patch": jpatch, "offset": joffset,
                          "radius": radius, "path": path})
 
@@ -704,7 +801,9 @@ def job_reacquire(payload):
                                                                  and std < 5.0) else ""
 
             occluded = sum(1 for ff in range(lg, f) if not vm.get(ff, True))
+
             resumes.append({"id": r["id"], "frame": int(f), "x": x, "y": y,
+                            "fill": [], "fill_note": "",
                             "last_good_frame": lg,
                             "gap_frames": int(f - lg),
                             "occluded_frames": int(occluded),
@@ -725,6 +824,76 @@ def job_reacquire(payload):
                                            else round(pattern_std[r["id"]], 2),
                             "guide_dx": tm[f][0] - tm[lg][0],
                             "guide_dy": tm[f][1] - tm[lg][1]})
+
+        # ---- bridge the gaps ------------------------------------------------------------
+        # Only now, because this needs the RESUME positions and they did not exist until the
+        # sweep finished. One extra CoTracker pass per group, queried at every verified
+        # resume in it -- `track_points` takes queries on different frames, so a group of
+        # tracks that came back at different moments still costs one pass.
+        #
+        # Anchoring the return pass on the verified resumes rather than on the forward
+        # pass's own endpoint is the whole point, and it is measured. When a track dies to
+        # DRIFT its last good frame is already on the wrong feature, so a guide queried
+        # there follows the wrong feature: on the artist's f91 cut, a guide queried at their
+        # hand-tracked f90 closes to 15.2 px and one queried where Blender actually was
+        # closes to 132.9. The resume has no such problem -- it was correlated against the
+        # artist's own pattern and scored 0.96 before anything was planted.
+        #
+        # So the two guides are anchored at opposite ends on evidence of different quality,
+        # their disagreement is the closure that gates the forward walk, and the backward
+        # walk runs off the verified end.
+        if fill_gaps and resumes:
+            want = [rr for rr in resumes
+                    if rr.get("verified") and int(rr["frame"]) - int(rr["last_good_frame"]) > 1
+                    and loc_ref.get(rr["id"]) is not None]
+            by_group = {}
+            for rr in want:
+                for gi, grp in grouped.items():
+                    if any(g["id"] == rr["id"] for g in grp):
+                        by_group.setdefault(gi, []).append(rr)
+                        break
+            for gi, rrs in by_group.items():
+                lo, hi = spans[gi]
+                try:
+                    back = cotrack.track_points(
+                        plate, [(int(rr["frame"]), float(rr["x"]), float(rr["y"]))
+                                for rr in rrs],
+                        lo, hi, max_side=int(params.get("max_side", 768)),
+                        backward=True, on_status=job.say)
+                except Exception as exc:                             # noqa: BLE001
+                    # Best-effort by construction. A crash in an optional step must not cost
+                    # resumes that are already found and verified -- the rule the SynthEyes
+                    # SAM3 post-filter learned by throwing away a clean export.
+                    job.say("return pass failed (%s) -- gaps left alone" % exc)
+                    continue
+                for j2, rr in enumerate(rrs):
+                    bm, bv = back["tracks"][j2], back["vis"][j2]
+                    tm, vm = per_req[rr["id"]]
+                    lg = int(rr["last_good_frame"])
+                    closure = {f: math.hypot(tm[f][0] - bm[f][0], tm[f][1] - bm[f][1])
+                               for f in tm if f in bm}
+                    lpatch, loffset = loc_ref[rr["id"]]
+
+                    def _m(ff, mx, my, rad, _p=lpatch, _o=loffset):
+                        return patmatch.match(plate, ff, _p, mx, my, radius=rad, offset=_o)
+
+                    try:
+                        fill, note = leash.fill_gap(
+                            _m, tm, vm, closure, lg, last_by_id[rr["id"]],
+                            int(rr["frame"]), resume_px=(float(rr["x"]), float(rr["y"])),
+                            back_guide=bm, back_vis=bv,
+                            min_match=min_match,
+                            trust_px=float(params.get("trust_px", leash.TRUST_P90_PX)))
+                    except Exception as exc:                         # noqa: BLE001
+                        fill, note = [], "gap fill failed: %s" % exc
+                    rr["fill"], rr["fill_note"] = fill, note
+                    if fill:
+                        job.say("%s: bridged f%d-f%d of the f%d-f%d gap (%s)"
+                                % (rr["id"], fill[0]["frame"], fill[-1]["frame"],
+                                   lg, int(rr["frame"]), note))
+                    else:
+                        job.say("%s: gap f%d-f%d left alone -- %s"
+                                % (rr["id"], lg, int(rr["frame"]), note))
 
         scored = [x["match_score"] for x in resumes if x["match_score"] is not None]
         job.say("%d resume(s), %d without one%s"
@@ -796,7 +965,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
-                         "/jobs/hold"):
+                         "/jobs/hold", "/jobs/leash"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -808,7 +977,7 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS[job.id] = job
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
                           "patcheck": job_patcheck, "motion": job_motion,
-                          "hold": job_hold}[kind](payload))
+                          "hold": job_hold, "leash": job_leash}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

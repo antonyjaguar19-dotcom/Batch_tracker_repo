@@ -129,6 +129,7 @@ class CLIP_PT_btr_main(_Base):
         # have.
         if p is not None:
             op.verify_pattern = p.verify_pattern
+            op.fill_gaps = p.fill_gaps
             op.min_match = p.min_match
             op.confirm_resumes = p.confirm_resumes
             op.fit_search_box = p.fit_search_box
@@ -196,6 +197,7 @@ class CLIP_PT_btr_opts(_Base):
         row = col.row()
         row.enabled = p.verify_pattern
         row.prop(p, "min_match", text="Minimum match")
+        col.prop(p, "fill_gaps", text="Bridge the gap it crossed")
         col.prop(p, "confirm_resumes", text="Ask me about each one")
         row = col.row()
         row.enabled = p.confirm_resumes
