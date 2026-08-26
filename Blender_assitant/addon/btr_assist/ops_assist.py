@@ -769,6 +769,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     break
                 tr.markers.delete_frame(g)
             rec["alive"] = False
+            # Same reasoning as the hold cut: a jump means the recent frames are not the
+            # feature, so they must not become the thing we search for.
+            rec["cut_by_check"] = True
             self._cut.append((rec["id"], int(f), len(gone)))
             print("[assist] %s jumped %.0f px at f%d against its own %.0f px/frame -- "
                   "%d frame(s) removed, re-acquire takes it from here"
@@ -859,6 +862,17 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # Dead, and anchored on the last frame that WAS the feature -- which is exactly
             # what re-acquire needs to search from.
             rec["alive"] = False
+            # Localise the resume with the ARTIST'S SEED patch, not with the feature as the
+            # track last saw it. Normally last-good is far better -- measured 0.46 px against
+            # 3.87 px on the SH004 known-answer set -- but that assumes the last frames were
+            # ON the feature. A hold-check cut says exactly the opposite, and the drift
+            # reaches back before the frame where the score finally gave way: measured on
+            # SH006 the cut lands at f91 while the track is already 5.65 px out at f87, so
+            # the patch cut at f90 is part of the lookalike. Localising with it put the
+            # resume where the artist's own patch scores 0.64, and the identity gate --
+            # correctly -- refused it, killing the track with 160 frames still to run. At the
+            # right position that same patch scores 0.931.
+            rec["cut_by_check"] = True
             self._cut.append((res["id"], int(lost), len(gone)))
             print("[assist] %s stopped being your feature at f%d (was %.2f, became %.2f) "
                   "-- %d frame(s) of drift removed, re-acquire takes it from here"
@@ -1048,11 +1062,18 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 continue
             rec = next((r for r in self._records if r["id"] == tr.name), None)
             if rec is not None and rec.get("edge_stopped"):
-                # It did not fail, it left. Every sweep for it would be looking off-plate.
-                self._gave_up.add(tr.name)
-                print("[assist] %s reached the edge of frame at f%d -- finished, not lost"
+                # A track stopped at the frame edge used to be abandoned here, on the
+                # reasoning that it had not failed, it had left, and every sweep for it would
+                # be looking off-plate. That is true only while it is OUTSIDE -- a feature
+                # that leaves and comes back a few frames later was made structurally
+                # impossible to recover, which is exactly what the artist then reported.
+                #
+                # It costs one CoTracker pass to be wrong about this. Off-plate frames score
+                # nothing (`reference_patch` refuses a box that does not fit), so the sweep
+                # simply finds no match until the feature is back inside, and the existing
+                # miss reasons already say when the shot ran out.
+                print("[assist] %s left frame at f%d -- looking for it to come back"
                       % (tr.name, rec["edge_stopped"]))
-                continue
             # Did the LAST resume actually buy anything? A point that died to blur rather
             # than to an occluder re-acquires fine and dies again straight away, so without
             # this the loop grinds forward a few frames per round on a feature that is
@@ -1101,6 +1122,9 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 # checks identity against the seed box below.
                 bcx, bcy, bpw, bph = marker_pattern_box(m, w, h)
                 last_box = {"frame": lf, "cx": bcx, "cy": bcy, "w": bpw, "h": bph}
+                if rec is not None and rec.get("cut_by_check"):
+                    # No last_box -> the sidecar localises with the artist's own patch.
+                    last_box = None
             reqs.append({"id": tr.name,
                          "query_frame": seed[0], "query_x": seed[1], "query_y": seed[2],
                          "last_good_frame": lf, "last_good_x": lx, "last_good_y": ly,
@@ -1328,6 +1352,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 m.search_max = (sx, sy)
             rec["alive"] = True
             rec["seed_frame"] = int(res["frame"])
+            rec.pop("cut_by_check", None)
             self._continue_from.pop(res["id"], None)
             # Ask only about the case that has not been measured. A resume across frames the
             # guide calls VISIBLE is the case the numbers cover; one across an occlusion is

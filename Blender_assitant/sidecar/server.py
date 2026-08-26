@@ -645,7 +645,14 @@ def job_reacquire(payload):
                 # is already a full-res correlation peak, so this is a second opinion on the
                 # same spot, not another search.
                 vp, voff, vscale, localised = verify_ref.get(r["id"], (None, None, 1.0, False))
-                if localised and vp is not None:
+                # Runs whether or not the last-good patch did the localising. It used to be
+                # gated on `localised`, which meant a resume searched with the ARTIST'S OWN
+                # patch -- the path taken after a drift cut -- skipped the refinement
+                # entirely and kept its own offset. Measured on the artist's 250-frame
+                # reference that cost p50 0.8 px -> 3.4 px and put a 2.3 px bias back on
+                # every resumed run. When the seed patch also did the localising this is a
+                # second look at the same peak, which is harmless and costs one correlation.
+                if vp is not None:
                     vpatch = (patmatch._resized(vp, vscale)
                               if abs(vscale - 1.0) > 0.02 else vp)
                     got = None

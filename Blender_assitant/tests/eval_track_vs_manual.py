@@ -151,6 +151,7 @@ def main():
             time.sleep(0.4)
 
     gave_up = False
+    cut_by_check = False
     prev_resume = seed_f
     for rnd in range(a.rounds + 1):
         for _ in track_core.track_job(ctx, [rec], clip.frame_duration, {}, opts):
@@ -167,6 +168,7 @@ def main():
             for g in [m.frame for m in tr.markers if m.frame >= int(jf)]:
                 if len(tr.markers) > 1:
                     tr.markers.delete_frame(g)
+            cut_by_check = True
             log("round %d: jump cut at f%d (%.0f px vs its own %.0f)" % (rnd, jf, jstep, jmed))
 
         path = [[int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
@@ -182,6 +184,7 @@ def main():
             for f in [m.frame for m in tr.markers if m.frame >= int(lost)]:
                 if len(tr.markers) > 1:
                     tr.markers.delete_frame(f)
+            cut_by_check = True
             log("round %d: cut at f%d" % (rnd, lost))
         fr = live_frames(tr)
         if not fr or fr[-1] >= clip.frame_duration - 2:
@@ -199,7 +202,10 @@ def main():
         req = [{"id": "EV", "query_frame": seed_f, "query_x": sx, "query_y": sy,
                 "last_good_frame": lg, "last_good_x": lx, "last_good_y": ly,
                 "gap": a.gap, "pattern": pattern,
-                "last_box": {"frame": lg, "cx": bcx, "cy": bcy, "w": bpw, "h": bph},
+                # Omitted after a hold/jump cut -- see ops_assist: the recent patch is the
+                # drift, so the artist's own is what should be searched for.
+                **({} if cut_by_check else
+                   {"last_box": {"frame": lg, "cx": bcx, "cy": bcy, "w": bpw, "h": bph}}),
                 "search_px": marker_search_px(m, w, h)}]
         st = wait(client.start_reacquire(ASSIST, ci, req,
                                          {"frame_hi": clip.frame_duration,
@@ -215,6 +221,7 @@ def main():
             break
         rr = res["resumes"][0]
         prev_resume = int(rr["frame"])
+        cut_by_check = False
         mk = tr.markers.insert_frame(int(rr["frame"]),
                                      co=image_px_to_uv(float(rr["x"]), float(rr["y"]), w, h))
         mk.mute = False

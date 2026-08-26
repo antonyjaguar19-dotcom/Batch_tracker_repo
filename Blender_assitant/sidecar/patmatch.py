@@ -415,7 +415,7 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
     return out
 
 
-def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=0.20,
+def first_loss(scores, floor=0.5, drop=0.6, settle=5, head=10, look=5, min_fall=0.20,
                ambig_margin=0.05, ambig_drop=0.85, probe_gain=0.10):
     """The first frame where a track stopped being on the artist's feature.
 
@@ -429,8 +429,16 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
     second occlusion -- and leaves f32 (0.608, a real frame in their hand track) alone,
     because 0.6 x 0.99 = 0.594 sits between them.
 
-    `settle` frames must agree before it counts, so one bad frame -- a grain hit, a lighting
-    step, a marker crossing a highlight -- does not cut a good track.
+    `settle` frames must agree before it counts. It was two, fitted to a synthetic case, and
+    real data moved it: the artist's own 250-frame hand track -- every frame correct by
+    definition -- contains a **four-frame** run where the seed patch scores as low as 0.132 at
+    a position they tracked by hand, and then recovers to 0.731. A 230-frame-old patch simply
+    stops describing the feature for a moment; blur, a light change, something passing. Two
+    frames of agreement cut that track at f230.
+
+    Five frames is what separates it from the drift on the same shot, which runs five and
+    never recovers. That number comes from measured footage, not from taste, and it is the
+    reason a transient dip is survivable at all.
 
     Returns the frame number, or None.
     """
@@ -530,6 +538,11 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=2, head=10, look=5, min_fall=
                 first_bad = f
             if bad_run >= settle:
                 return first_bad
+            # Do NOT let a rejected frame into `recent`. It used to, and the bad frames then
+            # dragged the recent level down to their own value -- by the third one the drop
+            # was no longer a fall against it, the run reset, and a long failure could never
+            # reach the settle count. Invisible while settle was 2; fatal at 5.
+            continue
         else:
             bad_run = 0
             first_bad = None

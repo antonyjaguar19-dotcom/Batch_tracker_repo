@@ -2300,3 +2300,94 @@ to this model.
   not profiled.
 * The perspective case is pinned as a synthetic pair, not against footage of a feature actually
   approaching camera. The artist reported it; no reference for it exists.
+
+### Cut too early, and never coming back (2026-08-25)
+
+Two reports: *"tracks are not tracked completely even though the tracks are still inside the
+frame"*, and *"CoTracker is not acquiring the tracks if they leave the frame and enter again
+after a few frames."* Neither was CoTracker. Both were assumptions written here this week.
+
+### Re-entry was made impossible on purpose
+
+Three commits earlier, `edge_stop` gained this:
+
+```python
+# It did not fail, it left. Every sweep for it would be looking off-plate.
+self._gave_up.add(tr.name)
+```
+
+True only while the feature is outside. A feature that leaves and returns a few frames later
+was structurally unrecoverable, which is exactly what got reported. Removed. Off-plate
+positions cost nothing to sweep — `reference_patch` refuses a box that does not fit, so the
+correlation is skipped until the feature is back inside; measured directly:
+
+```
+well inside              -> score 0.695
+just off the right edge  -> no match (skipped)
+off the top              -> no match (skipped)
+```
+
+### The early cuts: three causes, compounding
+
+**1. `settle` was fitted to a synthetic case.** The artist's 250-frame hand track — every frame
+correct by construction — contains a **four-frame** run where the frame-1 patch scores as low
+as **0.132** at a position they tracked by hand, then recovers to 0.731:
+
+```
+f150 0.979   f200 0.939   f216 0.692   f231 0.132   f250 0.731
+```
+
+A 230-frame-old patch stops describing the feature for a moment. At `settle = 2` that cut
+their track at f230 — and at f216 once the probe trigger was added. Their drift on the same
+shot runs **five** frames and never recovers, so 5 is the separation, taken from footage
+rather than taste.
+
+**2. Rejected frames were defining the "recent level".** Bad frames were appended to `recent`,
+so by the third one the drop was no longer a fall against it, the run reset, and a long
+failure could never reach the settle count. Invisible at 2; fatal at 5 — three tests failed
+the moment it was raised, which is how it surfaced.
+
+**3. A cut track was re-acquired with the patch that caused the cut.** After the hold check
+cuts at f91, the resume localised with the last-good patch from f90 — but the track was
+already **5.65 px** onto the lookalike at f87. It landed where the artist's own patch scores
+**0.64**, the identity gate correctly refused it, and the track died with 160 frames still to
+run. At the right position that same patch scores **0.931**.
+
+Every component behaved as designed and the outcome was still wrong: the reference was
+poisoned by the drift the cut existed to remove. A hold or jump cut now sends no `last_box`,
+so the sidecar localises with the artist's own patch. Normally last-good is far better —
+0.46 px against 3.87 px on the SH004 known-answer set — but that assumes the recent frames
+were ON the feature, and a cut asserts the opposite.
+
+**4. And that silently disabled the position refinement.** The verify step was gated on
+`localised`, so a resume searched with the seed patch skipped refinement entirely. Cost p50
+0.8 px -> 3.4 px. The gate looked like it was guarding correctness and was actually guarding
+an unrelated code path. It now runs whenever a seed patch exists.
+
+### Both references, best yet
+
+| | reference 1 (2 occlusions, 47 frames) | reference 2 (wire, 250 frames) |
+|---|---|---|
+| on the feature | **46 (98 %)** | **243 (97 %)** |
+| off the feature | **0** | **0** |
+| gaps | **1** | **7** |
+
+Reference 1 was 45/47 with 2 gaps; reference 2 was 235/250 with 15.
+
+### One number that got worse, stated plainly
+
+Reference 2's precision loosened: p50 0.8 px -> 3.4 px, of which 2.3 px is a constant offset.
+That offset is the artist's click against where the correlator centres on the same feature —
+identical to reference 1's 2.5 px baseline, constant within a run, and benign to a solve. The
+earlier 0.8 px was partly flattering: that run tracked THROUGH the drift region, so its
+scored frames were the easy ones. More coverage of harder frames is not a free improvement
+and should not be presented as one.
+
+### What this does not settle
+
+* `settle = 5` comes from one hand track's one transient. A correct track with a six-frame dip
+  would still be cut.
+* The seed-patch-after-a-cut rule is reasoned from one measurement (0.64 against 0.931). It has
+  not been scored on a clean death, where last-good is known to be better.
+* The 2.3 px offset is attributed to click-vs-correlator by inference from two references, not
+  measured directly.

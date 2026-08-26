@@ -190,8 +190,12 @@ def main():
          [(f, 0.55 + 0.1 * ((f % 3) - 1)) for f in range(1, 40)], None),
         ("one bad frame does not cut a good track",
          [(f, 0.10 if f == 10 else 0.95) for f in range(1, 20)], None),
-        ("two bad frames in a row is the real thing",
-         [(f, 0.10 if f in (10, 11) else 0.95) for f in range(1, 20)], 10),
+        # Was "two bad frames in a row". Real data moved it: the artist's own hand track
+        # has a FOUR-frame dip at a correct position, so two is not enough to mean anything.
+        ("a short dip does not cut a good track",
+         [(f, 0.10 if f in (10, 11, 12, 13) else 0.95) for f in range(1, 20)], None),
+        ("five bad frames in a row is the real thing",
+         [(f, 0.10 if 10 <= f <= 14 else 0.95) for f in range(1, 20)], 10),
         ("gentle decline (defocus) is still the feature",
          [(f, max(0.45, 0.95 - 0.02 * f)) for f in range(1, 30)], None),
         ("occlusion late in a long healthy track",
