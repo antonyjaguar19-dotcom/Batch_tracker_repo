@@ -82,6 +82,11 @@ def main():
                          "4K frames disagrees by a few")
     ap.add_argument("--track", default="",
                     help="which track in the manual file (default: the first)")
+    ap.add_argument("--engine", choices=("blender", "cotracker"), default="blender",
+                    help="which engine tracks BETWEEN occlusions. cotracker asks the "
+                         "sidecar for a CoTracker path pinned to the artist pattern box; "
+                         "blender is the tracker Blender ships. Re-acquisition across an "
+                         "occlusion is the same either way")
     ap.add_argument("--no-pin", action="store_true",
                     help="skip registering each frame against the artist's pattern -- the "
                          "behaviour before the pin pass existed")
@@ -162,8 +167,46 @@ def main():
     cut_by_check = False
     prev_resume = seed_f
     for rnd in range(a.rounds + 1):
-        for _ in track_core.track_job(ctx, [rec], clip.frame_duration, {}, opts):
-            pass
+        if a.engine == "cotracker":
+            # CoTracker as the PRIMARY engine between occlusions: it picks the
+            # neighbourhood, the artist's pattern box picks the pixel. Blender is not asked
+            # to track at all on this path -- which is the point of measuring it separately.
+            fs_now = live_frames(tr)
+            head = fs_now[-1] if fs_now else rec["seed_frame"]
+            mh = tr.markers.find_frame(head, exact=True)
+            if mh is None:
+                break
+            hx, hy = marker_to_image_px(mh, w, h)
+            st = wait(client.start_ctrack(ASSIST, ci,
+                                          [{"id": "EV", "seed_frame": int(head),
+                                            "seed_x": hx, "seed_y": hy,
+                                            "pattern": pattern}],
+                                          {"frame_hi": clip.frame_duration,
+                                           "min_match": a.min_match,
+                                           "pin_radius": a.pin_radius})["id"])
+            if st["state"] != "done":
+                log("round %d: ctrack failed: %s" % (rnd, st.get("error")))
+                break
+            res = st["result"]
+            got = (res["tracks"] or {}).get("EV") or []
+            for g in got:
+                if int(g["frame"]) == int(head):
+                    continue
+                mm = tr.markers.insert_frame(int(g["frame"]),
+                                             co=image_px_to_uv(float(g["x"]),
+                                                               float(g["y"]), w, h))
+                mm.mute = False
+                mm.pattern_corners = mh.pattern_corners
+                mm.search_min, mm.search_max = mh.search_min, mh.search_max
+            log("round %d: cotracker %d frame(s) from f%d -- %s"
+                % (rnd, len(got), head, (res["notes"] or {}).get("EV", "")))
+            if len(got) <= 1:
+                # It could not leave the seed frame. Another round would ask the same
+                # question of the same frame and get the same answer.
+                break
+        else:
+            for _ in track_core.track_job(ctx, [rec], clip.frame_duration, {}, opts):
+                pass
         if not live_frames(tr):
             break
 
@@ -172,6 +215,15 @@ def main():
         jpath = sorted([int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
                        for m in tr.markers if not m.mute)
         jf, jstep, jmed = track_core.first_jump(jpath)
+        # The jump check runs for BOTH engines, and the attempt to skip it under CoTracker is
+        # worth recording. The reasoning was that a frame already scored against the artist's
+        # own pattern cannot have been dragged by an occluder, so the check was redundant and
+        # was costing frames -- it cut at f231 between two frames 2.8 px and 3.0 px from the
+        # hand track. Measured, removing it went 247/250 to 231/250 with a frame 28 px OFF
+        # the feature: CoTracker ran two frames past the slide while still scoring 0.66, and
+        # the re-acquire then correctly refused a resume localised from that contaminated
+        # patch. A per-frame score says the pattern is present; it does not say the track has
+        # not stepped onto its neighbour, and the motion check is the only thing that does.
         if jf:
             for g in [m.frame for m in tr.markers if m.frame >= int(jf)]:
                 if len(tr.markers) > 1:

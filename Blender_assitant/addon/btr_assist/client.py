@@ -213,3 +213,13 @@ def start_pin(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/pin",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_ctrack(assist_root, clip_info, requests, params=None):
+    """Track seeds with CoTracker as the primary engine, pinned to the artist's pattern."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/ctrack",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)

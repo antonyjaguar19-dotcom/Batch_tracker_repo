@@ -59,7 +59,8 @@ matched. `Keep` drops the estimate and keeps the measurements.
 import os
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       IntProperty)
 
 from . import client, overlay, prefs, three_de, track_core
 from .ops_seed import clip_info
@@ -207,6 +208,21 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                     "preview -- against every candidate resume at full plate resolution, "
                     "and refuse the ones that are not the same feature. Off restores the "
                     "old behaviour: CoTracker's first visible frame is planted unchecked")
+    track_engine: EnumProperty(
+        name="Engine between occlusions", default="BLENDER",
+        items=(("BLENDER", "Blender",
+                "Blender's own tracker. Matches each frame against the one before it, which "
+                "is what gives it sub-pixel precision -- and why an error survives forward "
+                "with nothing to pull it back"),
+               ("COTRACKER", "CoTracker",
+                "CoTracker picks the neighbourhood on every frame and your pattern box picks "
+                "the pixel. Measured against two hand tracks: 247/250 against 246 on the long "
+                "one and level on the occluded one, with the tail slightly worse (max 8.4 px "
+                "-> 15.4). Its real advantage is on plates Blender cannot track at all, and "
+                "it ran 232 consecutive frames on the reference without a single re-acquire. "
+                "Falls back to Blender if the sidecar or CoTracker is unavailable")),
+        description="Which engine carries a track BETWEEN occlusions. Crossing an occlusion "
+                    "is CoTracker either way -- that is what the re-acquire has always been")
     pin_to_pattern: BoolProperty(
         name="Pin every frame to my pattern", default=True,
         description="When the run finishes, register every frame against the pattern box you "
@@ -661,6 +677,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         overlay.hide()
         self._hold_done = False
         self._stats = {}
+        if getattr(self, "track_engine", "BLENDER") == "COTRACKER" and self._start_ctrack(context):
+            return
         # Re-baselined every pass. A track that restarts from a repair or a resume starts
         # with a different box, and a watch still holding the old baseline would flag its
         # first frame.
@@ -670,6 +688,127 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
         self._phase = "tracking"
         self._status(context, "round %d: tracking %d marker(s)"
                      % (self._round + 1, len(self._records)))
+
+    def _start_ctrack(self, context):
+        """Hand the tracking to CoTracker, pinned to each artist pattern box.
+
+        Returns False to fall through to Blender, which is the whole of the secondary-engine
+        story: if the sidecar is not up, or CoTracker is not installed, or no track has a
+        usable pattern box, the run carries on exactly as it did before rather than failing.
+        A missing optional engine must degrade, not stop.
+        """
+        clip = self._clip
+        w, h = clip.size
+        reqs = []
+        for rec in self._records:
+            if not rec.get("alive", True):
+                continue
+            tr = rec["t"]
+            fs = live_frames(tr)
+            if not fs:
+                continue
+            head = fs[-1]
+            m = tr.markers.find_frame(head, exact=True)
+            if m is None:
+                continue
+            hx, hy = marker_to_image_px(m, w, h)
+            pat = self._patterns.get(rec["id"])
+            if not pat:
+                # Nothing to pin to. CoTracker on its own is 13 px at 4K, which is not a
+                # track -- so this one goes back to Blender rather than being tracked badly.
+                continue
+            reqs.append({"id": rec["id"], "seed_frame": int(head),
+                         "seed_x": hx, "seed_y": hy, "pattern": pat})
+        if not reqs:
+            return False
+        p = prefs.get(context)
+        try:
+            client.ensure(self._root, bpy.path.abspath(p.python_exe) if p else "",
+                          p.port if p else 0)
+            r = client.start_ctrack(self._root, clip_info(context, clip), reqs,
+                                    {"frame_hi": self._n_frames,
+                                     "min_match": float(self.min_match),
+                                     "pin_radius": float(self.pin_radius)})
+        except Exception as exc:                                      # noqa: BLE001
+            print("[assist] CoTracker engine unavailable (%s) -- using Blender" % exc)
+            return False
+        self._job = r["id"]
+        self._ctrack_heads = {q["id"]: int(q["seed_frame"]) for q in reqs}
+        self._phase = "ctracking"
+        self._status(context, "round %d: CoTracker tracking %d marker(s) ..."
+                     % (self._round + 1, len(reqs)))
+        return True
+
+    def _tick_ctrack(self, context):
+        st = client.poll(self._root, self._job)
+        if st["state"] in ("queued", "running"):
+            self._status(context, "%s  (%.0fs)" % (st.get("stage") or "CoTracker",
+                                                   st.get("seconds", 0)))
+            return {"RUNNING_MODAL"}
+        if st["state"] == "error":
+            # Not fatal. The tracks still hold everything they had, and Blender can carry
+            # them from here -- which is what "secondary engine" has to mean if it is to be
+            # worth having.
+            print("[assist] CoTracker engine failed (%s) -- using Blender"
+                  % st["error"]["message"])
+            track_core.attach_watch(self._records, self._opts)
+            self._gen = track_core.track_job(self._ctx, self._records, self._n_frames,
+                                             {}, self._opts, stats=self._stats)
+            self._phase = "tracking"
+            return {"RUNNING_MODAL"}
+
+        res = st["result"] or {}
+        clip = self._clip
+        w, h = clip.size
+        by_name = {r["id"]: r for r in self._records}
+        planted = 0
+        for tid, got in (res.get("tracks") or {}).items():
+            rec = by_name.get(tid)
+            if rec is None:
+                continue
+            tr = rec["t"]
+            head = self._ctrack_heads.get(tid)
+            src = tr.markers.find_frame(head, exact=True) if head else None
+            for g in got:
+                f = int(g["frame"])
+                if f == head:
+                    continue
+                m = tr.markers.insert_frame(f, co=image_px_to_uv(float(g["x"]),
+                                                                 float(g["y"]), w, h))
+                m.mute = False
+                if src is not None:
+                    # The artist's own box, carried forward. CoTracker has no notion of a
+                    # pattern box, so without this every planted frame would inherit
+                    # Blender's default and the next check would read a box nobody chose.
+                    m.pattern_corners = src.pattern_corners
+                    m.search_min, m.search_max = src.search_min, src.search_max
+                planted += 1
+            note = (res.get("notes") or {}).get(tid, "")
+            if note:
+                print("[assist] %s: %s" % (tid, note))
+        print("[assist] CoTracker planted %d frame(s) across %d track(s)"
+              % (planted, len(res.get("tracks") or {})))
+        self._stats = {"done": True, "frame": self._n_frames, "total": self._n_frames,
+                       "alive": len(self._records), "deaths": 0, "flagged": 0, "edge": 0}
+
+        # From here the run is identical whichever engine produced the frames. The scale
+        # watch is the one step that is skipped: it baselines against Blender's own per-frame
+        # box and CoTracker never sets one, so it would be comparing a box to itself.
+        #
+        # The motion check is NOT skipped, and the attempt to skip it is worth recording. The
+        # reasoning was that a frame already scored against the artist's pattern cannot have
+        # been dragged onto a neighbour, so the check was redundant -- it had cut at f231
+        # between two frames 2.8 px and 3.0 px from the hand track. Measured, removing it
+        # took the 250-frame reference from 247/250 to 231/250 and left a frame 28 px OFF the
+        # feature: CoTracker ran two frames past the slide while still scoring 0.66. A
+        # per-frame score says the pattern is present; it does not say the track has not
+        # stepped onto its neighbour, and the motion check is the only thing that does.
+        if self.hold_feature and not self._hold_done:
+            self._cut_jumps(context)
+            if self._start_hold(context):
+                return {"RUNNING_MODAL"}
+            self._hold_done = True
+        return self._after_tracking(context)
 
     def _status(self, context, msg):
         context.workspace.status_text_set("Assist: %s" % msg)
@@ -692,7 +831,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
 
     def modal(self, context, event):
         if event.type == "ESC":
-            if self._phase in ("waiting", "drift", "motion", "hold"):
+            if self._phase in ("waiting", "drift", "motion", "hold", "ctracking"):
                 client.cancel(self._root, self._job)
             return self._done(context, "cancelled")
         try:
@@ -709,6 +848,8 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 return self._tick_motion(context)
             if self._phase == "hold":
                 return self._tick_hold(context)
+            if self._phase == "ctracking":
+                return self._tick_ctrack(context)
             if self._phase == "tracking":
                 return self._tick_tracking(context)
             if self._phase == "waiting":

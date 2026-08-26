@@ -345,6 +345,146 @@ def job_patcheck(payload):
     return fn
 
 
+def job_ctrack(payload):
+    """Track a seed with CoTracker as the PRIMARY engine, pinned to the artist's pattern.
+
+    The division of labour is measured, not assumed. Driving a track with CoTracker alone was
+    scored against two hand tracks and lost badly on precision -- p50 13.0 px at 4K against
+    Blender's 3.4 -- while never once leaving the feature on a 250-frame continuous run where
+    the Blender loop cut seven frames out. It knows WHICH feature; it does not know where the
+    feature is to a pixel.
+
+    So it is asked only the question it answers well. CoTracker supplies a per-frame
+    prediction, re-anchored to the last frame that was confirmed rather than to its own
+    absolute coordinates -- it accumulates about 0.1 px per frame, so by frame 250 it is 24 px
+    out while its motion over the last few frames is still good to 2 px. Then the artist's own
+    pattern box is registered at that prediction, allowing it to warp, and THAT is the
+    position recorded. CoTracker chooses the neighbourhood; the pattern chooses the pixel.
+
+    Stops at the first frame the pattern cannot be found on, and does not skip forward. That
+    frame is an occlusion, and crossing it is `job_reacquire`'s job -- the same division the
+    artist asked for: CoTracker between the occlusions, the re-acquire across them.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        plate_path = clip.get("path", "")
+        if not os.path.exists(plate_path):
+            raise FileNotFoundError("plate not found: %s" % plate_path)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+        if not reqs:
+            raise ValueError("no seeds to track")
+
+        out_dir = os.path.join(ASSIST, "logs", "ctrack", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(plate_path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        frame_lo = max(1, int(params.get("frame_lo") or 1))
+        frame_hi = min(int(plate.count), int(params.get("frame_hi") or plate.count))
+        # How far ahead of the seed to go in one call. Unlike the re-acquire, this is NOT a
+        # VRAM limit -- the guide is built in chained 120-frame windows whatever the span --
+        # it is only a ceiling on how much work one job does. 150 was too small and showed
+        # it: on a 250-frame reference the track reached f151, spent a re-acquire crossing a
+        # boundary that was not an occlusion, and carried on.
+        span = int(params.get("span", 600))
+        min_match = float(params.get("min_match", 0.60))
+        # Room for CoTracker's own error at the prediction. Its displacement over ONE frame
+        # agrees with a hand track to about 2 px at p90, so this is generous by design and is
+        # bounded below by the same reasoning as the pin: wide enough to reach the feature,
+        # too narrow to reach the next one.
+        radius = float(params.get("pin_radius", 12.0))
+        max_side = int(params.get("max_side", 768))
+        chain = int(params.get("chain", 120))
+
+        out, notes = {}, {}
+        for r in reqs:
+            if job.cancel.is_set():
+                break
+            tid = r["id"]
+            seed_f = int(r["seed_frame"])
+            seed_px = (float(r["seed_x"]), float(r["seed_y"]))
+            pat = r.get("pattern") or {}
+            ref = patmatch.reference_patch(plate, int(pat.get("frame", seed_f)),
+                                           float(pat["cx"]), float(pat["cy"]),
+                                           float(pat["w"]), float(pat["h"])) if pat else None
+            if ref is None:
+                notes[tid] = "no pattern box to pin to"
+                continue
+            patch, offset = ref
+
+            hi = min(frame_hi, seed_f + span)
+            if hi - seed_f < 1:
+                notes[tid] = "nothing ahead of the seed to track"
+                continue
+            job.say("%s: CoTracker over f%d-f%d" % (tid, seed_f, hi))
+            guide = leash._chain(plate, seed_f, seed_px, frame_lo, hi,
+                                 max_side, chain, job.say, +1)
+            if not guide:
+                notes[tid] = "the guide produced no positions"
+                continue
+
+            got = [{"frame": seed_f, "x": seed_px[0], "y": seed_px[1],
+                    "score": 1.0, "warped": False}]
+            anchor_f, anchor_px = seed_f, seed_px
+            stopped = None
+            for f in range(seed_f + 1, hi + 1):
+                if job.cancel.is_set():
+                    break
+                p = leash.predict(guide, anchor_f, anchor_px, f)
+                if p is None:
+                    stopped = (f, "the guide has no position here")
+                    break
+                img = patmatch._gray(plate.frame(f - 1))
+                if img is None:
+                    stopped = (f, "the frame could not be read")
+                    break
+                hit = patmatch.match_pinned(img, patch, p[0], p[1],
+                                            radius=radius, offset=offset)
+                if hit is None:
+                    stopped = (f, "your pattern box does not fit here")
+                    break
+                if hit[2] < min_match:
+                    stopped = (f, "your pattern only reaches %.2f, under %.2f"
+                               % (hit[2], min_match))
+                    break
+                scale, skew = patmatch.warp_shape(hit[3])
+                got.append({"frame": f, "x": float(hit[0]), "y": float(hit[1]),
+                            "score": round(float(hit[2]), 4),
+                            "warped": hit[3] is not None,
+                            "scale": round(scale, 3), "skew": round(skew, 3)})
+                # Re-anchor on every confirmed frame. Anchoring once at the seed would let
+                # the guide's own drift accumulate into the prediction, which is the whole
+                # reason its absolute path is 24 px out by frame 250.
+                anchor_f, anchor_px = f, (float(hit[0]), float(hit[1]))
+            out[tid] = got
+            sc = [g["score"] for g in got]
+            notes[tid] = ("stopped at f%d -- %s" % stopped) if stopped else ("reached f%d" % hi)
+            job.say("%s: %d frame(s) f%d-f%d, match %.2f-%.2f; %s"
+                    % (tid, len(got), got[0]["frame"], got[-1]["frame"],
+                       min(sc), max(sc), notes[tid]))
+        cotrack.free()
+        return {"tracks": out, "notes": notes, "min_match": min_match,
+                "pin_radius": radius, "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_pin(payload):
     """Move every marker onto the artist's own pattern, frame by frame.
 
@@ -1122,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
                          "/jobs/hold", "/jobs/leash", "/jobs/report",
-                         "/jobs/pin"):
+                         "/jobs/pin", "/jobs/ctrack"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1135,7 +1275,8 @@ class Handler(BaseHTTPRequestHandler):
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
                           "patcheck": job_patcheck, "motion": job_motion,
                           "hold": job_hold, "leash": job_leash,
-                          "report": job_report, "pin": job_pin}[kind](payload))
+                          "report": job_report, "pin": job_pin,
+                          "ctrack": job_ctrack}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

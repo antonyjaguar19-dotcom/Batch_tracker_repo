@@ -9,7 +9,8 @@ import json
 import os
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
+                       StringProperty)
 
 DEFAULTS_CACHE = {}
 
@@ -64,6 +65,17 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
     # artist makes once per plate, not per run, and a modal operator has no redo panel to
     # adjust them in. The operator still owns the properties -- the panel copies these into
     # it -- so scripting the operator directly is unaffected.
+    track_engine: EnumProperty(
+        name="Engine between occlusions", default="BLENDER",
+        items=(("BLENDER", "Blender",
+                "Blender's own tracker, matching each frame against the one before it"),
+               ("COTRACKER", "CoTracker",
+                "CoTracker picks the neighbourhood on every frame, your pattern box picks "
+                "the pixel. Measured against two hand tracks: 247/250 against 246 on the "
+                "long one, level on the occluded one, tail slightly worse. Falls back to "
+                "Blender if the sidecar or CoTracker is unavailable")),
+        description="Which engine carries a track BETWEEN occlusions. Crossing an occlusion "
+                    "is CoTracker either way")
     pin_to_pattern: BoolProperty(
         name="Pin every frame to my pattern", default=True,
         description="When a run finishes, register every frame against the pattern box you "
@@ -170,6 +182,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "track_engine")
         layout.prop(self, "pin_to_pattern")
         row = layout.row()
         row.enabled = self.pin_to_pattern

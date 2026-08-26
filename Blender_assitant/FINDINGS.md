@@ -2824,3 +2824,80 @@ deleted.
   size approaching camera is matched by a patch half its scale, and only the warp compensates.
 * Reference 1's tail regression is unexplained beyond "short track, little to correct".
 * Two references, one plate, one artist -- still.
+
+### CoTracker as the primary engine between occlusions (2026-08-26)
+
+Asked for directly: *"lets make co tracker as the primary tracking engine for tracking
+between the occlusions and blender as the secondary tracking engine."*
+
+Measured earlier, this looked like a bad idea: CoTracker driving a track alone scored p50
+**13.0 px** at 4K against Blender's 3.4, and 30 % on the occluded reference. What changed is
+the piece built in the previous section -- a matcher that registers the artist's pattern box
+allowing it to warp. With that, the two engines can be asked only the questions they answer
+well:
+
+* **CoTracker picks the neighbourhood.** It never left the feature on a 250-frame continuous
+  run where the Blender loop cut seven frames out. It knows WHICH feature.
+* **The artist's pattern picks the pixel.** CoTracker's prediction is re-anchored to the last
+  confirmed frame -- it accumulates about 0.1 px per frame, so by frame 250 its absolute path
+  is 24 px out while its motion over the last few frames is still good to 2 px -- and the
+  pattern box is then registered at that prediction. That position is what gets recorded.
+
+It stops at the first frame the pattern cannot be found on and never skips forward. That
+frame is an occlusion, and crossing it is the re-acquire's job. Which is exactly the division
+asked for: CoTracker between the occlusions, the re-acquire across them.
+
+| | Blender primary | CoTracker primary |
+|---|---|---|
+| ref 1 (2 occlusions) | 46/47 (98 %), 0 off, 1 gap | **46/47 (98 %), 0 off, 1 gap** |
+| ref 1 precision | p50 3.6, p90 6.5, max 7.7 | p50 3.7, p90 6.9, max 14.1 |
+| ref 2 (250 frames) | 246/250 (98 %), 0 off, 4 gaps | **247/250 (99 %), 0 off, 3 gaps** |
+| ref 2 precision | p50 2.1, p90 4.5, max 8.4 | p50 2.1, p90 5.0, **max 15.4** |
+
+One frame better on the long reference, level on the occluded one, and a worse tail on both.
+Stated plainly, that is a modest win bought with a longer worst case. What the table does not
+show is the thing that may matter more: on reference 2 it ran **232 consecutive frames from a
+single CoTracker pass** with no re-acquire at all, and it is the only path that can work on a
+plate where Blender's tracker does not hold at all.
+
+`span` mattered and was wrong at first. Unlike the re-acquire this is not a VRAM limit -- the
+guide is built in chained 120-frame windows whatever the span -- so 150 merely made the track
+stop at f151 and spend a re-acquire crossing a boundary that was not an occlusion. At 600 the
+same shot needs one re-acquire instead of two.
+
+### The check that looked redundant and was not
+
+The motion (jump) check exists for one failure: a tracker dragged by an occluder while
+frame-to-frame correlation stays happy, so nothing ever fails and the drift is written out as
+data. Under CoTracker-primary every frame has already been scored against the artist's own
+pattern independently, so the check looked redundant -- and it was costing frames, cutting at
+f231 between two frames that were 2.8 px and 3.0 px from the hand track.
+
+Removing it went **247/250 to 231/250, with a frame 28 px OFF the feature.** CoTracker ran two
+frames past the slide while still scoring 0.66, and the re-acquire then correctly refused a
+resume localised from that contaminated patch. A per-frame score says the pattern is present;
+it does not say the track has not stepped onto its neighbour, and the motion check is the only
+thing that does. Kept for both engines.
+
+### Blender as the secondary engine, and what that has to mean
+
+`_start_ctrack` returns False rather than raising when the sidecar is not up, CoTracker is not
+installed, or a track has no pattern box to pin to -- and the run carries on in Blender exactly
+as before. A job that errors mid-flight hands the same tracks back to Blender's tracker from
+wherever they got to. A secondary engine that only works when the primary already does is not
+a fallback.
+
+A track with no pattern box is deliberately NOT sent: CoTracker on its own is 13 px, which is
+not a track. It goes to Blender instead of being tracked badly.
+
+### What this does not settle
+
+* Two references, one plate. Neither is a shot where Blender fails outright, which is the case
+  this mode is most for -- SH013 has not been through it.
+* The worse tail is unexplained. p50 is level and the maximum roughly doubles on both
+  references, which suggests a small number of frames rather than a general loosening.
+* CoTracker is CC-BY-NC. It has been in the loop for re-acquisition all along, but making it
+  the engine of record for delivered tracks is a larger dependency on a non-commercial
+  licence. TAPNext++ (Apache-2.0) is vendored with weights present.
+* The scale watch is skipped under this engine -- it baselines against Blender's per-frame box
+  and CoTracker never sets one -- so a box running away is not caught on this path.

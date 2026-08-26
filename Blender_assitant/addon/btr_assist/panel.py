@@ -130,6 +130,7 @@ class CLIP_PT_btr_main(_Base):
         if p is not None:
             op.verify_pattern = p.verify_pattern
             op.fill_gaps = p.fill_gaps
+            op.track_engine = p.track_engine
             op.pin_to_pattern = p.pin_to_pattern
             op.pin_radius = p.pin_radius
             op.min_match = p.min_match
@@ -207,6 +208,9 @@ class CLIP_PT_btr_opts(_Base):
         row = sub.row()
         row.enabled = p.watch_scale
         row.prop(p, "scale_ratio", text="Box size limit")
+
+        col = layout.column(align=True)
+        col.prop(p, "track_engine", text="Between occlusions")
 
         col = layout.column(heading="Pinning", align=True)
         col.prop(p, "pin_to_pattern", text="Pin every frame to my pattern")
