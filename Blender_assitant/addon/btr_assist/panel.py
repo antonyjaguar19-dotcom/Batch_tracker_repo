@@ -192,6 +192,23 @@ class CLIP_PT_btr_opts(_Base):
         row.enabled = p.watch_scale
         row.prop(p, "scale_ratio", text="Box size limit")
 
+        col = layout.column(heading="New markers", align=True)
+        col.prop(p, "constant_box", text="Same size on screen at any zoom")
+        row = col.row()
+        row.enabled = p.constant_box
+        row.prop(p, "box_screen_px", text="On-screen size")
+        # A live readout, because "it still looks small" and "it is not running" are the same
+        # picture. The three numbers say which: the zoom it is reading, the plate size it
+        # asked for, and what that comes to on screen. If the last one is not what the
+        # setting above says, the reconciler is not reaching this clip.
+        clip = getattr(context.space_data, "clip", None)
+        zoom = getattr(context.space_data, "zoom_percentage", 0.0) or 0.0
+        if clip is not None and zoom > 0:
+            pat = clip.tracking.settings.default_pattern_size
+            col.label(text="now: %d px at %d%% zoom  ->  %d px on screen"
+                           % (pat, round(zoom), round(pat * zoom / 100.0)),
+                      icon="ZOOM_IN")
+
         col = layout.column(heading="When a track dies", align=True)
         col.prop(p, "verify_pattern", text="Must match my pattern")
         row = col.row()

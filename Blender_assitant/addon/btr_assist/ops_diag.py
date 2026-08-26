@@ -40,6 +40,24 @@ def _runs(track, frames):
     return out
 
 
+def _box_state(sd, clip):
+    """What a Ctrl-click would produce right now, and whether anything is keeping it honest."""
+    zoom = float(getattr(sd, "zoom_percentage", 0.0) or 0.0)
+    pat = int(clip.tracking.settings.default_pattern_size)
+    out = {"zoom_percentage": round(zoom, 2),
+           "default_pattern_size_px": pat,
+           "default_search_size_px": int(clip.tracking.settings.default_search_size),
+           "on_screen_px": round(pat * zoom / 100.0, 1) if zoom > 0 else None,
+           "timer_running": None, "remembered": None}
+    try:
+        from . import click_size                                      # noqa: PLC0415
+        out["timer_running"] = bool(bpy.app.timers.is_registered(click_size._apply))
+        out["remembered"] = list(click_size._saved.get(clip.name, ()))
+    except Exception as exc:                                          # noqa: BLE001
+        out["timer_running"] = "unavailable: %s" % exc
+    return out
+
+
 def collect(context, clip):
     w, h = clip.size
     sd = context.space_data
@@ -108,8 +126,12 @@ def collect(context, clip):
                   "frame_current": context.scene.frame_current},
         "settings": {k: getattr(p, k) for k in (
             "fit_search_box", "confirm_resumes", "confirm_only_occluded", "verify_pattern",
-            "min_match", "animate_scale", "watch_scale", "scale_ratio", "force_full_res")
+            "min_match", "animate_scale", "watch_scale", "scale_ratio", "force_full_res",
+            "fill_gaps", "constant_box", "box_screen_px")
             if p is not None and hasattr(p, k)},
+        # "the new-marker box is still tiny" and "the reconciler is not running" look
+        # identical from a screenshot. These four say which.
+        "new_marker_box": _box_state(sd, clip),
         "defaults": {
             "default_motion_model": clip.tracking.settings.default_motion_model,
             "default_pattern_match": clip.tracking.settings.default_pattern_match,
