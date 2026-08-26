@@ -210,6 +210,8 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row = layout.row()
         row.enabled = self.animate_scale and self.watch_scale
         row.prop(self, "scale_ratio")
+        layout.separator()
+        layout.operator("clip.btr_reset_prefs", icon="LOOP_BACK")
         if not self.python_exe:
             box = layout.box()
             box.label(text="Run bootstrap.bat in Blender_assitant to fill these in.",
@@ -226,6 +228,92 @@ def _constant_box_changed(self):
         click_size.stop()
 
 
+
+#: Left alone by the reset. These are facts about THIS MACHINE, not preferences -- putting
+#: them back to a shipped default turns a settings tidy-up into a broken sidecar, and the
+#: artist finds out by running bootstrap again.
+#:
+#: Module-level and not a class attribute: `self.KEEP` inside a bpy Operator does not resolve
+#: to the class attribute the way plain Python would -- bpy_struct's attribute lookup shadows
+#: it -- so the guard silently matched nothing and the reset cleared the paths it was written
+#: to protect. The class attribute was plainly visible from the type the whole time.
+RESET_KEEP = ("assist_root", "python_exe", "port")
+
+
+class CLIP_OT_btr_reset_prefs(bpy.types.Operator):
+    """Put every assist setting back to the value it ships with.
+
+    Worth having because almost every default here is a MEASURED number rather than a taste:
+    `min_match` at 0.66, `pin_radius` at 12, the closure trust at 25 px. Each was fitted
+    against hand tracks, and a session spent nudging them to chase one awkward shot leaves
+    the tool quietly worse on the next one with no record of what moved.
+
+    Deliberately does NOT touch the two path settings. `assist_root` and `python_exe` are
+    facts about this machine, not preferences -- resetting them turns a settings tidy-up into
+    a broken sidecar, and finding that out means running bootstrap again.
+    """
+
+    bl_idname = "clip.btr_reset_prefs"
+    bl_label = "Reset assist settings"
+    bl_description = ("Put every assist setting back to its shipped default. Most of them are "
+                      "measured against hand tracks rather than chosen, so this is the way "
+                      "back after tuning for one awkward shot. Leaves the sidecar paths alone "
+                      "-- those describe this machine, not a preference")
+    # REGISTER only. UNDO on an operator that writes AddonPreferences makes Blender reload
+    # preferences from userpref.blend as part of the undo push, which quietly reverts any
+    # unsaved change -- including the sidecar paths this is careful not to touch. It looked
+    # exactly like the guard failing, and the guard was fine.
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        # `get`, not `prefs.get` -- this class lives IN prefs.py, and the qualified name is a
+        # NameError that surfaces as "poll() failed, context is incorrect", which reads like a
+        # UI problem and is not one.
+        return get(context) is not None
+
+    def execute(self, context):
+        p = get(context)
+        if p is None:
+            self.report({"ERROR"}, "preferences unavailable")
+            return {"CANCELLED"}
+        changed = []
+        for key, prop in p.bl_rna.properties.items():
+            # `bl_*` and `rna_type` are registration metadata, not settings, and writing one
+            # is not a harmless no-op: setting `bl_idname` back to its "default" (empty)
+            # rebinds the AddonPreferences and restores every value from userpref.blend --
+            # including the sidecar paths this is careful to skip. It looked for a long time
+            # like the skip list was broken, and the skip list was correct throughout.
+            if (key in RESET_KEEP or prop.is_readonly
+                    or key.startswith("bl_") or key in ("rna_type", "name")):
+                continue
+            default = getattr(prop, "default", None)
+            if default is None:
+                continue
+            try:
+                now = getattr(p, key)
+            except AttributeError:
+                continue
+            if now == default:
+                continue
+            try:
+                setattr(p, key, default)
+            except (AttributeError, TypeError, ValueError):
+                # A property that refuses its own advertised default is worth knowing about
+                # rather than swallowing, but it must not stop the rest being reset.
+                print("[assist] could not reset %r" % key)
+                continue
+            changed.append("%s %r -> %r" % (key, now, default))
+        for line in changed:
+            print("[assist] reset %s" % line)
+        if not changed:
+            self.report({"INFO"}, "already at the shipped defaults")
+        else:
+            self.report({"INFO"}, "%d setting(s) back to default (see console); sidecar "
+                                  "paths left alone" % len(changed))
+        return {"FINISHED"}
+
+
 def get(context):
     try:
         return context.preferences.addons[__package__].preferences
@@ -233,4 +321,4 @@ def get(context):
         return None
 
 
-CLASSES = (BtrAssistPrefs,)
+CLASSES = (BtrAssistPrefs, CLIP_OT_btr_reset_prefs)

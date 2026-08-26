@@ -252,6 +252,47 @@ def _walk(matcher, guide, vis, anchor_frame, anchor_px, frames, min_match, visib
     return out, ""
 
 
+#: How far a guide-free step may move a marker between adjacent frames, in plate pixels. It
+#: has to cover real inter-frame motion and must not reach a neighbouring feature -- the same
+#: two-sided constraint as the pin, and the same measured answer. On the artist's reference
+#: this is what refuses f232: the best match there scores 0.917 and sits 24.9 px away.
+LOCAL_RADIUS_PX = 12.0
+
+
+def _walk_local(matcher, anchor_frame, anchor_px, frames, radius, min_match,
+                vis=None):
+    """Step frame by frame with a PREVIOUS-FRAME prior and no guide at all.
+
+    The guide walks answer "where does CoTracker think this went". This answers the simpler
+    question a tracker asks: it was here last frame, is it near here now. It exists because
+    the guide's prediction can be too far off to pass the snap gate on exactly the frames
+    worth having -- measured on the artist's reference the bridge stopped one frame short of
+    f233, where the seed patch scores 0.938 at their own hand-tracked position. The guide was
+    wrong; the feature was plainly there.
+
+    No drift, because the template is always the artist's seed patch and never the previous
+    frame's pixels. What moves is only where the search starts.
+
+    Stops at the first frame that fails, and the move cap is what makes that safe: on f232 of
+    the same reference -- genuinely occluded -- this finds something scoring 0.917 that sits
+    24.9 px away. The score alone would have taken it.
+    """
+    out, cur = [], (float(anchor_px[0]), float(anchor_px[1]))
+    for f in frames:
+        if vis is not None and not vis.get(f, False):
+            break
+        got = matcher(f, cur[0], cur[1], radius)
+        if got is None:
+            break
+        moved = math.hypot(got[0] - cur[0], got[1] - cur[1])
+        if got[2] < min_match or moved > radius:
+            break
+        out.append({"frame": f, "x": float(got[0]), "y": float(got[1]),
+                    "score": float(got[2]), "snap": float(moved)})
+        cur = (float(got[0]), float(got[1]))
+    return out
+
+
 def fill_gap(matcher, guide, vis, closure, anchor_frame, anchor_px, resume_frame,
              resume_px=None, back_guide=None, back_vis=None,
              min_match=0.60, trust_px=TRUST_P90_PX, visible_gate=True):
@@ -336,9 +377,59 @@ def fill_gap(matcher, guide, vis, closure, anchor_frame, anchor_px, resume_frame
         if why:
             notes.append("%s: %s" % (tag, why))
 
+    # ---- finish from both ends, without the guide -------------------------------------
+    # A re-acquire that only tracks FORWARD leaves the frames just before it empty even when
+    # the feature is plainly visible on them. The guide walks above are meant to be that, but
+    # they can only reach as far as the guide is right. Where one stopped early, step in from
+    # that end with a previous-frame prior instead.
+    #
+    # Measured on the artist's reference: recovers f233 at 0.71 and 3.3 px from their hand
+    # track, which the guide walk refused because its own prediction there was 11.6 px out.
+    # It stops at f232, correctly -- that frame is occluded and the thing it finds scores
+    # 0.917 twenty-five pixels away.
+    for tag, end_f, end_px, order in (
+            ("forward from the cut", anchor_frame, anchor_px, span),
+            ("back from the resume", resume_frame, resume_px, list(reversed(span)))):
+        if end_px is None:
+            continue
+        # Start from the last frame this END has actually reached -- the end itself if the
+        # guide walk got nowhere, otherwise the furthest CONTIGUOUS frame it accepted. Every
+        # such frame passed the same gates, so the walk is still anchored on something
+        # verified; the point of the rule is only that it must never begin part-way into a
+        # gap on a frame nothing has ruled on, which is how a walk marches into an occluder
+        # with a confident-looking score at every step.
+        #
+        # Requiring the END itself was too strict and cost the frame this exists for: on the
+        # artist's reference the guide walk accepted f235 and f234 and stopped, so the local
+        # walk's first target was f233 -- not the end -- and it refused to run at all.
+        seat_f, seat_px = end_f, end_px
+        idx = 0
+        while idx < len(order) and order[idx] in got:
+            seat_f = order[idx]
+            seat_px = (got[seat_f]["x"], got[seat_f]["y"])
+            idx += 1
+        todo = [f for f in order[idx:] if f not in got]
+        if not todo:
+            continue
+        seat = _anchor_on(matcher, seat_f, seat_px)
+        if seat is None:
+            continue
+        end_f = seat_f
+        run = _walk_local(matcher, seat_f, seat, todo, LOCAL_RADIUS_PX, min_match,
+                          vis=v if visible_gate else None)
+        for r in run:
+            got.setdefault(r["frame"], r)
+        if run:
+            notes.append("%s: %d more frame(s) stepped in without the guide"
+                         % (tag, len(run)))
+
     filled = [got[f] for f in sorted(got)]
     if not filled:
         return [], "; ".join(notes) or "nothing to fill"
+    # The notes survive a full fill. Reporting only "filled every frame" would hide that the
+    # guide was refused and the frames came from the step-in instead, which is the difference
+    # between a gap CoTracker crossed and one the artist's pattern crossed on its own.
+    done = "filled every frame in the gap"
     if len(filled) == len(span):
-        return filled, "filled every frame in the gap"
+        return filled, ("%s (%s)" % (done, "; ".join(notes))) if notes else done
     return filled, "; ".join(notes)

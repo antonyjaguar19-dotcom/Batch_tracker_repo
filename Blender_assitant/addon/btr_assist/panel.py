@@ -209,6 +209,10 @@ class CLIP_PT_btr_opts(_Base):
         row.enabled = p.watch_scale
         row.prop(p, "scale_ratio", text="Box size limit")
 
+        row = layout.row()
+        row.alignment = "RIGHT"
+        row.operator("clip.btr_reset_prefs", text="Reset to defaults", icon="LOOP_BACK")
+
         col = layout.column(align=True)
         col.prop(p, "track_engine", text="Between occlusions")
 

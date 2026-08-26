@@ -1171,7 +1171,9 @@ def job_reacquire(payload):
                     lpatch, loffset = loc_ref[rr["id"]]
 
                     def _m(ff, mx, my, rad, _p=lpatch, _o=loffset):
-                        return patmatch.match(plate, ff, _p, mx, my, radius=rad, offset=_o)
+                        # PINNED, not rigid. A rigid score is what fails on a feature that
+                        # has changed shape, which is the case a gap fill is reaching for.
+                        return patmatch.pinned(plate, ff, _p, mx, my, radius=rad, offset=_o)
 
                     try:
                         fill, note = leash.fill_gap(

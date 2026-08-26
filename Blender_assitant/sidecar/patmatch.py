@@ -221,6 +221,22 @@ def warp_match_in(img, patch, cx, cy, offset=(0.0, 0.0), motion=None, init=None)
     return float(x), float(y), float(cc), warp
 
 
+def pinned(plate, frame, patch, cx, cy, radius=3.0, offset=(0.0, 0.0), motion=None):
+    """`match_pinned` against a frame number rather than a decoded image.
+
+    The frame-major callers decode once and share; the ones that ask about a single frame
+    want this. It exists because the gap fill was handed `match` -- the RIGID matcher -- and
+    a rigid score is exactly what fails on a feature that has changed shape, which is the
+    case the fill is reaching for. Measured on the artist's reference: at f233 the rigid
+    score at their own hand-tracked position is 0.212 and the pinned one is 0.938, so the
+    walk stopped one frame short of a frame that was plainly there.
+    """
+    img = _gray(plate.frame(int(frame) - 1))
+    if img is None:
+        return None
+    return match_pinned(img, patch, cx, cy, radius=radius, offset=offset, motion=motion)
+
+
 def match_pinned(img, patch, cx, cy, radius=3.0, offset=(0.0, 0.0), motion=None):
     """The best the artist's pattern can do here, rigid OR warped -- position and score.
 
@@ -236,16 +252,30 @@ def match_pinned(img, patch, cx, cy, radius=3.0, offset=(0.0, 0.0), motion=None)
     Returns (x, y, score, warp_or_None) or None.
     """
     rigid = match_in(img, patch, cx, cy, radius=radius, offset=offset)
-    warped = warp_match_in(img, patch,
-                           cx if rigid is None else rigid[0],
-                           cy if rigid is None else rigid[1],
-                           offset=offset, motion=motion)
-    if rigid is None and warped is None:
+
+    # ECC is a local optimiser, so WHERE IT STARTS decides which answer it finds. Starting it
+    # only at the rigid peak makes it inherit the rigid pass's mistakes -- and the rigid pass
+    # is exactly what fails when the feature has changed shape, which is the case this
+    # function exists for. Measured on the artist's reference at f233: the rigid peak sits
+    # 11.6 px from the feature and refining from it converges to 0.546, while the same patch
+    # at the position the caller predicted scores 0.938. One start point, one wrong answer.
+    #
+    # So both are tried: the rigid peak, and the prediction handed in. Two extra correlations
+    # on a 41x41 patch, against a frame that would otherwise be dropped.
+    starts = [(cx, cy)]
+    if rigid is not None and math.hypot(rigid[0] - cx, rigid[1] - cy) > 0.5:
+        starts.append((rigid[0], rigid[1]))
+    best = None
+    for sx, sy in starts:
+        got = warp_match_in(img, patch, sx, sy, offset=offset, motion=motion)
+        if got is not None and (best is None or got[2] > best[2]):
+            best = got
+    if rigid is None and best is None:
         return None
-    if warped is None:
+    if best is None:
         return rigid[0], rigid[1], rigid[2], None
-    if rigid is None or warped[2] > rigid[2]:
-        return warped[0], warped[1], warped[2], warped[3]
+    if rigid is None or best[2] > rigid[2]:
+        return best[0], best[1], best[2], best[3]
     return rigid[0], rigid[1], rigid[2], None
 
 

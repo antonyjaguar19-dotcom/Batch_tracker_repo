@@ -80,10 +80,22 @@ def main():
     check("never plants ON the resume frame", 15 in [x["frame"] for x in filled], False)
     check("never plants on the anchor", 10 in [x["frame"] for x in filled], False)
 
+    # An untrustworthy guide no longer means an empty gap, and that is deliberate. The guide
+    # WALKS are refused -- closure gates those -- but a step-in from a verified end uses the
+    # artist's pattern and a previous-frame prior, and never consults the guide at all, so
+    # closure has nothing to say about it. What holds it back instead is the pattern score
+    # and the per-frame move cap. Measured on the artist's two references: it recovers f233
+    # at 0.71 and 3.3 px from their hand track, and on the reference with two REAL occlusions
+    # it fires on nothing, because the first frame past each cut genuinely does not match.
     filled, why = leash.fill_gap(snapper(0.5), g, vis, {f: 90.0 for f in g},
                                  10, (500.0, 300.0), 15)
-    check("an untrustworthy guide fills nothing", filled, [])
-    check("  and says why", "closure" in why, True)
+    check("an untrustworthy guide refuses the GUIDE walk", "closure" in why, True)
+    check("  but a pattern that matches is still stepped in from the end",
+          [x["frame"] for x in filled], [11, 12, 13, 14])
+
+    dead = lambda f, x, y, r: (x + 0.5, y, 0.1)
+    filled, why = leash.fill_gap(dead, g, vis, {f: 90.0 for f in g}, 10, (500.0, 300.0), 15)
+    check("an untrustworthy guide AND no pattern match fills nothing", filled, [])
 
     filled, why = leash.fill_gap(snapper(30.0), g, vis, ok_clo, 10, (500.0, 300.0), 15)
     check("a peak far from the prediction fills nothing", filled, [])
@@ -130,10 +142,20 @@ def main():
     check("  and the frame BOTH ends refused stays empty",
           13 in [x["frame"] for x in filled], False)
 
-    filled, why = leash.fill_gap(snapper(0.5), g, vis, {f: 90.0 for f in g},
+    filled, why = leash.fill_gap(dead, g, vis, {f: 90.0 for f in g},
                                  10, (500.0, 300.0), 15, resume_px=(540.0, 300.0))
-    check("an untrustworthy guide fills nothing from either end", filled, [])
-    check("  and names both ends", why.count("closure"), 2)
+    check("neither end fills when nothing matches", filled, [])
+    check("  and both ends are named", why.count("closure"), 2)
+
+    # The step-in must stop where the pattern stops, from whichever end reached it. A frame
+    # that fails is an occlusion, and carrying on past it is the one thing this must not do.
+    holed2 = lambda f, x, y, r: (x + 0.5, y, 0.1 if f in (13, 14) else 0.9)
+    filled, _ = leash.fill_gap(holed2, g, vis, {f: 90.0 for f in g},
+                               10, (500.0, 300.0), 18, resume_px=(580.0, 300.0))
+    got_f = [x["frame"] for x in filled]
+    check("stops at the hole from the cut end", [f for f in got_f if f < 13], [11, 12])
+    check("  and from the resume end", [f for f in got_f if f > 14], [15, 16, 17])
+    check("  leaving the hole itself empty", [f for f in got_f if f in (13, 14)], [])
 
     filled, _ = leash.fill_gap(snapper(0.5), g, vis, ok_clo, 10, (500.0, 300.0), 15,
                                resume_px=None)
