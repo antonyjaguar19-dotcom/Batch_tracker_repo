@@ -2741,3 +2741,86 @@ The first metric this project has that is not fitted to SH006.
   truck from one that slid onto a lookalike -- both are things to look at, but they are not
   the same problem.
 * Nothing is wired to the addon yet. This is the measured core only.
+
+### Perspective is not drift, and a track has to be pinned to something (2026-08-26)
+
+Reported: *"as the tracks perspective change the QC checker is confusing it with the track
+drift and delete the tracks in those areas ... track should be pinned to the pattern no
+matter the perspective shift of the pattern."*
+
+Both halves are the same missing piece, and it invalidates the premise of every threshold
+tuned here this month.
+
+### The matcher was failing, not the track
+
+`match_in` slides a RIGID patch and takes the best correlation. That assumes the feature
+still looks like the day it was seeded, which stops being true the moment the camera moves
+round it or towards it. Scored at positions the artist tracked BY HAND -- correct by
+construction, so a low score can only be the matcher:
+
+| frame | plain NCC | ECC affine |
+|---|---|---|
+| f216 | 0.651 | **0.873** |
+| f230 | 0.535 | **0.825** |
+| f231 | **0.082** | -- |
+| f250 | 0.690 | **0.851** |
+| worst of 27 sampled | **0.535** | **0.807** |
+
+Plain correlation drops under 0.60 at correct positions. Allowing an affine warp it never
+does. The four-frame dip that forced `settle = 5` was never in the footage.
+
+`hold_check` now scores with `match_pinned`, which takes the better of rigid and warped
+rather than always warping: an affine has four more degrees of freedom, and where the rigid
+score was already above 0.95 the warped one sat 0.01-0.09 BELOW it, spending them on noise.
+A rigid match is an affine with those parameters pinned at zero, so taking the better of the
+two is choosing the best fit within one family, not averaging two opinions.
+
+The PROBE stays rigid deliberately. It asks "is there a better answer a short way off", and
+letting it warp too would let it find a good affine fit to some other piece of the plate and
+report a gain that is about the model's freedom rather than about a better feature.
+
+Effect on reference 2: **four cuts became one.** The cuts at f211 and f266 were perspective.
+
+### And removing bad cuts made the drift worse, which is the finding
+
+With one cut instead of four, the track ran f96-f250 with no re-acquire at all -- and drifted
+to **8.8 px**, median 4.9. Right feature, wrong sub-position. Every re-anchor that used to
+reset that had been a cut firing for the wrong reason. **The drift was never being fixed,
+only interrupted.**
+
+Blender matches each frame against the one BEFORE it. That is what gives it sub-pixel
+precision and it is also why an error survives forward with nothing to pull it back. So the
+anchor becomes the one thing that does not move: the pattern box the artist drew. Every frame
+is registered against THAT, allowing it to warp.
+
+| | reference 2 (250 frames) | reference 1 (47 frames) |
+|---|---|---|
+| on the feature | 246 (98 %) | 46 (98 %) |
+| off the feature | **0** | **0** |
+| p50 before / after | 4.9 -> **2.1 px** | 4.7 -> **3.6 px** |
+| p90 before / after | 7.1 -> **4.5 px** | 5.6 -> 6.5 px |
+| constant offset | 2.3 -> **0.3 px** | 2.7 -> 3.4 px |
+
+Reference 2's constant offset is now essentially zero: the marker sits where the artist
+clicked. That is the number "rock pinned" means.
+
+Stated plainly: on the 47-frame reference the median improves and the TAIL gets worse. There
+is little accumulated drift to take out of a short track, and a couple of pixels on a handful
+of frames moves p90 a long way at that length. The long track is where this pays.
+
+`pin_radius` was measured, not chosen: 8 px leaves p90 at 7.1, 12 px brings it to 4.5, and
+neither puts a single frame off the feature. Dropping `min_match` from 0.60 to 0.45 pinned one
+extra frame out of 250 and changed no other number, so the gate stays where it is.
+
+Positions only. Nothing is deleted, muted or added, and a frame whose pattern cannot be found
+is left exactly where it was -- a pass that removes work is not a pin. It runs last in the
+loop, after the resume frames are settled, so it never registers a marker that is about to be
+deleted.
+
+### What this does not settle
+
+* Affine, not homography. A pattern seen at a hard angle needs eight parameters, not six.
+* The pin registers against the seed patch at its ORIGINAL size. A feature that doubles in
+  size approaching camera is matched by a patch half its scale, and only the warp compensates.
+* Reference 1's tail regression is unexplained beyond "short track, little to correct".
+* Two references, one plate, one artist -- still.

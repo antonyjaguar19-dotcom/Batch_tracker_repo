@@ -150,6 +150,122 @@ def match_in(img, patch, cx, cy, radius=32.0, offset=(0.0, 0.0)):
     return float(x), float(y), float(score[py, px])
 
 
+# ---------------------------------------------------------------- pinning through a warp
+
+#: ECC iterations and convergence. 60/1e-4 converges on a 41x41 patch in well under a
+#: millisecond; the numbers are a cost ceiling, not a tuned quantity.
+ECC_ITERS = 60
+ECC_EPS = 1e-4
+
+#: A patch with no contrast has no gradient for ECC to descend, and it fails noisily rather
+#: than returning a bad answer. Below this it is not worth asking.
+ECC_MIN_STD = 1.0
+
+
+def warp_match_in(img, patch, cx, cy, offset=(0.0, 0.0), motion=None, init=None):
+    """Align the artist's patch to this frame ALLOWING IT TO WARP, and score the fit.
+
+    `match_in` slides a rigid patch and takes the best correlation. That assumes the feature
+    still looks like the day it was seeded -- and it stops being true the moment the camera
+    moves round it or towards it. Measured on the artist's own 250-frame hand track, where
+    every frame is correct by construction and any low score is therefore the MATCHER
+    failing rather than the track:
+
+        frame   plain NCC   ECC affine
+        f216      0.651       0.873
+        f230      0.535       0.825
+        f231      0.082         --
+        f250      0.690       0.851
+        worst     0.535       0.807   (over 27 sampled frames)
+
+    Plain correlation falls under 0.60 at positions the artist tracked by hand. Allowing an
+    affine warp, it never does. Every cut threshold in this addon was fitted against the
+    first column, which is why a feature turning towards the camera reads as drift -- and why
+    `first_loss` needed a five-frame settle to survive a four-frame dip that was never in the
+    footage at all.
+
+    Returns (x, y, score, warp) -- the patch centre corrected by the warp's translation, the
+    enhanced correlation coefficient, and the 2x3 affine -- or None.
+    """
+    import cv2                                                        # noqa: PLC0415
+    if img is None:
+        return None
+    mode = cv2.MOTION_AFFINE if motion is None else motion
+    ph, pw = patch.shape[:2]
+    P = np.ascontiguousarray(patch, dtype=np.float32)
+    if float(P.std()) < ECC_MIN_STD:
+        return None
+    ih, iw = img.shape
+    ccx, ccy = cx + offset[0], cy + offset[1]
+    x0 = int(round(ccx - pw / 2.0))
+    y0 = int(round(ccy - ph / 2.0))
+    if x0 < 0 or y0 < 0 or x0 + pw > iw or y0 + ph > ih:
+        return None
+    W = np.ascontiguousarray(img[y0:y0 + ph, x0:x0 + pw], dtype=np.float32)
+    warp = np.eye(2, 3, dtype=np.float32) if init is None else init.astype(np.float32).copy()
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ECC_ITERS, ECC_EPS)
+    try:
+        cc, warp = cv2.findTransformECC(P, W, warp, mode, crit, None, 5)
+    except cv2.error:
+        # Non-convergence is normal on a covered or featureless frame and is not an error --
+        # the caller reads "no warped answer" and falls back to the rigid one.
+        return None
+    if not np.isfinite(cc) or not np.isfinite(warp).all():
+        return None
+    # ECC maps the TEMPLATE into the window, so the patch centre lands at the warp applied to
+    # the patch's own centre. That displacement is the sub-pixel correction.
+    pc = np.array([pw / 2.0, ph / 2.0, 1.0], dtype=np.float64)
+    wc = warp.astype(np.float64) @ pc
+    x = x0 + float(wc[0]) - offset[0]
+    y = y0 + float(wc[1]) - offset[1]
+    return float(x), float(y), float(cc), warp
+
+
+def match_pinned(img, patch, cx, cy, radius=3.0, offset=(0.0, 0.0), motion=None):
+    """The best the artist's pattern can do here, rigid OR warped -- position and score.
+
+    Takes whichever fits better rather than always warping. An affine has four more degrees
+    of freedom than a translation, and on a frame where nothing has changed those spend
+    themselves on noise: over the same 27 frames the warped score sat 0.01-0.09 BELOW the
+    rigid one wherever the rigid one was already above 0.95. It only wins where the feature
+    has genuinely changed shape, and there it wins by 0.16-0.29.
+
+    A rigid match is an affine with the extra parameters pinned at zero, so taking the better
+    of the two is choosing the best fit within the family, not averaging two opinions.
+
+    Returns (x, y, score, warp_or_None) or None.
+    """
+    rigid = match_in(img, patch, cx, cy, radius=radius, offset=offset)
+    warped = warp_match_in(img, patch,
+                           cx if rigid is None else rigid[0],
+                           cy if rigid is None else rigid[1],
+                           offset=offset, motion=motion)
+    if rigid is None and warped is None:
+        return None
+    if warped is None:
+        return rigid[0], rigid[1], rigid[2], None
+    if rigid is None or warped[2] > rigid[2]:
+        return warped[0], warped[1], warped[2], warped[3]
+    return rigid[0], rigid[1], rigid[2], None
+
+
+def warp_shape(warp):
+    """How much the patch had to change shape, as (scale, non-uniformity).
+
+    `scale` is the area ratio the warp applies and `skew` is how far the two axes were scaled
+    differently -- which is what perspective does to a pattern and pure distance does not.
+    Reported so a cut can say "this feature turned" rather than only "the score fell".
+    """
+    if warp is None:
+        return 1.0, 0.0
+    a = np.asarray(warp, dtype=np.float64)[:, :2]
+    sx = float(math.hypot(a[0, 0], a[1, 0]))
+    sy = float(math.hypot(a[0, 1], a[1, 1]))
+    area = abs(float(np.linalg.det(a)))
+    skew = abs(sx - sy) / max(1e-6, 0.5 * (sx + sy))
+    return math.sqrt(max(0.0, area)), skew
+
+
 def best_candidate(plate, patch, offset, candidates, radius=32.0):
     """Score every candidate resume and return the best.
 
@@ -394,7 +510,13 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
         if img is None:
             out.append((int(f), None, None))
             continue
-        got = match_in(img, patch, float(x), float(y), radius=radius, offset=offset)
+        # Pinned, not rigid. This is the score every cut in the addon is decided on, and a
+        # rigid patch reads a feature turning towards the camera as a feature being lost --
+        # the artist's report that "the QC checker confuses perspective change with drift and
+        # deletes the tracks in those areas". On their own hand track the rigid score falls
+        # to 0.535 and 0.082 at positions they tracked by hand; allowing the pattern to warp,
+        # the worst of the same frames is 0.807.
+        got = match_pinned(img, patch, float(x), float(y), radius=radius, offset=offset)
         _b, _s, mg = peak_margin(img, patch, float(x), float(y), offset=offset,
                                  radius=margin_radius)
         gain = dist = None
@@ -406,10 +528,16 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
             # track's last frame: the drifted one scores 0.501 where 0.979 sits 23 px away,
             # while the artist's hand track scores 0.731 with only 0.786 available -- a gain
             # of 0.478 against 0.055.
+            # The probe stays RIGID on purpose. It asks "is there a better answer a short
+            # way off", and letting it warp too would let it find a good affine fit to some
+            # other piece of the plate and report a gain that is about the model's freedom
+            # rather than about a better feature. The comparison has to be like for like, so
+            # the gain is measured against the rigid score at the claimed position.
+            here = match_in(img, patch, float(x), float(y), radius=radius, offset=offset)
             near = match_in(img, patch, float(x), float(y), radius=probe_radius,
                             offset=offset)
-            if near is not None:
-                gain = float(near[2]) - float(got[2])
+            if near is not None and here is not None:
+                gain = float(near[2]) - float(here[2])
                 dist = math.hypot(near[0] - float(x), near[1] - float(y))
         out.append((int(f), None if got is None else float(got[2]), mg, gain, dist))
     return out

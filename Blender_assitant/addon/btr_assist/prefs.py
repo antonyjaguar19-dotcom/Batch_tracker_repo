@@ -64,6 +64,19 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
     # artist makes once per plate, not per run, and a modal operator has no redo panel to
     # adjust them in. The operator still owns the properties -- the panel copies these into
     # it -- so scripting the operator directly is unaffected.
+    pin_to_pattern: BoolProperty(
+        name="Pin every frame to my pattern", default=True,
+        description="When a run finishes, register every frame against the pattern box you "
+                    "drew instead of leaving it answerable to the previous frame. Blender "
+                    "tracks against the frame before, so error accumulates with nothing to "
+                    "pull it back -- on a 250-frame reference it reached 8.8 px. Pinning took "
+                    "the median from 4.9 px to 2.1 and the constant offset from 0.8 px to "
+                    "0.3, with nothing moved off its feature. Positions only")
+    pin_radius: FloatProperty(
+        name="Pin may move a marker by", default=12.0, min=2.0, max=48.0, subtype="PIXEL",
+        description="Plate pixels, per frame. Has to cover accumulated drift without being "
+                    "able to reach a neighbouring feature. Measured: 8 px leaves p90 at "
+                    "7.1 px, 12 px brings it to 4.5, neither puts a frame off the feature")
     constant_box: BoolProperty(
         name="New markers keep their on-screen size", default=True,
         description="Blender sizes a new track in PLATE pixels, so the same setting that "
@@ -157,6 +170,10 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "pin_to_pattern")
+        row = layout.row()
+        row.enabled = self.pin_to_pattern
+        row.prop(self, "pin_radius")
         layout.prop(self, "constant_box")
         row = layout.row()
         row.enabled = self.constant_box

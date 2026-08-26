@@ -199,3 +199,17 @@ def start_report(assist_root, clip_info, tracks, params=None):
     return _request(info, "/jobs/report",
                     {"clip": clip_info, "tracks": tracks, "params": params or {}},
                     timeout=60.0)
+
+
+def start_pin(assist_root, clip_info, requests, params=None):
+    """Register every frame of each track against the artist's own pattern box.
+
+    Positions only -- the sidecar never proposes deleting a frame, so a pin can be applied
+    without reviewing it.
+    """
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/pin",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)

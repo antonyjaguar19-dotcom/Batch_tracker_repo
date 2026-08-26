@@ -82,6 +82,11 @@ def main():
                          "4K frames disagrees by a few")
     ap.add_argument("--track", default="",
                     help="which track in the manual file (default: the first)")
+    ap.add_argument("--no-pin", action="store_true",
+                    help="skip registering each frame against the artist's pattern -- the "
+                         "behaviour before the pin pass existed")
+    ap.add_argument("--pin-radius", type=float, default=8.0)
+    ap.add_argument("--pin-min-match", type=float, default=0.60)
     ap.add_argument("--no-fill", action="store_true",
                     help="do not bridge the gap between a cut and its resume -- the "
                          "behaviour before the leash existed")
@@ -252,6 +257,36 @@ def main():
             % (rnd, rr["frame"], rr.get("match_score")))
     else:
         log("ran out of rounds (%d)" % a.rounds)
+
+    # ---- pin every frame onto the artist's own pattern -------------------------------
+    # Mirrors what the addon does at the end of a run. Without it the eval scores a loop the
+    # artist does not have, and this is the step that decides whether "rock pinned" is true.
+    if not a.no_pin:
+        path_now = []
+        for f in live_frames(tr):
+            mm = tr.markers.find_frame(f, exact=True)
+            if mm is None:
+                continue
+            px, py = marker_to_image_px(mm, w, h)
+            path_now.append([int(f), float(px), float(py)])
+        if path_now:
+            st = wait(client.start_pin(ASSIST, ci,
+                                       [{"id": "EV", "pattern": pattern, "path": path_now}],
+                                       {"pin_radius": a.pin_radius,
+                                        "min_match": a.pin_min_match})["id"])
+            if st["state"] == "done":
+                res = st["result"]
+                got = res["moved"].get("EV") or []
+                for mv in got:
+                    mm = tr.markers.find_frame(int(mv["frame"]), exact=True)
+                    if mm is not None:
+                        mm.co = image_px_to_uv(float(mv["x"]), float(mv["y"]), w, h)
+                sm = (res["summary"] or {}).get("EV") or {}
+                log("pinned %d frame(s), left %d, median move %.2f px, max %.2f"
+                    % (sm.get("pinned", 0), sm.get("left", 0),
+                       sm.get("median_move_px", 0.0), sm.get("max_move_px", 0.0)))
+            else:
+                log("pin failed: %s" % st.get("error"))
 
     ours = {}
     for f in live_frames(tr):

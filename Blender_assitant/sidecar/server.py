@@ -345,6 +345,121 @@ def job_patcheck(payload):
     return fn
 
 
+def job_pin(payload):
+    """Move every marker onto the artist's own pattern, frame by frame.
+
+    Blender tracks against the PREVIOUS frame, which is what gives it sub-pixel precision and
+    also what lets a small error survive into the next frame and the next. Nothing pulls it
+    back. Measured on the artist's 250-frame reference: with the false cuts removed the track
+    ran f96-f250 without a single re-acquire and drifted to 8.8 px by the end -- correct
+    feature, wrong sub-position, and every re-anchor that used to reset it had been a cut
+    firing for the wrong reason.
+
+    So the anchor becomes the thing that never moves: the pattern box the artist drew. Each
+    frame is registered against THAT, allowing it to warp, so the position is answerable to
+    the seed rather than to the previous frame.
+
+    Positions only. No marker is deleted, muted or added, and a frame the pattern cannot be
+    found on is left exactly where it was -- a pass that removes work is not a pin.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        path = clip.get("path", "")
+        if not os.path.exists(path):
+            raise FileNotFoundError("plate not found: %s" % path)
+        if not reqs:
+            raise ValueError("no tracks to pin")
+
+        out_dir = os.path.join(ASSIST, "logs", "pin", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        min_match = float(params.get("min_match", 0.60))
+        # How far a pin may move a marker. It has to cover accumulated drift -- 8.8 px on the
+        # reference -- without being able to step onto a neighbouring feature, which on this
+        # plate is the failure the whole hold check exists to catch. Frames are corrected in
+        # order and each starts from the position it already has, so the budget is per frame
+        # and not per shot.
+        radius = float(params.get("pin_radius", 8.0))
+
+        # Frame-major: one decode, every track that wants that frame. Per-track decoding
+        # re-read the same 4K frame once per track, which is what made the reappearance sweep
+        # slow enough to notice before it was turned round the same way.
+        refs, want = {}, {}
+        for r in reqs:
+            pat = r.get("pattern") or {}
+            if not pat:
+                continue
+            ref = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
+                                           float(pat["cx"]), float(pat["cy"]),
+                                           float(pat["w"]), float(pat["h"]))
+            if ref is None:
+                continue
+            refs[r["id"]] = ref
+            for f, x, y in r.get("path") or []:
+                want.setdefault(int(f), []).append((r["id"], float(x), float(y)))
+
+        moved = {rid: [] for rid in refs}
+        stats = {rid: {"pinned": 0, "left": 0, "moved_px": []} for rid in refs}
+        for f in sorted(want):
+            if job.cancel.is_set():
+                break
+            img = patmatch._gray(plate.frame(f - 1))
+            if img is None:
+                for rid, _x, _y in want[f]:
+                    stats[rid]["left"] += 1
+                continue
+            for rid, x, y in want[f]:
+                patch, offset = refs[rid]
+                got = patmatch.match_pinned(img, patch, x, y, radius=radius, offset=offset)
+                if got is None or got[2] < min_match:
+                    stats[rid]["left"] += 1
+                    continue
+                nx, ny = float(got[0]), float(got[1])
+                d = math.hypot(nx - x, ny - y)
+                if d > radius:
+                    # The best fit is further off than a pin is allowed to reach. That is not
+                    # a sub-position correction, it is a different feature, and the hold check
+                    # is what rules on those.
+                    stats[rid]["left"] += 1
+                    continue
+                scale, skew = patmatch.warp_shape(got[3])
+                moved[rid].append({"frame": f, "x": nx, "y": ny,
+                                   "score": round(float(got[2]), 4),
+                                   "moved_px": round(d, 3),
+                                   "warped": got[3] is not None,
+                                   "scale": round(scale, 3), "skew": round(skew, 3)})
+                stats[rid]["pinned"] += 1
+                stats[rid]["moved_px"].append(d)
+
+        summary = {}
+        for rid, st in stats.items():
+            mv = sorted(st["moved_px"])
+            summary[rid] = {
+                "pinned": st["pinned"], "left": st["left"],
+                "median_move_px": round(mv[len(mv) // 2], 2) if mv else 0.0,
+                "max_move_px": round(mv[-1], 2) if mv else 0.0}
+            job.say("%s: pinned %d frame(s), left %d, median move %.2f px"
+                    % (rid, st["pinned"], st["left"], summary[rid]["median_move_px"]))
+        return {"moved": moved, "summary": summary, "pin_radius": radius,
+                "min_match": min_match, "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_report(payload):
     """Will these tracks solve? Pure track geometry -- no plate is read and no model loaded.
 
@@ -1006,7 +1121,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
-                         "/jobs/hold", "/jobs/leash", "/jobs/report"):
+                         "/jobs/hold", "/jobs/leash", "/jobs/report",
+                         "/jobs/pin"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1019,7 +1135,7 @@ class Handler(BaseHTTPRequestHandler):
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
                           "patcheck": job_patcheck, "motion": job_motion,
                           "hold": job_hold, "leash": job_leash,
-                          "report": job_report}[kind](payload))
+                          "report": job_report, "pin": job_pin}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

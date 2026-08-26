@@ -130,6 +130,8 @@ class CLIP_PT_btr_main(_Base):
         if p is not None:
             op.verify_pattern = p.verify_pattern
             op.fill_gaps = p.fill_gaps
+            op.pin_to_pattern = p.pin_to_pattern
+            op.pin_radius = p.pin_radius
             op.min_match = p.min_match
             op.confirm_resumes = p.confirm_resumes
             op.fit_search_box = p.fit_search_box
@@ -206,6 +208,12 @@ class CLIP_PT_btr_opts(_Base):
         row.enabled = p.watch_scale
         row.prop(p, "scale_ratio", text="Box size limit")
 
+        col = layout.column(heading="Pinning", align=True)
+        col.prop(p, "pin_to_pattern", text="Pin every frame to my pattern")
+        row = col.row()
+        row.enabled = p.pin_to_pattern
+        row.prop(p, "pin_radius", text="May move by")
+
         col = layout.column(heading="New markers", align=True)
         col.prop(p, "constant_box", text="Same size on screen at any zoom")
         row = col.row()
@@ -250,6 +258,9 @@ class CLIP_PT_btr_3de(_Base):
         # The QC an artist actually asks about a finished track: is it still on the thing
         # they picked? Lives here rather than in Options because it is a thing you DO.
         layout.operator("clip.btr_qc_ends", text="Check ends on my pattern", icon="CHECKMARK")
+        # Works on any track, including ones tracked by hand or imported -- the pin does not
+        # care how a track was made, only that its first frame is where the artist framed it.
+        layout.operator("clip.btr_pin", text="Pin to my pattern", icon="PINNED")
         layout.label(text="Gaps are kept in both directions.")
 
 
