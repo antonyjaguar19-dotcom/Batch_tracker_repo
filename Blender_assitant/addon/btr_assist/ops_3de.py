@@ -12,7 +12,7 @@ import bpy
 from bpy.props import BoolProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
-from . import three_de
+from . import click_size, three_de, track_core
 
 
 def _clip(context):
@@ -110,6 +110,14 @@ class CLIP_OT_btr_import_3de(bpy.types.Operator, ImportHelper):
             # a second one on top of it.
             u, v = three_de.px_to_uv(x0, y0, w, h)
             tr.markers[0].co = (u, v)
+            # Pin the box to the size the ARTIST set, not to whatever the new-marker default
+            # currently holds. `click_size` keeps that default in step with the viewport zoom
+            # so a Ctrl-clicked marker is always the same size on screen -- which is right for
+            # a marker being placed by eye and wrong for a file being read off disk, where it
+            # would make an imported track's box depend on how zoomed in someone happened to
+            # be. The QC pass correlates using this box.
+            pat_px, sea_px = click_size.artist_default(clip)
+            track_core.set_geom(tr.markers[0], float(pat_px), float(sea_px), w, h)
             for fr, x, y in pts[1:]:
                 u, v = three_de.px_to_uv(x, y, w, h)
                 tr.markers.insert_frame(fr + self.frame_offset, co=(u, v))

@@ -64,6 +64,21 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
     # artist makes once per plate, not per run, and a modal operator has no redo panel to
     # adjust them in. The operator still owns the properties -- the panel copies these into
     # it -- so scripting the operator directly is unaffected.
+    constant_box: BoolProperty(
+        name="New markers keep their on-screen size", default=True,
+        description="Blender sizes a new track in PLATE pixels, so the same setting that "
+                    "looks right on an HD plate draws a five-pixel box on a 4K one at "
+                    "fit-to-window zoom -- too small to see what you seeded. With this on, "
+                    "the size Ctrl-click uses is kept in step with your zoom so the box is "
+                    "always the same size in the viewport. Your own default pattern size is "
+                    "remembered and put back when this is switched off",
+        update=lambda self, ctx: _constant_box_changed(self))
+    box_screen_px: IntProperty(
+        name="On-screen box size", default=40, min=12, max=200, subtype="PIXEL",
+        description="How big a new marker's pattern box should look, in SCREEN pixels, "
+                    "whatever the zoom. Clamped in plate pixels at both ends: never under "
+                    "16, because a smaller patch holds too little texture to correlate "
+                    "however big it looks, and never over a quarter of the short edge")
     verify_pattern: BoolProperty(
         name="Re-acquire must match your pattern", default=True,
         description="Correlate the pattern box you set -- the patch shown in the Track "
@@ -142,6 +157,10 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
         row.prop(self, "port")
         row.prop(self, "autostart")
         layout.prop(self, "force_full_res")
+        layout.prop(self, "constant_box")
+        row = layout.row()
+        row.enabled = self.constant_box
+        row.prop(self, "box_screen_px")
         layout.prop(self, "rounds")
         layout.prop(self, "hold_feature")
         layout.prop(self, "stop_at_frame_edge")
@@ -166,6 +185,15 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
             box.label(text="Run bootstrap.bat in Blender_assitant to fill these in.",
                       icon="ERROR")
             box.label(text="3DE import/export works without it; auto-seed does not.")
+
+
+def _constant_box_changed(self):
+    """Switching this off must hand the artist's own default box size back at once."""
+    from . import click_size                                          # noqa: PLC0415
+    if self.constant_box:
+        click_size.start()
+    else:
+        click_size.stop()
 
 
 def get(context):

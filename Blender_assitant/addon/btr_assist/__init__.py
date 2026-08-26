@@ -22,7 +22,7 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
@@ -42,17 +42,19 @@ VERSION = bl_info["version"]
 #: moves on release cannot distinguish those. This moves on every build.
 BUILD = "dev"
 
-from . import (ops_3de, ops_assist, ops_diag, ops_qc, ops_seed, overlay,
-               panel, prefs)
+from . import (click_size, ops_3de, ops_assist, ops_diag, ops_qc, ops_seed,
+               overlay, panel, prefs)
 
 MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_qc, panel)
 
 
 def register():
+    import bpy
     for mod in MODULES:
         for cls in mod.CLASSES:
-            import bpy
             bpy.utils.register_class(cls)
+    # After the classes, because it reads the addon preferences.
+    click_size.start()
 
 
 def unregister():
@@ -60,6 +62,10 @@ def unregister():
     # A draw handler outlives unregister(): disabling the addon while the confirm prompt is
     # up would leave a callback pointing into a dead module, firing on every redraw.
     overlay.hide()
+    # A timer outlives unregister() the same way a draw handler does, and this one also
+    # holds the artist's own default box sizes -- stopping without restoring would leave
+    # their preference overwritten by a disabled addon.
+    click_size.stop()
     for mod in reversed(MODULES):
         for cls in reversed(mod.CLASSES):
             try:

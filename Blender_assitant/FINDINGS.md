@@ -2571,3 +2571,78 @@ occluder, which is worse than the hole it fills.
 * The fill costs one extra CoTracker pass per group of deaths. Not profiled against a real
   batch of 20 tracks; measured only on single-track references.
 * Both references are the same plate and the same artist.
+
+### A new marker that is the same size on screen at any zoom (2026-08-26)
+
+Reported: Ctrl-clicking on a 4K plate makes a pattern box so small it has to be zoomed into,
+dragged bigger, and zoomed back out -- once per track.
+
+A unit mismatch, not a bad default. Blender sizes a new track from
+`clip.tracking.settings.default_pattern_size`, which counts PLATE pixels. The default is 21.
+That is a sixth of the width of a 128-px proxy and 0.55 % of a 3840-px plate, and fitting 4K
+into a clip editor puts the zoom near 26 %:
+
+```
+21 plate px at 26 % zoom  ->  5.5 pixels on screen
+```
+
+Which is what was being clicked into existence.
+
+### Kept in step with the zoom instead
+
+Plate pixels and screen pixels are related by the zoom alone, so the setting Blender already
+reads can simply be kept correct:
+
+    plate_px = screen_px / (zoom_percentage / 100)
+
+| zoom | plate px for a 40 px box | was |
+|---|---|---|
+| 25 % | 160 | 21 |
+| 50 % | 80 | 21 |
+| 100 % | 40 | 21 |
+| 400 % | 16 (the floor) | 21 |
+
+Nothing intercepts the click. `clip.add_marker` stays Blender's own operator with its own
+drag-to-place behaviour, and it reads a default that happens to be right by the time it runs.
+Two clamps: never under 16 plate px, because a smaller patch holds too little texture to
+correlate however big it looks; never over a quarter of the short edge, for the
+zoomed-far-out case where the arithmetic would ask for a box bigger than the frame.
+
+### A timer, not a draw handler
+
+The obvious place to read the zoom is a draw callback -- it runs on every zoom, for free. But
+a draw callback must not write data and this writes two RNA properties. `bpy.app.timers` runs
+where that is allowed. 0.2 s is a latency budget, not a sampling rate: it only has to beat
+the gap between the artist stopping a scroll and clicking. The tick writes only on a real
+change, because writing the same value back tags the ID modified and asks the artist to save
+work that did not happen.
+
+### The setting still belongs to the artist
+
+`default_pattern_size` is a real preference someone may have set deliberately, and this
+overwrites it. The value in force when a clip is first touched is remembered and put back
+when the option is switched off or the addon is unregistered. Taking a setting over for the
+session is defensible; keeping it afterwards is not.
+
+### The side effect it had to not have
+
+Importing 3DE tracks also creates tracks from that default, and `ops_qc` correlates using the
+resulting pattern box. Left alone, a track imported at 25 % zoom would carry a 160 px pattern
+and QC would be reading a patch six times the size of the feature -- a change to how a FILE
+is read, caused by how zoomed in someone happened to be. Import now pins the box to
+`click_size.artist_default(clip)`, the artist's own value, so reading a file off disk behaves
+exactly as it did before any of this.
+
+`tests/test_click_size.py` drives the INSTALLED extension: the loose module on `sys.path` has
+no addon preferences, so testing against it would exercise the arithmetic twice and never run
+the reconciler at all. It also asserts `register()` actually scheduled the timer -- every
+other check calls `_apply` by hand and would pass just as well if nothing were ever scheduled
+to call it -- and that the restore works without the test planting the saved value first.
+
+### What this does not settle
+
+* 40 screen px is a guess at what reads well, exposed as a preference rather than measured.
+* `zoom_percentage` is taken as the whole story. On a HiDPI display where Blender applies a UI
+  scale, "screen pixels" and device pixels may differ; not checked on such a monitor.
+* A clip open in two editors at different zooms gets whichever the loop reaches last.
+  Harmless -- the size only matters at the click -- but it is not defined behaviour.
