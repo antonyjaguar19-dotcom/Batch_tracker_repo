@@ -189,3 +189,13 @@ def start_leash(assist_root, clip_info, request, params=None):
     return _request(info, "/jobs/leash",
                     {"clip": clip_info, "request": request, "params": params or {}},
                     timeout=30.0)
+
+
+def start_report(assist_root, clip_info, tracks, params=None):
+    """Ask whether a set of tracks will solve. CPU only -- no plate is read, no model loaded."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/report",
+                    {"clip": clip_info, "tracks": tracks, "params": params or {}},
+                    timeout=60.0)

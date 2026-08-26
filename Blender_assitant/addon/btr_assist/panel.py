@@ -160,6 +160,20 @@ class CLIP_PT_btr_main(_Base):
             row.operator("clip.btr_confirm_resumes", text="Drop",
                          icon="X").action = "DROP"
 
+        # The question about the SHOT rather than about a track. It belongs on the main panel
+        # and not in a closed sub-panel: every other check here judges one track at a time,
+        # and a set made entirely of good tracks can still be unsolvable -- all on one plane,
+        # all in one corner, or eleven frames in the middle held up by four of them. None of
+        # that is visible in the viewport, and an export and a solve is an expensive way to
+        # find out.
+        clip = getattr(context.space_data, "clip", None)
+        if clip is not None and len(clip.tracking.tracks) > 1:
+            layout.separator()
+            row = layout.row()
+            row.scale_y = 1.2
+            row.operator("clip.btr_shot_report", text="Will this shot solve?",
+                         icon="CAMERA_DATA")
+
 
 class CLIP_PT_btr_opts(_Base):
     """Every knob, grouped by WHEN it applies. Closed until someone wants it."""

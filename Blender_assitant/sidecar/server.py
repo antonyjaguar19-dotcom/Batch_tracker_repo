@@ -345,6 +345,47 @@ def job_patcheck(payload):
     return fn
 
 
+def job_report(payload):
+    """Will these tracks solve? Pure track geometry -- no plate is read and no model loaded.
+
+    Lives in the sidecar only because it needs cv2 for the RANSAC fits, which Blender does
+    not ship. It is CPU-only and takes well under a second on a few hundred tracks, so it is
+    cheap enough to run whenever the artist wants to look.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import coverage                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        params = payload.get("params") or {}
+        raw = payload.get("tracks") or {}
+        if not raw:
+            raise ValueError("no tracks to judge")
+        w = int(clip.get("width") or 0)
+        h = int(clip.get("height") or 0)
+        if w <= 0 or h <= 0:
+            raise ValueError("the clip resolution is needed -- every number here is a "
+                             "fraction of the frame")
+        # JSON object keys are strings, and a frame number that survives the round trip as
+        # "17" sorts before "9" and breaks every range in here.
+        tracks = {tid: {int(f): (float(p[0]), float(p[1])) for f, p in pts.items()}
+                  for tid, pts in raw.items() if pts}
+        job.say("judging %d track(s) against a %dx%d frame" % (len(tracks), w, h))
+        rep = coverage.report(tracks, w, h,
+                              floor=int(params.get("floor", 8)),
+                              hole_share=float(params.get("hole_share", 0.5)))
+        if rep.get("size_warning"):
+            job.say(rep["size_warning"])
+        job.say("parallax: %s" % rep["parallax"]["verdict"])
+        # per_frame is one entry per frame and the addon only needs the shape of it; a
+        # 3000-frame shot would otherwise send 3000 numbers back for a label.
+        rep["per_frame"] = {str(k): v for k, v in rep["per_frame"].items()}
+        return rep
+    return fn
+
+
 def job_leash(payload):
     """A guide path for a whole track, plus whether it may be believed.
 
@@ -965,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
-                         "/jobs/hold", "/jobs/leash"):
+                         "/jobs/hold", "/jobs/leash", "/jobs/report"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -977,7 +1018,8 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS[job.id] = job
             run_job(job, {"seed": job_seed, "reacquire": job_reacquire,
                           "patcheck": job_patcheck, "motion": job_motion,
-                          "hold": job_hold, "leash": job_leash}[kind](payload))
+                          "hold": job_hold, "leash": job_leash,
+                          "report": job_report}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

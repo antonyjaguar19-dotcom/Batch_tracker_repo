@@ -22,7 +22,7 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 8, 1),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
@@ -42,10 +42,11 @@ VERSION = bl_info["version"]
 #: moves on release cannot distinguish those. This moves on every build.
 BUILD = "dev"
 
-from . import (click_size, ops_3de, ops_assist, ops_diag, ops_qc, ops_seed,
-               overlay, panel, prefs)
+from . import (click_size, ops_3de, ops_assist, ops_diag, ops_qc, ops_report,
+               ops_seed, overlay, panel, prefs)
 
-MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_qc, panel)
+MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_qc, ops_report,
+           panel)
 
 
 def register():
