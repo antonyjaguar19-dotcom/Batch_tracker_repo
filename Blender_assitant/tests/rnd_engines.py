@@ -286,6 +286,9 @@ def main():
     ap.add_argument("--plate", required=True)
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--only", default="")
+    ap.add_argument("--methods", default="",
+                    help="comma-separated substrings; empty runs them all. Use this to run "
+                         "the CPU-only baseline while the GPU is busy training something")
     a = ap.parse_args()
 
     os.environ.setdefault("BTR_COTRACKER_MAX_FRAMES", "400")
@@ -321,11 +324,15 @@ def main():
             log("%-12s skipped -- pattern box does not fit at the seed" % name)
             continue
         patch, offset = ref
-        guide = leash._chain(plate, fs[0], truth[fs[0]], fs[0], hi, 768, 120, None, +1)
+        want = [m for m in METHODS
+                if not a.methods or any(k.strip() in m[0] for k in a.methods.split(","))]
+        # Only pay for a CoTracker pass if a method that was asked for actually needs one.
+        guide = ({} if not any(m[2] for m in want)
+                 else leash._chain(plate, fs[0], truth[fs[0]], fs[0], hi, 768, 120, None, +1))
 
         log("")
         log("%s  f%d-%d, %d run(s), %d gap(s)" % (name, fs[0], hi, len(rs), len(rs) - 1))
-        for mname, fn, _needs in METHODS:
+        for mname, fn, _needs in want:
             pred = fn(plate, truth, fs, hi, patch, offset, guide)
             s = score(pred, truth, rs)
             t = totals[mname]
@@ -349,6 +356,8 @@ def main():
         % ("method", "on feature", "abs p50", "motion p50", "re-acquired"))
     for mname, _fn, _g in METHODS:
         t = totals[mname]
+        if not t["of"]:
+            continue
         ab = sorted(t["abs"])
         mo = sorted(t["mot"])
         log("%-18s %4d/%-4d %3d%%  %6.1f px   %6.2f px     %s"

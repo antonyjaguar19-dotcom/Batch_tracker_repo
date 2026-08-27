@@ -207,3 +207,115 @@ evidence it is the only remaining route to 100 % re-acquisition on plates like t
   could change how far the guide carries the point across it.
 - Blender's own tracker was not run in this matrix; it is measured against the same references
   in `FINDINGS.md` and is the weakest of the three at crossing anything.
+
+---
+
+# FINAL RESULT
+
+Measured after everything above, on the artist's `track3` reference.
+
+## Is 100 % possible? No — and the reference is why, not the tracker
+
+The artist tracked one feature by hand twice: **0 of 46 frames identical, 2.13 px apart,
+scatter 1.78 px, max 3.00 px.** A target the person defining it cannot hit twice is not a
+target. Settled, and no engineering moves it.
+
+## What the shipped tool actually does on that reference
+
+| | |
+|---|---|
+| on the feature | **46 / 47 (98 %)** |
+| precision p50 / p90 / max | **1.4 px** / 2.7 px / 8.6 px |
+| constant offset | **0.5 px** |
+| off the feature (must be deleted) | **5 frames** |
+| missed | 1 frame |
+| occlusions crossed | **both** — resumed f26 at 0.966, f40 at 0.904 |
+
+**Its p50 of 1.4 px is tighter than the artist agrees with themselves (2.13 px).** On
+precision the job is finished and the reference is the limit.
+
+The five bad frames are **f33, f34, f35, f36, f40 — every one inside the second occlusion.**
+The tool tracks about four frames INTO the occluder before the check notices and cuts at f37.
+That is the whole of what is left.
+
+## Why it overshoots, and why no tracker fixes it
+
+The artist's own patch, scored on the frames they deliberately left EMPTY because the feature
+is hidden:
+
+```
+f15 0.913  f16 0.912  f17 0.904  f18 0.923  f19 0.957
+f20 0.931  f21 0.938  f22 0.899  f23 0.922  f24 0.865
+```
+
+Higher than f32, where the feature is genuinely visible (0.92). The texture repeats, so a
+covered feature still matches. **Appearance cannot mark the moment of occlusion**, and the
+tool only notices once evidence accumulates — about four frames later.
+
+Every other signal, measured against the artist's own gaps:
+
+| signal | agreement |
+|---|---|
+| pattern score | none — hidden frames score higher than visible ones |
+| CoTracker visibility head | **56 %** — right that f16-24 are hidden, never says it is back |
+| motion consistency of the match | 27-36 px while hidden vs 9-17 px after; overlapping |
+| **occluder mask, "road sign"** | **67 %** |
+| occluder mask, + billboard and poles | **43 %** |
+
+## The occluder-mask idea was mine, was tested, and failed
+
+Worth testing — SAM3 is already in the pipeline next door, and knowing where the occluder is
+turns a correlation guess into a lookup. Three steps, in order:
+
+1. The existing SH006 masks exclude MOVERS (car, person, truck). They put the artist's true
+   position and every false match inside the same "trackable" region — **no discrimination in
+   either polarity.** The occluder here is a road sign the camera drives past: static scene
+   geometry, which no mover prompt will ever mark.
+2. Re-prompted `road sign, traffic sign, signboard, direction sign`, the mask covers f22-24
+   at 100 % and reaches **67 %**. It misses the start of the first occlusion and all of the
+   second, because more than one object does the occluding.
+3. Broadened with `billboard, pole, mast`, agreement **fell to 43 %** — and that is the
+   finding: **the tracked feature is the top of a pole.** Prompting for poles masks the
+   feature itself. Narrow prompts miss occluders, broad prompts mask the target, and here
+   the occluder and the target are the same class of object.
+
+Disproven for this shot. It may hold where the occluder is a distinct object — a truck
+crossing a building — but it is not a general answer.
+
+## CoTracker or DINO?
+
+**Neither, and the question does not matter.**
+
+* Between occlusions the neural model contributes **nothing**: pattern-only — no model at all
+  — and CoTracker+pin scored **identically to two decimals** (0.1 px absolute, 0.12 px
+  motion). The artist's pattern box does the work; the model only supplies a neighbourhood.
+* Head to head on 16 of the artist's own seeds: CoTracker 91 %, DINO 88 %, both at a median of
+  about **one model pixel** — limited by the resolution they run at, not their quality, and
+  both fixed by the same pin.
+* Neither touches the overshoot, because the overshoot is the plate matching a covered
+  feature.
+
+DINO also costs hours per shot that never amortise; preprocessing alone ran over an hour for
+65 frames on this box before any training started.
+
+## Verdict
+
+**Done, not worth more time:**
+
+- Precision — 1.4 px p50 against a reference only self-consistent to 2.13 px.
+- Holding the pattern between occlusions — 0.1 px, and it needs no neural model.
+- Crossing occlusions at all — both crossed automatically, at 0.97 and 0.90.
+
+**Waste:**
+
+- Chasing 100 %, or anything under ~2 px absolute.
+- Choosing between CoTracker and DINO.
+- Occluder masks as a general fix on shots like this.
+
+**The only remaining headroom:** the ~4-frame overshoot into an occluder, which is 5 of the 6
+wrong frames here. It is not a detection problem — nothing detects it in a single frame — but
+a question of removing frames retrospectively once a resume proves, in hindsight, where the
+feature actually went. The resume at f40 knows that f33-36 were wrong.
+
+**Expected ceiling: 98-99 % correct, one or two frames to tidy per occlusion.** Not 100 %,
+ever, against a reference that moves 2 px when the same artist tracks it twice.
