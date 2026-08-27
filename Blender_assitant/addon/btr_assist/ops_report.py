@@ -106,6 +106,25 @@ def render(rep):
         out.append("  on every pair.")
     out.append("")
 
+    q = rep.get("quality") or {}
+    grades = rep.get("grades") or {}
+    if q.get("tracks"):
+        v = q.get("verdicts") or {}
+        out.append("QUALITY OF THE TRACKS THEMSELVES")
+        out.append("  %d good, %d worth a look, %d poor"
+                   % (v.get("good", 0), v.get("check", 0), v.get("poor", 0)))
+        out.append("  steadiness: median %s px, worst tenth %s px, worst %s px"
+                   % (q.get("jitter_p50"), q.get("jitter_p90"), q.get("jitter_max")))
+        bad = sorted(((tid, g) for tid, g in grades.items() if g["verdict"] != "good"),
+                     key=lambda kv: -(kv[1].get("jitter_px") or 0))
+        for tid, g in bad[:12]:
+            out.append("  %-18s %-6s %s" % (tid, g["verdict"], "; ".join(g["why"])))
+        if len(bad) > 12:
+            out.append("  ... and %d more" % (len(bad) - 12))
+        out.append("  This does NOT include drift. A track that slid off its feature is still")
+        out.append("  smooth, so it grades well here -- use 'Find and fix slides' for that.")
+        out.append("")
+
     bare = rep["bare_cells"]
     if bare:
         out.append("Regions with little coverage across the shot:")
@@ -194,14 +213,21 @@ class CLIP_OT_btr_shot_report(bpy.types.Operator):
             print("[report] %s" % ln)
 
         if self.select_suspect:
+            # Everything worth an artist's eye: tracks that disagree with the camera motion,
+            # and tracks that are poor in their own right. One selection, because the artist
+            # is about to step through them and does not care which check objected.
             want = set(s["id"] for s in rep["suspect"])
+            want |= set(tid for tid, g in (rep.get("grades") or {}).items()
+                        if g["verdict"] == "poor")
             for tr in clip.tracking.tracks:
                 tr.select = tr.name in want
 
         par = rep["parallax"]["verdict"]
         bad = len(rep["suspect"])
         thin = len(rep["thin_runs"])
-        head = "parallax %s; %d suspect; %d thin stretch(es)" % (par, bad, thin)
+        poor = sum(1 for g in (rep.get("grades") or {}).values() if g["verdict"] == "poor")
+        head = ("parallax %s; %d poor track(s); %d suspect; %d thin stretch(es)"
+                % (par, poor, bad, thin))
         # A degenerate shot is the finding that changes what the artist does next, so it is
         # the one that gets to interrupt.
         self.report({"WARNING"} if par == "degenerate" else {"INFO"},

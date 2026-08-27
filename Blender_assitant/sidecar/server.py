@@ -729,6 +729,7 @@ def job_report(payload):
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
         import coverage                                              # noqa: PLC0415
+        import quality                                               # noqa: PLC0415
 
         clip = payload.get("clip") or {}
         params = payload.get("params") or {}
@@ -748,6 +749,20 @@ def job_report(payload):
         rep = coverage.report(tracks, w, h,
                               floor=int(params.get("floor", 8)),
                               hole_share=float(params.get("hole_share", 0.5)))
+        # Per-track quality alongside the set-level answer. They are different questions and
+        # a shot can fail either: a hundred immaculate tracks all on one plane will not solve,
+        # and neither will good coverage made of mush. Cheap -- geometry only, no plate read.
+        #
+        # This does NOT include drift. A slide is smooth and fits a local quadratic perfectly:
+        # measured, the artist's drifted track reads 0.779 px of jitter against their hand
+        # track's 0.677. `leash.find_slides` is the only thing here that sees drift, and it
+        # needs a CoTracker pass, which is why it lives behind its own operator.
+        grades, gsum = quality.grade_all(tracks)
+        rep["grades"] = grades
+        rep["quality"] = gsum
+        job.say("quality: %s; jitter p50 %s p90 %s px"
+                % (", ".join("%d %s" % (n, k) for k, n in sorted(gsum["verdicts"].items())),
+                   gsum["jitter_p50"], gsum["jitter_p90"]))
         if rep.get("size_warning"):
             job.say(rep["size_warning"])
         job.say("parallax: %s" % rep["parallax"]["verdict"])

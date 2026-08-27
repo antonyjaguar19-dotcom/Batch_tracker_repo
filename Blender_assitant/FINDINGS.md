@@ -2990,3 +2990,90 @@ is a trap.
   where CoTracker walks onto the occluder that is exactly when a slide is most likely.
 * The seed frame is assumed correct. Everything here is measured relative to it.
 * One plate, one artist, still.
+
+### "Can it always produce a decent track?" (2026-08-26)
+
+Asked: *"the track quality varies from track to track, some tracks are good and some are really
+bad. cant we make the tool always produce an decent quality track?"*
+
+**No**, and it is worth saying plainly rather than tuning towards it. Quality is bounded by
+what is in the plate: a seed on flat sky, on a moving object, or covered for eighty frames has
+no good answer, and anything that returns one is inventing data.
+
+But *"every track is decent"* and *"you are never handed a bad track without being told"* are
+different promises, and the second is achievable. That needs a grade that works with **no
+reference**, because on a real shot there is none.
+
+### The complaint, as a number
+
+Per-frame deviation from a local quadratic -- what a real camera move looks like over seven
+frames -- across the artist's own 137-track SH008 export:
+
+```
+best track   0.04 px      p50 0.456      p90 1.539      worst 4.55 px
+```
+
+Two orders of magnitude, one run, one set of settings. That spread IS the complaint. For scale
+their own hand tracks measure 0.68 and 0.86 px, because a human clicking scatters about a
+pixel; a correlator on a hard corner beats that comfortably and one on mush does not come near.
+
+### And the half it cannot see
+
+**Jitter is blind to drift, and no threshold changes that.** A slide is smooth: it fits a local
+quadratic perfectly. Measured on the artist's own pair —
+
+| | jitter |
+|---|---|
+| their DRIFTED assist track | 0.779 px |
+| their hand track of the same feature | 0.677 px |
+
+The broken one reads marginally *better*. Adding a constant-velocity offset to a path changes
+no second derivative anywhere, so drift is invisible here **by construction** rather than by
+tuning. `leash.find_slides` is the only thing that sees it.
+
+So the grade covers what a track can be judged on from its own geometry, and the slide check is
+reported alongside rather than folded in. One number covering both would hide which fault a
+track has, and they need different fixes: a slide is repairable, noise is not.
+
+### Calibrated, not eyeballed
+
+Noise of a known size injected into the artist's own hand track:
+
+```
+injected 1.0 px  ->  reads 0.774      (a 7-point quadratic absorbs some of it)
+injected 2.0 px  ->  reads 1.548      ratio 2.000
+injected 4.0 px  ->  reads 3.096      ratio 2.000
+a smooth path    ->  reads 0.000
+a steady slide   ->  changes the reading by 0.000
+```
+
+The first version of the drift assertion was wrong and is worth recording: a SYNTHETIC ramp
+does produce 1.93 px of jitter, all of it from the two kinks where the slide starts and stops.
+That measures the corners that were built, not the fault. The real thing is gradual, so the
+test now uses the artist's own drifted output against their own hand track.
+
+### What ships
+
+The grade rides in the shot report, which already judges the set -- a shot fails either way
+round: a hundred immaculate tracks all on one plane will not solve, and neither will good
+coverage made of mush. On the 137-track export:
+
+```
+89 good, 44 worth a look, 4 poor
+BWD_0020  poor   very unsteady (4.55 px of jitter); in 3 pieces
+BWD_0063  poor   very unsteady (3.78 px of jitter); in 3 pieces
+```
+
+A reason in words, not a score out of five. An artist deciding whether to keep a track wants to
+know it is UNSTEADY, not that it got 2/5.
+
+### What this does not settle
+
+* The thresholds (1.5 px "check", 3.0 px "poor") are the p90 and the worst case of ONE export.
+  They are honest descriptions of that export and a guess about any other.
+* Nothing here is fixed automatically. It grades and selects; the artist decides. Whether a
+  poor track should be re-seeded, re-tracked with a bigger box, or dropped is not answered.
+* Jitter says nothing about a track being on the RIGHT feature. A rock-steady track on the
+  wrong object grades good, correctly -- that is `coverage.disagreement` and `find_slides`.
+* Nothing predicts quality at SEED time, which is what would actually stop bad tracks being
+  made. That remains the largest unbuilt thing in this addon.
