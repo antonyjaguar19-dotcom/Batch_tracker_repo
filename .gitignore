@@ -31,3 +31,10 @@ Blender_assitant/vendor/
 Blender_assitant/dist/
 Blender_assitant/logs/
 Blender_assitant/config/paths.json
+
+# Spatial tracker experiment: upstream clone, HF weights and its private dependency set
+# (SpaTrackerV2 is Apache-2.0, but 4.9 GB of weights and a second copy of sklearn/kornia
+# have no business in git). `out/` above already covers its results.
+Spatial tracker/vendor/
+Spatial tracker/weights/
+Spatial tracker/pydeps/
