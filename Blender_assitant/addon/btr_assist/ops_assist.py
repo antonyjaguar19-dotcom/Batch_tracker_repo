@@ -435,42 +435,35 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # **2.6-2.9x more often** on real plates, because it matches the seed patch
             # forever while appearance drifts. That track died at f158 with the feature 82 px
             # inside the frame, and nothing in the addon had touched the setting responsible.
+            #
+            # With `blender_tracking` on, only the motion model is touched, and only when
+            # the artist has ticked Animate scale -- a box that cannot do anything under
+            # `Loc`. Everything else is left exactly as Blender has it, because forcing this
+            # addon's configuration onto the artist's markers is what made the assistant's
+            # result disagree with their own by 10.36 px over 14 frames.
             changed = []
-            if self.blender_tracking:
-                # Blender's tracker, exactly as the artist has it. The block below is this
-                # addon's own configuration and it is better on this project's numbers --
-                # but it is a DIFFERENT tracker, and forcing it onto the artist's markers is
-                # what made the assistant's result disagree with their own by 10.36 px over
-                # 14 frames. The one exception is the motion model, because `animate_scale`
-                # is the artist ticking a box that cannot work under `Loc`.
-                if self.animate_scale and tr.motion_model != "LocScale":
-                    changed.append("motion_model %s->LocScale (scale watch is on)"
-                                   % tr.motion_model)
-                    tr.motion_model = "LocScale"
-                if changed:
-                    print("[assist] %s: %s" % (tr.name, ", ".join(changed)))
-                continue
             if self.animate_scale and tr.motion_model != "LocScale":
                 # A `Loc` track would silently opt out of the whole scale watch.
                 changed.append("motion_model %s->LocScale" % tr.motion_model)
                 tr.motion_model = "LocScale"
-            if tr.pattern_match != self._opts.pattern_match:
-                changed.append("pattern_match %s->%s"
-                               % (tr.pattern_match, self._opts.pattern_match))
-                tr.pattern_match = self._opts.pattern_match
-            if abs(tr.correlation_min - self._opts.correlation) > 1e-4:
-                changed.append("correlation %.2f->%.2f"
-                               % (tr.correlation_min, self._opts.correlation))
-                tr.correlation_min = self._opts.correlation
-            if not tr.use_brute:
-                changed.append("brute on")
-                tr.use_brute = True
-            if not tr.use_normalization:
-                changed.append("normalization on")
-                tr.use_normalization = True
-            if tr.frames_limit:
-                changed.append("frames_limit %d->0" % tr.frames_limit)
-                tr.frames_limit = 0
+            if not self.blender_tracking:
+                if tr.pattern_match != self._opts.pattern_match:
+                    changed.append("pattern_match %s->%s"
+                                   % (tr.pattern_match, self._opts.pattern_match))
+                    tr.pattern_match = self._opts.pattern_match
+                if abs(tr.correlation_min - self._opts.correlation) > 1e-4:
+                    changed.append("correlation %.2f->%.2f"
+                                   % (tr.correlation_min, self._opts.correlation))
+                    tr.correlation_min = self._opts.correlation
+                if not tr.use_brute:
+                    changed.append("brute on")
+                    tr.use_brute = True
+                if not tr.use_normalization:
+                    changed.append("normalization on")
+                    tr.use_normalization = True
+                if tr.frames_limit:
+                    changed.append("frames_limit %d->0" % tr.frames_limit)
+                    tr.frames_limit = 0
             if changed:
                 # Say what was taken over. Changing an artist's settings silently is its own
                 # kind of wrong, even when the change is right.
