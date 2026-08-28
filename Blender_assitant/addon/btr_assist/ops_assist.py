@@ -810,8 +810,52 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             self._hold_done = True
         return self._after_tracking(context)
 
+    #: Phases that hand work to something else and can sit there for a while. Naming them
+    #: lets the overlay say WHAT is being waited on instead of just "working".
+    _PHASE_WORDS = {
+        "motion": "measuring how far the plate moves",
+        "tracking": "tracking in Blender",
+        "ctracking": "tracking with CoTracker",
+        "hold": "checking every frame against your pattern",
+        "drift": "asking about a box that changed size",
+        "waiting": "looking for the feature again",
+        "confirm": "waiting for YOU",
+    }
+
     def _status(self, context, msg):
+        """Say what is happening, in the clip editor, with a heartbeat.
+
+        The status strip alone was not enough and the artist said so: working, idle and stuck
+        looked identical. Three facts fix that -- what it is doing, how long this phase has
+        run, and whether anything has CHANGED recently. The heartbeat lives in the overlay and
+        turns on every redraw, so a frozen one means the operator is gone while a turning one
+        with a stalled timer means it is waiting on something.
+        """
+        import time                                                   # noqa: PLC0415
+        now = time.time()
+        if getattr(self, "_t_phase_name", None) != self._phase:
+            self._t_phase_name = self._phase
+            self._t_phase = now
+        if getattr(self, "_last_msg", None) != msg:
+            self._last_msg = msg
+            self._t_msg = now
+        phase_for = now - getattr(self, "_t_phase", now)
+        still_for = now - getattr(self, "_t_msg", now)
+
         context.workspace.status_text_set("Assist: %s" % msg)
+        if self._phase == "confirm":
+            for area in context.window.screen.areas:
+                if area.type == "CLIP_EDITOR":
+                    area.tag_redraw()
+            return
+        lines = ["%s  (%.0fs)" % (self._PHASE_WORDS.get(self._phase, self._phase),
+                                  phase_for),
+                 msg]
+        if still_for >= overlay.STALL_SECONDS:
+            # Not an error. A CoTracker pass on a long window genuinely takes minutes, and
+            # the artist deserves to know the difference between that and a hang.
+            lines.append("no change for %.0fs -- still working, Esc stops it" % still_for)
+        overlay.status(lines)
         for area in context.window.screen.areas:
             if area.type == "CLIP_EDITOR":
                 area.tag_redraw()
@@ -909,7 +953,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
 
     def _after_tracking(self, context):
         if self.backward and not self._backward_done:
-            self._status(context, "backward pass (not cancellable) ...")
+            # This one genuinely freezes the UI: `sequence=True` runs to completion inside a
+            # single operator call, so no redraw happens and the heartbeat stops. Saying so
+            # first is the difference between a known pause and a crash.
+            self._status(context, "backward pass -- Blender will not respond until it ends")
+            overlay.tag_redraw()
             # Anchored on each track's ORIGINAL head, never on `seed_frame`: a repair or a
             # resume moves `seed_frame` forward, and tracking backwards from there would
             # re-write frames that are already measured and good.

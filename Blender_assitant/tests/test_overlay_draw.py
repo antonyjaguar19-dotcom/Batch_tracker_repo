@@ -114,6 +114,31 @@ def main():
     if drawn() != ["1", "None", "2.5"]:
         fail("did not stringify: %r" % (drawn(),))
 
+    # ---- the STATUS mode, which is a different colour and carries a heartbeat ----------
+    # It exists because working, idle and stuck looked identical to the artist. The heartbeat
+    # indexes a string from the clock inside _draw, which is exactly the sort of thing that
+    # works until it does not -- and a draw callback that throws does so on EVERY redraw.
+    stub.calls = []
+    check("status", lambda: overlay.status(["tracking in Blender  (3s)", "round 1"]))
+    check("draw while status is up", overlay._draw)
+    got = drawn()
+    if len(got) != 2 or "tracking in Blender" not in got[0]:
+        fail("status drew %r" % (got,))
+    if got[0] == "tracking in Blender  (3s)":
+        fail("no heartbeat was prepended: %r" % (got[0],))
+    stub.calls = []
+    check("status with a stall note",
+          lambda: overlay.status(["looking for the feature again  (48s)",
+                                  "CoTracker: tracking 1 point(s)",
+                                  "no change for 31s -- still working, Esc stops it"]))
+    check("draw with three status lines", overlay._draw)
+    if len(drawn()) != 3:
+        fail("stall status drew %r" % (drawn(),))
+    check("status with no lines at all", lambda: overlay.status([]))
+    check("draw with an empty status", overlay._draw)
+    check("a prompt after a status", lambda: overlay.show(["a question", "ENTER  yes"]))
+    check("draw the prompt again", overlay._draw)
+
     check("hide", overlay.hide)
     if overlay._HANDLE is not None:
         fail("hide left the handler registered")
