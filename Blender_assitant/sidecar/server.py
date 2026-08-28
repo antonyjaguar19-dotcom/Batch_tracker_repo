@@ -529,12 +529,33 @@ def job_runs(payload):
                 notes[tid] = "no pattern box to track with"
                 continue
             patch, offset = ref
-            got, notes_r = [], []
+            got, notes_r, bad_marks = [], [], []
             for run in r.get("runs") or []:
                 a, b = int(run["start"]), int(run["end"])
                 ax, ay = float(run["start_x"]), float(run["start_y"])
                 bx = run.get("end_x")
                 by = run.get("end_y")
+                # Does each mark actually SIT ON the feature? The mark is inserted at the
+                # nearest existing position, which after an occlusion is nowhere near it, so
+                # a mark the artist forgot to drag starts the run in the wrong place and
+                # every frame after it is wrong. Nothing downstream could tell -- it reads
+                # exactly like a failed re-acquisition, which is what got reported.
+                # START marks only, and the distinction is measured. A start mark begins a
+                # run: undragged, it puts every frame after it in the wrong place, and
+                # nothing else can tell. An END mark is already covered by the drift number,
+                # which says how far the run landed from it -- and checking it against the
+                # seed patch raises FALSE ALARMS, because the patch ages: on the artist's own
+                # correctly-placed f65 mark, 64 frames from the seed, it scores 0.33.
+                for tag, mf, mx, my in (("start", a, ax, ay),):
+                    if mx is None or my is None:
+                        continue
+                    img0 = patmatch._gray(plate.frame(int(mf) - 1))
+                    chk = None if img0 is None else patmatch.match_pinned(
+                        img0, patch, float(mx), float(my), radius=2.0, offset=offset)
+                    sc0 = None if chk is None else float(chk[2])
+                    if sc0 is None or sc0 < min_match:
+                        bad_marks.append((int(mf), tag, sc0))
+
                 cur = (ax, ay)
                 got.append({"frame": a, "x": ax, "y": ay, "score": 1.0, "marked": True})
                 stopped = None
@@ -585,9 +606,14 @@ def job_runs(payload):
                                   "" if close is None else
                                   ", drifted %.1f px from your end mark" % close))
             tracks[tid] = got
+            if bad_marks:
+                notes_r.insert(0, "MARKS NOT ON YOUR FEATURE: " + ", ".join(
+                    "f%d (%s, %s)" % (f, t, "no match" if s0 is None else "%.2f" % s0)
+                    for f, t, s0 in bad_marks) + " -- drag them onto it and track again")
             notes[tid] = "; ".join(notes_r)
             job.say("%s: %s" % (tid, notes[tid]))
-        return {"tracks": tracks, "notes": notes, "min_match": min_match,
+        return {"tracks": tracks, "notes": notes, "bad_marks": bool(bad_marks),
+                "min_match": min_match,
                 "radius": radius, "width": plate.w, "height": plate.h}
     return fn
 

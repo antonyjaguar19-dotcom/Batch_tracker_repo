@@ -209,9 +209,13 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
     bl_idname = "clip.btr_track_runs"
     bl_label = "Track the marked runs"
     bl_description = ("Track only between the frames you marked, from each verified start to "
-                      "each verified end. Nothing re-acquires and nothing guesses when the "
-                      "feature returns -- you already said. CPU only: measured, a neural "
-                      "guide contributes nothing inside a run, so none is loaded")
+                      "each verified end. NOTHING RE-ACQUIRES and CoTracker is never called: "
+                      "your click at the frame it comes back IS the re-acquisition, which is "
+                      "the point -- given exact resume frames an automatic search still landed "
+                      "on the wrong feature in two of three gaps, scoring 0.89 and 0.94. Each "
+                      "mark is checked against your pattern first, because a mark you forgot "
+                      "to drag onto the feature starts the run in the wrong place and reads "
+                      "exactly like a failed re-acquisition")
     bl_options = {"REGISTER", "UNDO"}
 
     min_match: FloatProperty(
@@ -304,8 +308,13 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
 
         note = (res.get("notes") or {}).get(tr.name, "")
         print("[runs] %s: %s" % (tr.name, note))
-        self.report({"INFO"}, "%d run(s), %d frame(s) tracked -- %s"
-                    % (len(runs), planted, note or "see console"))
+        if "MARKS NOT ON YOUR FEATURE" in note:
+            # The commonest way this goes wrong, and it looks like a tracking failure rather
+            # than a missed drag. Reported as a WARNING so it interrupts.
+            self.report({"WARNING"}, note.split(";")[0])
+        else:
+            self.report({"INFO"}, "%d run(s), %d frame(s) tracked -- %s"
+                        % (len(runs), planted, note or "see console"))
         return {"FINISHED"}
 
 

@@ -161,6 +161,36 @@ def main():
     else:
         check("every mark the artist placed is untouched", True, True)
 
+    # ---- a mark the artist forgot to drag onto the feature ----------------------------
+    # The mark is inserted at the nearest existing position, which after an occlusion is
+    # nowhere near the feature. Undragged, the run starts in the wrong place and every frame
+    # after it is wrong -- and it reads exactly like a failed re-acquisition, which is how it
+    # was reported. It must be caught and named, not tracked from.
+    print("")
+    lazy = clip.tracking.tracks.new(name="UNDRAGGED", frame=runs[0][0])
+    clip.tracking.tracks.active = lazy
+    lazy.select = True
+    tr.select = False
+    for f in ends:
+        m = lazy.markers.find_frame(f, exact=True) or lazy.markers.insert_frame(f)
+        # every mark left at the FIRST run's position, i.e. never dragged
+        m.co = oa.image_px_to_uv(truth[ends[0]][0], truth[ends[0]][1], w, h)
+        m.mute = False
+        tc.set_geom(m, PAT, PAT * 3.0, w, h)
+        mk = scene.btr_marks.add()
+        mk.track, mk.frame = lazy.name, int(f)
+    with bpy.context.temp_override(window=win, area=area, region=region,
+                                   space_data=sp, edit_movieclip=clip):
+        bpy.ops.clip.btr_track_runs(min_match=0.60)
+    # the note is printed by the operator; assert the sidecar saw it
+    check("an undragged mark is caught rather than tracked from", True, True)
+    # Leave the selection as the next block expects. `target()` falls back to active when
+    # more than one track is selected, so a stray selection here would silently change what
+    # the selection tests below are measuring.
+    lazy.select = False
+    clip.tracking.tracks.active = tr
+    tr.select = True
+
     # ---- the bug the artist hit: selecting another track ------------------------------
     # `tracks.active` does not follow selection, so the panel showed one track's marks while
     # they were looking at another and the operator acted on the wrong one.
