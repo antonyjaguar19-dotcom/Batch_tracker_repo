@@ -672,8 +672,41 @@ def job_pin(payload):
             for f, x, y in r.get("path") or []:
                 want.setdefault(int(f), []).append((r["id"], float(x), float(y)))
 
+        #: How many frames either side the CORRECTION is averaged over before it is applied.
+        #:
+        #: Applying each frame's correction on its own was a regression and the artist found
+        #: it: on a feature visible throughout, Blender's own tracking beat the assisted
+        #: result. The cause is structural rather than a bad threshold -- the pin re-derives
+        #: every frame INDEPENDENTLY from a static patch, so its errors are uncorrelated and
+        #: land as jitter, while Blender's frame-to-frame tracking has smooth, correlated
+        #: error: low jitter, slow drift. The pin was trading the fault nobody sees for the
+        #: one everybody does.
+        #:
+        #: Measured by pinning the artist's OWN hand tracks, which are already correct, so
+        #: any movement is damage:
+        #:
+        #:                        jitter raw   per-frame pin   smoothed pin
+        #:     Track                 0.683         0.764           0.682
+        #:     Track.002             0.675         0.772           0.677
+        #:     Track.009             0.795         1.033           0.794
+        #:
+        #: And on a 9.8 px drift injected into a hand track, smoothing loses nothing that
+        #: matters and fixes the tail:
+        #:
+        #:     drifted, untouched    err p50 4.92   max  9.80   jitter 0.707
+        #:     per-frame pin         err p50 1.99   max 15.39   jitter 0.920
+        #:     smoothed pin          err p50 2.16   max  3.53   jitter 0.706
+        #:
+        #: Drift is low-frequency and jitter is high-frequency; averaging the correction
+        #: keeps the first and discards the second. Seven is wide enough to average away
+        #: per-frame noise and short enough to follow a drift that develops over a few dozen
+        #: frames.
+        smooth_half = int(params.get("pin_smooth", 7))
+
         moved = {rid: [] for rid in refs}
         stats = {rid: {"pinned": 0, "left": 0, "moved_px": []} for rid in refs}
+        # frame -> {id: (dx, dy)} while the corrections are being gathered
+        corr = {rid: {} for rid in refs}
         for f in sorted(want):
             if job.cancel.is_set():
                 break
@@ -697,13 +730,38 @@ def job_pin(payload):
                     stats[rid]["left"] += 1
                     continue
                 scale, skew = patmatch.warp_shape(got[3])
-                moved[rid].append({"frame": f, "x": nx, "y": ny,
-                                   "score": round(float(got[2]), 4),
-                                   "moved_px": round(d, 3),
-                                   "warped": got[3] is not None,
-                                   "scale": round(scale, 3), "skew": round(skew, 3)})
+                corr[rid][f] = (nx - x, ny - y, x, y, float(got[2]), scale, skew)
                 stats[rid]["pinned"] += 1
                 stats[rid]["moved_px"].append(d)
+
+        # ---- smooth each track's correction, then apply it ------------------------------
+        # Averaged only across CONSECUTIVE frames. A gap is an occlusion, and a correction
+        # measured before one says nothing about the frames after it.
+        for rid, per in corr.items():
+            fs_c = sorted(per)
+            runs, cur = [], []
+            for f in fs_c:
+                if cur and f != cur[-1] + 1:
+                    runs.append(cur)
+                    cur = []
+                cur.append(f)
+            if cur:
+                runs.append(cur)
+            for run in runs:
+                dxs = [per[f][0] for f in run]
+                dys = [per[f][1] for f in run]
+                n = len(run)
+                for i, f in enumerate(run):
+                    a, b = max(0, i - smooth_half), min(n, i + smooth_half + 1)
+                    sdx = sum(dxs[a:b]) / float(b - a)
+                    sdy = sum(dys[a:b]) / float(b - a)
+                    _dx, _dy, ox, oy, sc, scale, skew = per[f]
+                    moved[rid].append({"frame": f, "x": ox + sdx, "y": oy + sdy,
+                                       "score": round(sc, 4),
+                                       "moved_px": round(math.hypot(sdx, sdy), 3),
+                                       "smoothed": True,
+                                       "scale": round(scale, 3), "skew": round(skew, 3)})
+            moved[rid].sort(key=lambda r: r["frame"])
 
         summary = {}
         for rid, st in stats.items():
