@@ -465,6 +465,114 @@ def job_fix(payload):
 
 
 
+
+def job_guess(payload):
+    """Where might the feature be on the frame the artist marked? Offers, never decides.
+
+    In mark mode the artist marks the frame the feature comes back and drags the mark onto
+    it. This does the drag's first half: CoTracker is queried from the previous mark -- a
+    position the artist verified -- and the artist's own pattern is correlated around its
+    prediction at several widths. What comes back is a RANKED LIST for them to look at.
+
+    It proposes rather than accepts, and that is measured. On the artist's three gaps, with
+    their exact frames supplied and each candidate then walked to their own END mark:
+
+        gap        radius  candidate   closes at   truth
+        f14->f25     12     52 px off    4.3 px     WRONG
+        f32->f41     56      1 px off   44.1 px     right
+        f127->f166   12      3 px off   did not reach  right
+
+    A right candidate exists in two of the three. Nothing available can tell which: the
+    closing error against the artist's end mark is dominated by the run's own drift, so it
+    ranks the WRONG candidate on the first gap above the right ones on the others. Accepting
+    automatically would be confidently wrong roughly a third of the time, which is worse than
+    asking -- so the artist gets the list and one keypress.
+
+    Several search widths on purpose. No single one works: 12 px found the right answer on
+    the third gap and missed it on the second, 56 px did the reverse.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        req = payload.get("request") or {}
+        params = payload.get("params") or {}
+        path_ = clip.get("path", "")
+        if not os.path.exists(path_):
+            raise FileNotFoundError("plate not found: %s" % path_)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+        if not req:
+            raise ValueError("nothing to guess")
+
+        out_dir = os.path.join(ASSIST, "logs", "guess", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path_, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        pat = req.get("pattern") or {}
+        ref = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
+                                       float(pat["cx"]), float(pat["cy"]),
+                                       float(pat["w"]), float(pat["h"])) if pat else None
+        if ref is None:
+            raise ValueError("no pattern box to look for")
+        patch, offset = ref
+
+        anchor_f = int(req["anchor_frame"])
+        anchor_px = (float(req["anchor_x"]), float(req["anchor_y"]))
+        want = int(req["frame"])
+        if want <= anchor_f:
+            raise ValueError("the frame to guess must come after the mark before it")
+
+        span = int(params.get("span", 150))
+        hi = min(int(plate.count), max(want, anchor_f + span))
+        job.say("CoTracker from f%d, looking at f%d" % (anchor_f, want))
+        guide = leash._chain(plate, anchor_f, anchor_px, anchor_f, hi,
+                             int(params.get("max_side", 768)), 120, job.say, +1)
+        p = leash.predict(guide, anchor_f, anchor_px, want)
+        img = patmatch._gray(plate.frame(want - 1))
+        if p is None or img is None:
+            cotrack.free()
+            return {"candidates": [], "reason": "the guide has no position on that frame"}
+
+        cands = []
+        for r in [float(x) for x in params.get("radii", [12.0, 28.0, 56.0])]:
+            hit = patmatch.match_pinned(img, patch, p[0], p[1], radius=r, offset=offset)
+            if hit is None:
+                continue
+            # Same peak found at two widths is one candidate, not two.
+            if any(math.hypot(hit[0] - c["x"], hit[1] - c["y"]) < 2.0 for c in cands):
+                continue
+            cands.append({"x": float(hit[0]), "y": float(hit[1]),
+                          "score": round(float(hit[2]), 3), "radius": r,
+                          "from_guide_px": round(math.hypot(hit[0] - p[0],
+                                                            hit[1] - p[1]), 1)})
+        # The guide's own prediction, unrefined, always offered last: when the pattern is
+        # genuinely covered every correlation peak is a lookalike, and where CoTracker
+        # thinks the point went is then the more honest answer.
+        cands.append({"x": float(p[0]), "y": float(p[1]), "score": None,
+                      "radius": 0.0, "from_guide_px": 0.0})
+        cands.sort(key=lambda c: -(c["score"] if c["score"] is not None else -1))
+        job.say("%d candidate(s)" % len(cands))
+        cotrack.free()
+        return {"candidates": cands, "frame": want, "anchor_frame": anchor_f,
+                "guide_x": float(p[0]), "guide_y": float(p[1]),
+                "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_runs(payload):
     """Track between frames the ARTIST marked, with no re-acquisition anywhere.
 
@@ -1611,7 +1719,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
                          "/jobs/hold", "/jobs/leash", "/jobs/report",
                          "/jobs/pin", "/jobs/ctrack", "/jobs/fix",
-                         "/jobs/runs"):
+                         "/jobs/runs", "/jobs/guess"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1626,7 +1734,8 @@ class Handler(BaseHTTPRequestHandler):
                           "hold": job_hold, "leash": job_leash,
                           "report": job_report, "pin": job_pin,
                           "ctrack": job_ctrack,
-                          "fix": job_fix, "runs": job_runs}[kind](payload))
+                          "fix": job_fix, "runs": job_runs,
+                          "guess": job_guess}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

@@ -13,6 +13,7 @@ Kept from it, because each was learned the hard way:
 
 import argparse
 import json
+import ast
 import os
 import re
 import shutil
@@ -123,6 +124,26 @@ def build(exe):
         fh.write(MANIFEST.format(pkg_id=PKG_ID, version=version, name=NAME,
                                  tagline=TAGLINE,
                                  tags=", ".join('"%s"' % t for t in TAGS)))
+
+    # Every module must at least PARSE before it is packaged. `extension validate` checks the
+    # manifest and nothing else: a panel.py with a stray line between `if` and `else` built
+    # cleanly, validated cleanly, installed, and then failed to import inside Blender with
+    # the addon apparently gone. Cheap to check, and the failure it prevents is invisible
+    # until the artist opens the panel.
+    bad = []
+    for root, _dirs, files in os.walk(SRC):
+        for fn in sorted(files):
+            if not fn.endswith(".py"):
+                continue
+            full = os.path.join(root, fn)
+            try:
+                ast.parse(open(full, encoding="utf-8").read(), filename=full)
+            except SyntaxError as exc:
+                bad.append("%s:%s: %s" % (os.path.relpath(full, SRC), exc.lineno, exc.msg))
+    if bad:
+        for b in bad:
+            print("  SYNTAX ERROR  %s" % b)
+        raise SystemExit("refusing to package a module that does not parse")
 
     zip_path = os.path.join(DIST, "%s-%s.zip" % (PKG_ID, version))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:

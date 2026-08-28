@@ -318,4 +318,117 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         return {"FINISHED"}
 
 
-CLASSES = (BtrMark, CLIP_OT_btr_mark, CLIP_OT_btr_track_runs)
+class CLIP_OT_btr_mark_guess(bpy.types.Operator):
+    """Move the mark at the current frame to where CoTracker thinks the feature went.
+
+    OFFERS, never decides, and that is measured rather than cautious. On the artist's three
+    gaps a right candidate existed in two, but nothing available can tell which is right: the
+    closing error against their own end mark is dominated by the run's drift, so it ranked a
+    52 px WRONG candidate above two that were 1-3 px correct. Accepting automatically would
+    be confidently wrong about a third of the time.
+
+    So each press moves the mark to the next candidate and says what it scored. The artist
+    looks, and either keeps it or drags it themselves -- which is one keypress instead of a
+    drag when it is right, and no worse than today when it is not.
+    """
+
+    bl_idname = "clip.btr_mark_guess"
+    bl_label = "Guess where it went"
+    bl_description = ("Move the mark on this frame to where CoTracker thinks the feature "
+                      "went, using the previous mark as the anchor. Press again to see the "
+                      "next candidate. It OFFERS -- measured on three real gaps it found a "
+                      "correct position in two, and could not tell which was correct, so you "
+                      "decide. Check it before tracking")
+    bl_options = {"REGISTER", "UNDO"}
+
+    #: Candidates for the last (track, frame) asked about, so repeat presses cycle instead of
+    #: re-running CoTracker for an answer already in hand.
+    _cache = {}
+
+    @classmethod
+    def poll(cls, context):
+        clip = _clip(context)
+        if clip is None:
+            return False
+        tr = target(clip)
+        if tr is None:
+            return False
+        f = int(context.scene.frame_current)
+        fs = marks_for(context.scene, tr.name)
+        return f in fs and fs.index(f) > 0
+
+    def execute(self, context):
+        clip = _clip(context)
+        tr = target(clip)
+        scene = context.scene
+        w, h = clip.size
+        f = int(scene.frame_current)
+        fs = marks_for(scene, tr.name)
+        if f not in fs or fs.index(f) == 0:
+            self.report({"WARNING"}, "stand on a mark that has another mark before it")
+            return {"CANCELLED"}
+
+        key = (tr.name, f)
+        cached = self._cache.get(key)
+        if cached is None:
+            anchor_f = fs[fs.index(f) - 1]
+            ma = tr.markers.find_frame(anchor_f, exact=True)
+            m0 = tr.markers.find_frame(fs[0], exact=True)
+            if ma is None or m0 is None:
+                self.report({"ERROR"}, "the mark before this one has no marker")
+                return {"CANCELLED"}
+            axp, ayp = marker_to_image_px(ma, w, h)
+            cx, cy, pw, ph = marker_pattern_box(m0, w, h)
+            p = prefs.get(context)
+            root = bpy.path.abspath(p.assist_root) if p and p.assist_root else                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            try:
+                client.ensure(root, bpy.path.abspath(p.python_exe) if p else "",
+                              p.port if p else 0)
+                job = client.start_guess(
+                    root, clip_info(context, clip),
+                    {"pattern": {"frame": int(fs[0]), "cx": cx, "cy": cy, "w": pw, "h": ph},
+                     "anchor_frame": int(anchor_f), "anchor_x": axp, "anchor_y": ayp,
+                     "frame": f})
+            except Exception as exc:                                  # noqa: BLE001
+                self.report({"ERROR"}, "sidecar: %s" % exc)
+                return {"CANCELLED"}
+            res, waited = None, 0.0
+            while waited < 600.0:
+                st = client.poll(root, job["id"])
+                if st["state"] == "done":
+                    res = st["result"]
+                    break
+                if st["state"] == "error":
+                    self.report({"ERROR"}, st["error"]["message"])
+                    return {"CANCELLED"}
+                time.sleep(0.15)
+                waited += 0.15
+            if res is None:
+                self.report({"ERROR"}, "the guess did not finish")
+                return {"CANCELLED"}
+            cached = {"cands": res.get("candidates") or [], "i": -1}
+            if not cached["cands"]:
+                self.report({"WARNING"}, res.get("reason") or "nothing to offer here")
+                return {"CANCELLED"}
+            self._cache[key] = cached
+
+        cached["i"] = (cached["i"] + 1) % len(cached["cands"])
+        c = cached["cands"][cached["i"]]
+        m = tr.markers.find_frame(f, exact=True)
+        if m is None:
+            self.report({"ERROR"}, "no marker on f%d" % f)
+            return {"CANCELLED"}
+        m.co = image_px_to_uv(float(c["x"]), float(c["y"]), w, h)
+        m.mute = False
+        self.report({"INFO"},
+                    "candidate %d of %d at f%d -- %s, %.0f px from CoTracker's own guess. "
+                    "Press again for the next; check it before tracking"
+                    % (cached["i"] + 1, len(cached["cands"]), f,
+                       "no pattern score (this is CoTracker's raw position)"
+                       if c["score"] is None else "your pattern scores %.2f" % c["score"],
+                       c["from_guide_px"]))
+        return {"FINISHED"}
+
+
+CLASSES = (BtrMark, CLIP_OT_btr_mark, CLIP_OT_btr_mark_guess,
+           CLIP_OT_btr_track_runs)

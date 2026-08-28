@@ -243,3 +243,13 @@ def start_runs(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/runs",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_guess(assist_root, clip_info, request, params=None):
+    """Ask CoTracker where a marked frame's feature might be. A list to look at, not an answer."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/guess",
+                    {"clip": clip_info, "request": request, "params": params or {}},
+                    timeout=30.0)

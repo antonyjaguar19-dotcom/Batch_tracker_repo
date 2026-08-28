@@ -289,6 +289,9 @@ class CLIP_PT_btr_mark(_Base):
         row = layout.row(align=True)
         row.operator("clip.btr_mark", text="Unmark").action = "DROP"
         row.operator("clip.btr_mark", text="Clear").action = "CLEAR"
+        # Offered, not automatic. Measured on three real gaps it found a correct position in
+        # two and could not tell which -- so it moves the mark and the artist looks.
+        layout.operator("clip.btr_mark_guess", text="Guess where it went", icon="VIEWZOOM")
 
         if not fs:
             layout.label(text="Mark the LAST visible frame, then the FIRST frame it is back.")
@@ -302,6 +305,7 @@ class CLIP_PT_btr_mark(_Base):
             box.label(text="one end of a stretch is unmarked", icon="ERROR")
         else:
             box.label(text="%d stretch(es) to track" % (len(fs) // 2), icon="CHECKMARK")
+        box.label(text="drag each mark ONTO the feature -- that is the re-acquisition")
         row = layout.row()
         row.scale_y = 1.3
         row.enabled = len(fs) >= 2 and len(fs) % 2 == 0
