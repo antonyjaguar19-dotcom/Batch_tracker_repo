@@ -265,10 +265,26 @@ def match_pinned(img, patch, cx, cy, radius=3.0, offset=(0.0, 0.0), motion=None)
     starts = [(cx, cy)]
     if rigid is not None and math.hypot(rigid[0] - cx, rigid[1] - cy) > 0.5:
         starts.append((rigid[0], rigid[1]))
+    # ECC is unconstrained: it optimises the warp and can walk the patch clean off the
+    # plate. Measured on the artist's f41, searching a 28 px radius: it returned y = -609.7,
+    # 686 px away and outside the image, scoring 0.998 -- a perfect fit to nothing, ranked
+    # above the correct answer found at another width (0.945, 1.3 px off). The score cannot
+    # catch this; the geometry can. A refinement is only an answer to the question asked if
+    # it stays inside the search that was asked for, and on the plate.
+    ph, pw = patch.shape[:2]
+    ih, iw = img.shape[:2]
+    limit = float(radius) + 1.0
     best = None
     for sx, sy in starts:
         got = warp_match_in(img, patch, sx, sy, offset=offset, motion=motion)
-        if got is not None and (best is None or got[2] > best[2]):
+        if got is None:
+            continue
+        if math.hypot(got[0] - cx, got[1] - cy) > limit:
+            continue
+        if not (0.0 <= got[0] - pw / 2.0 and got[0] + pw / 2.0 <= iw
+                and 0.0 <= got[1] - ph / 2.0 and got[1] + ph / 2.0 <= ih):
+            continue
+        if best is None or got[2] > best[2]:
             best = got
     if rigid is None and best is None:
         return None

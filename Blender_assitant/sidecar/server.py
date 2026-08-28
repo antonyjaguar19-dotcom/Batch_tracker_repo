@@ -469,24 +469,27 @@ def job_fix(payload):
 def job_guess(payload):
     """Where might the feature be on the frame the artist marked? Offers, never decides.
 
-    In mark mode the artist marks the frame the feature comes back and drags the mark onto
-    it. This does the drag's first half: CoTracker is queried from the previous mark -- a
-    position the artist verified -- and the artist's own pattern is correlated around its
-    prediction at several widths. What comes back is a RANKED LIST for them to look at.
+    In mark mode the artist gives the frames and CoTracker is asked WHERE, never WHEN. It is
+    queried from the last position anything verified, and the artist's own pattern is then
+    correlated around its prediction at several widths. What comes back is a RANKED LIST.
 
-    It proposes rather than accepts, and that is measured. On the artist's three gaps, with
-    their exact frames supplied and each candidate then walked to their own END mark:
+    Measured on the artist's three gaps, each candidate scored against their hand track:
 
-        gap        radius  candidate   closes at   truth
-        f14->f25     12     52 px off    4.3 px     WRONG
-        f32->f41     56      1 px off   44.1 px     right
-        f127->f166   12      3 px off   did not reach  right
+        gap        anchor  best candidate   score   truth
+        f14->f25     f14      1.9 px off    0.948   right
+        f32->f41     f31      1.3 px off    0.945   right
+        f127->f166   f126     3   px off    -       right
 
-    A right candidate exists in two of the three. Nothing available can tell which: the
-    closing error against the artist's end mark is dominated by the run's own drift, so it
-    ranks the WRONG candidate on the first gap above the right ones on the others. Accepting
-    automatically would be confidently wrong roughly a third of the time, which is worse than
-    asking -- so the artist gets the list and one keypress.
+    The top-scoring candidate is the right one in all three. That was NOT true before
+    `match_pinned` was made to reject a refinement that leaves its own search radius: ECC
+    walked the patch 686 px off the plate on the second gap and scored it 0.998, outranking
+    the correct answer. The ranking is only worth reading because that class of answer can no
+    longer enter the list.
+
+    It still proposes rather than decides. Three gaps on one feature is not enough to promise
+    the top candidate is always right, and a wrong landing is silent -- every frame after it
+    is wrong and nothing downstream can tell. So the caller reports the score it started
+    from, and the artist looks.
 
     Several search widths on purpose. No single one works: 12 px found the right answer on
     the third gap and missed it on the second, 56 px did the reverse.

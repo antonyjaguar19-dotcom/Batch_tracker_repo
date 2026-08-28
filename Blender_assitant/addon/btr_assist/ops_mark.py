@@ -33,7 +33,8 @@ import os
 import time
 
 import bpy
-from bpy.props import EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
+                       StringProperty)
 
 from . import client, prefs
 from .ops_assist import (clip_info, image_px_to_uv, live_frames, marker_pattern_box,
@@ -206,28 +207,55 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
 
 
 class CLIP_OT_btr_track_runs(bpy.types.Operator):
+    """Seed once, mark the frames, and let each engine do what it is good at.
+
+    The artist seeds ONE marker and marks the frames the feature disappears and comes back --
+    numbers only, no dragging. Then:
+
+      * **CoTracker finds it** at the first frame of every later run, anchored on the last
+        frame the previous run reached. Crossing an occlusion is the one thing it is measured
+        to be good at, and the artist's frames mean it is never asked WHEN, only WHERE.
+      * **Blender tracks the runs.** Its frame-to-frame matching is smooth, and smoothness is
+        the property that matters here: an independent per-frame match has uncorrelated
+        error, which lands as jitter -- exactly what made the pin worse than doing nothing
+        until its correction was averaged (0.683 -> 0.764 jitter on a hand track).
+
+    Nothing decides when the feature is hidden, because that is undecidable on this footage:
+    the artist's own pattern scores 0.86-0.96 on frames where it is definitively covered.
+
+    WHERE it comes back is still a guess. Measured end to end on the artist's `track3`
+    Track.001 -- one seed marker at f1 and their six frame numbers, nothing dragged:
+
+        run        landed        tracked
+        f1-f14     seeded        f1-f14
+        f25-f32    2.5 px off    f25-f31
+        f41-f65    1.3 px off    f41-f63
+
+    44 of their 47 frames on the feature, worst 2.5 px, and NOTHING inside an occlusion. The
+    three missing frames are the last one or two before a gap, where Blender loses the
+    feature as it starts to be covered -- it stops rather than following the occluder, which
+    is the behaviour worth having.
+
+    A wrong landing is silent: every frame after it is wrong and nothing downstream can tell.
+    So each guessed run reports what the pattern scored where it started, for the artist to
+    look at.
+    """
+
     bl_idname = "clip.btr_track_runs"
     bl_label = "Track the marked runs"
-    bl_description = ("Track only between the frames you marked, from each verified start to "
-                      "each verified end. NOTHING RE-ACQUIRES and CoTracker is never called: "
-                      "your click at the frame it comes back IS the re-acquisition, which is "
-                      "the point -- given exact resume frames an automatic search still landed "
-                      "on the wrong feature in two of three gaps, scoring 0.89 and 0.94. Each "
-                      "mark is checked against your pattern first, because a mark you forgot "
-                      "to drag onto the feature starts the run in the wrong place and reads "
-                      "exactly like a failed re-acquisition")
+    bl_description = ("Track only between the frames you marked. CoTracker finds the feature "
+                      "at each reappearance, Blender tracks each run. Nothing decides WHEN "
+                      "the feature is hidden -- you already said. Each run reports what your "
+                      "pattern scores where it started, so a bad landing is visible rather "
+                      "than silent")
     bl_options = {"REGISTER", "UNDO"}
 
-    min_match: FloatProperty(
-        name="Minimum match", default=0.60, min=0.1, max=0.99,
-        description="Below this the run stops rather than carrying on into whatever matched")
-    radius: FloatProperty(
-        name="May move by", default=0.0, min=0.0, max=200.0, subtype="PIXEL",
-        description="Plate pixels a marker may move between frames. ZERO takes it from your "
-                    "own search box, which is the right answer far more often than a fixed "
-                    "number: measured on this plate the feature moves up to 32 px in one "
-                    "frame, so a 12 px cap stopped two runs of three within a frame or two "
-                    "of their start. Set it only to override the box you drew")
+    backward: BoolProperty(
+        name="Also track backwards", default=True,
+        description="Within the run holding your seed, track back to the run's first frame "
+                    "as well as forward. Blender's backward stepping is unsafe one frame at "
+                    "a time on 5.2, so it runs to completion and anything before the run is "
+                    "removed afterwards")
 
     @classmethod
     def poll(cls, context):
@@ -237,22 +265,63 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         tr = target(clip)
         return tr is not None and len(marks_for(context.scene, tr.name)) >= 2
 
+    def _guess(self, context, clip, tr, root, pattern, anchor_f, anchor_px, frame):
+        """CoTracker's best position for `frame`. None if it cannot offer one."""
+        try:
+            job = client.start_guess(
+                root, clip_info(context, clip),
+                {"pattern": pattern, "anchor_frame": int(anchor_f),
+                 "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
+                 "frame": int(frame)})
+        except Exception as exc:                                      # noqa: BLE001
+            print("[runs] guess failed: %s" % exc)
+            return None
+        waited = 0.0
+        while waited < 600.0:
+            st = client.poll(root, job["id"])
+            if st["state"] == "done":
+                cands = (st["result"] or {}).get("candidates") or []
+                return cands[0] if cands else None
+            if st["state"] == "error":
+                print("[runs] guess failed: %s" % st["error"]["message"])
+                return None
+            time.sleep(0.15)
+            waited += 0.15
+        return None
+
     def execute(self, context):
+        from . import track_core                                      # noqa: PLC0415
         clip = _clip(context)
         tr = target(clip)
+        scene = context.scene
         w, h = clip.size
-        runs, fs = runs_from(context.scene, tr, w, h)
-        if not runs:
+        fs = [f for f in marks_for(scene, tr.name)]
+        pairs = list(zip(fs[0::2], fs[1::2]))
+        if not pairs:
             self.report({"WARNING"},
                         "%d mark(s) on %s -- they come in PAIRS, one for each end of a "
                         "visible stretch" % (len(fs), tr.name))
             return {"CANCELLED"}
 
-        seed = tr.markers.find_frame(fs[0], exact=True)
-        cx, cy, pw, ph = marker_pattern_box(seed, w, h)
-        req = [{"id": tr.name,
-                "pattern": {"frame": int(fs[0]), "cx": cx, "cy": cy, "w": pw, "h": ph},
-                "runs": runs}]
+        live = live_frames(tr)
+        if not live:
+            self.report({"ERROR"}, "%s has no seed marker" % tr.name)
+            return {"CANCELLED"}
+        seed_f = live[0]
+        seed_m = tr.markers.find_frame(seed_f, exact=True)
+        cx, cy, pw, ph = marker_pattern_box(seed_m, w, h)
+        pattern = {"frame": int(seed_f), "cx": cx, "cy": cy, "w": pw, "h": ph}
+        # Read as PLAIN NUMBERS now, once. Two reasons, both measured:
+        #   * `markers.insert_frame` returns a marker whose search box is ZERO-sized
+        #     (x[0,0] y[0,0]). Blender then has nothing to search in and the run dies on its
+        #     first step -- it looks exactly like a lost feature and is not one.
+        #   * a marker reference goes stale once tracking has grown the marker array, so
+        #     copying `seed_m.search_min` after the first run reads a dangling marker.
+        pat_corners = [tuple(c) for c in seed_m.pattern_corners]
+        s_min, s_max = tuple(seed_m.search_min), tuple(seed_m.search_max)
+        if (s_max[0] - s_min[0]) * w < 2.0 or (s_max[1] - s_min[1]) * h < 2.0:
+            sw, sh = pw * 1.5 / w, ph * 1.5 / h
+            s_min, s_max = (-sw, -sh), (sw, sh)
 
         p = prefs.get(context)
         root = bpy.path.abspath(p.assist_root) if p and p.assist_root else \
@@ -260,61 +329,89 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         try:
             client.ensure(root, bpy.path.abspath(p.python_exe) if p else "",
                           p.port if p else 0)
-            # The artist's own search box is their statement of how far this feature moves,
-            # and `fit_search_box` sizes it from measured plate motion when they let it. A
-            # fixed cap ignores both. Halved because the box spans both directions.
-            radius = float(self.radius) or max(12.0, marker_search_px(seed, w, h) / 2.0)
-            job = client.start_runs(root, clip_info(context, clip), req,
-                                    {"min_match": float(self.min_match),
-                                     "radius": radius})
         except Exception as exc:                                      # noqa: BLE001
             self.report({"ERROR"}, "sidecar: %s" % exc)
             return {"CANCELLED"}
 
-        res, waited = None, 0.0
-        while waited < 900.0:
-            st = client.poll(root, job["id"])
-            if st["state"] == "done":
-                res = st["result"]
-                break
-            if st["state"] == "error":
-                self.report({"ERROR"}, st["error"]["message"])
-                return {"CANCELLED"}
-            time.sleep(0.1)
-            waited += 0.1
-        if res is None:
-            self.report({"ERROR"}, "the run did not finish")
-            return {"CANCELLED"}
+        win = context.window
+        area = next((a for a in win.screen.areas if a.type == "CLIP_EDITOR"), None)
+        region = next((r for r in area.regions if r.type == "WINDOW"), None) if area else None
+        ctx = (win, area, region, clip, scene)
+        opts = track_core.Opts(leash=0.0, motion_model="LocScale", scale_clamp=1.6,
+                               edge_stop=True)
+        track_core.apply_settings(clip, opts)
 
-        got = (res.get("tracks") or {}).get(tr.name) or []
-        marked = set(fs)
-        planted = 0
-        for g in got:
-            f = int(g["frame"])
-            if f in marked:
-                # Never move a frame the artist placed by hand. It is the reference the run
-                # was tracked from, and overwriting it would quietly replace their judgement
-                # with the tool's.
+        notes, started = [], []
+        for i, (a, b) in enumerate(pairs):
+            if b <= a:
                 continue
-            m = tr.markers.find_frame(f, exact=True)
-            if m is None:
-                m = tr.markers.insert_frame(f, co=image_px_to_uv(g["x"], g["y"], w, h))
-                m.pattern_corners = seed.pattern_corners
-                m.search_min, m.search_max = seed.search_min, seed.search_max
-            else:
-                m.co = image_px_to_uv(g["x"], g["y"], w, h)
+            m = tr.markers.find_frame(a, exact=True)
+            if m is None or a != seed_f:
+                # Not the seeded run: CoTracker has to find the feature here. Anchored on the
+                # last frame the track actually reached, which is the newest position anything
+                # has verified.
+                have = [f for f in live_frames(tr) if f < a]
+                anchor_f = have[-1] if have else seed_f
+                am = tr.markers.find_frame(anchor_f, exact=True)
+                if am is None:
+                    notes.append("f%d-f%d: nothing before it to look from" % (a, b))
+                    continue
+                cand = self._guess(context, clip, tr, root, pattern,
+                                   anchor_f, marker_to_image_px(am, w, h), a)
+                if cand is None:
+                    notes.append("f%d-f%d: CoTracker offered nothing" % (a, b))
+                    continue
+                m = tr.markers.find_frame(a, exact=True) or tr.markers.insert_frame(a)
+                m.co = image_px_to_uv(float(cand["x"]), float(cand["y"]), w, h)
+                m.pattern_corners = pat_corners
+                m.search_min, m.search_max = s_min, s_max
+                started.append((a, cand.get("score")))
             m.mute = False
-            planted += 1
 
-        note = (res.get("notes") or {}).get(tr.name, "")
-        print("[runs] %s: %s" % (tr.name, note))
-        if "MARKS NOT ON YOUR FEATURE" in note:
-            # The commonest way this goes wrong, and it looks like a tracking failure rather
-            # than a missed drag. Reported as a WARNING so it interrupts.
-            self.report({"WARNING"}, note.split(";")[0])
+            rec = [{"t": tr, "id": tr.name, "kind": "", "alive": True, "w": w, "h": h,
+                    "seed_frame": int(a), "seed_pat": (pw, ph)}]
+            # n_frames = b, so the last step is b-1 -> b. Passing b+1 would carry the track
+            # one frame INTO the occlusion the artist just told us about.
+            for _ in track_core.track_job(ctx, rec, int(b), {}, opts):
+                pass
+            reached = max([f for f in live_frames(tr) if a <= f <= b] or [a])
+            notes.append("f%d-f%d: reached f%d" % (a, b, reached))
+
+            if self.backward and a < seed_f <= b:
+                # Only the seeded run needs it, and only Blender's whole-sequence mode is
+                # safe backwards on 5.2 -- so it runs past the start and is trimmed.
+                track_core.track_group(ctx, [tr], int(seed_f), backwards=True, sequence=True)
+                for f in [x for x in live_frames(tr) if x < a]:
+                    if len(tr.markers) > 1:
+                        tr.markers.delete_frame(f)
+
+        # Anything outside a marked stretch is a frame the artist said is not there.
+        keep = set()
+        for a, b in pairs:
+            keep.update(range(a, b + 1))
+        removed = 0
+        # Every marker, not just the live ones: a failed step leaves a MUTED marker behind,
+        # and one of those sitting inside an occlusion is still a frame the artist said the
+        # feature is not on.
+        for f in [int(m.frame) for m in tr.markers]:
+            if f not in keep and len(tr.markers) > 1:
+                tr.markers.delete_frame(f)
+                removed += 1
+
+        msg = "; ".join(notes)
+        if started:
+            msg += " | CoTracker started " + ", ".join(
+                "f%d (%s)" % (f, "no score" if sc is None else "%.2f" % sc)
+                for f, sc in started)
+        print("[runs] %s: %s" % (tr.name, msg))
+        low = [f for f, sc in started if sc is not None and sc < 0.6]
+        if low:
+            self.report({"WARNING"},
+                        "CoTracker's landing looks wrong at %s -- check it, or drag the mark "
+                        "and track again" % ", ".join("f%d" % f for f in low))
         else:
-            self.report({"INFO"}, "%d run(s), %d frame(s) tracked -- %s"
-                        % (len(runs), planted, note or "see console"))
+            self.report({"INFO"}, "%d run(s), %d frame(s) outside them removed -- %s"
+                        % (len(pairs), removed, msg))
         return {"FINISHED"}
 
 
