@@ -76,14 +76,20 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                 "Blender if the sidecar or CoTracker is unavailable")),
         description="Which engine carries a track BETWEEN occlusions. Crossing an occlusion "
                     "is CoTracker either way")
+    blender_tracking: BoolProperty(
+        name="Track with Blender's own settings", default=True,
+        description="Track with the same settings Blender itself uses, so a track the assistant makes is the track you would have made by hand. Turning this OFF applies this addon's own measured configuration -- PREV_FRAME matching with normalization, which survives 2.6-2.9x longer on real plates but does NOT reproduce Blender: measured 10.36 px apart over 14 frames of SH006 from the same seed")
     pin_to_pattern: BoolProperty(
-        name="Pin every frame to my pattern", default=True,
+        name="Pin every frame to my pattern", default=False,
         description="When a run finishes, register every frame against the pattern box you "
                     "drew instead of leaving it answerable to the previous frame. Blender "
                     "tracks against the frame before, so error accumulates with nothing to "
                     "pull it back -- on a 250-frame reference it reached 8.8 px. Pinning took "
                     "the median from 4.9 px to 2.1 and the constant offset from 0.8 px to "
-                    "0.3, with nothing moved off its feature. Positions only")
+                    "0.3, with nothing moved off its feature. Positions only. OFF by default: it "
+                    "MOVES frames Blender placed, so the result stops being Blender's "
+                    "track -- turn it on when you want the drift removed and are ready to "
+                    "check the result against your own eye")
     pin_radius: FloatProperty(
         name="Pin may move a marker by", default=12.0, min=2.0, max=48.0, subtype="PIXEL",
         description="Plate pixels, per frame. Has to cover accumulated drift without being "

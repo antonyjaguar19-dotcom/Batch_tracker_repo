@@ -107,6 +107,19 @@ class Opts:
         # Hard bounds on how far LocScale may take the pattern box from the size the artist
         # set, as a ratio either way. 0 disables. See `clamp_pattern`.
         self.scale_clamp = 0.0
+        # Leave every tracking setting exactly as Blender has it: do not write the clip's
+        # defaults, do not write a track's own properties. OFF here so the headless path and
+        # the parity gate are unchanged; the interactive operators turn it ON.
+        #
+        # It exists because the two were measurably not the same tracker. Same seed, same
+        # pattern box, 14 frames of SH006: a track carrying Blender's own defaults and one
+        # carrying this file's (PREV_FRAME, normalization on) end up **10.36 px apart**, and
+        # `apply_settings` wrote those into the artist's CLIP, so markers they made later in
+        # Blender's own UI changed too (7.91 px). The settings below are better on this
+        # project's own numbers, and that is not the point: an assistant that silently
+        # tracks differently from the application it is assisting cannot be checked against
+        # it, and the artist checks it constantly.
+        self.blender_defaults = False
         self.motion = None
         self.motion_headroom = 1.5
         self.motion_cap_frac = 0.25
@@ -389,6 +402,11 @@ def apply_settings(clip, opts):
     protection, so nothing here may be inherited -- a scene whose defaults were left on
     Affine/PREV_FRAME would silently produce the sweep's WORST configuration.
     """
+    if getattr(opts, "blender_defaults", False):
+        # The artist asked for Blender's tracker. Writing clip defaults here would change
+        # every track they create afterwards, in Blender's own UI, for the rest of the
+        # session -- measured at 7.91 px over 14 frames.
+        return
     st = clip.tracking.settings
     st.use_default_brute = True             # survives fast motion; the search box is the cost
     st.use_default_normalization = True     # exposure/grain changes must not read as failure
@@ -417,12 +435,18 @@ def seed_tracks(clip, seeds, opts, tracks=None):
         srch = max(pat + 4, int(round(srch * opts.search_scale)))
         model = opts.motion_model or model
         t = tracks.new(name=s["id"], frame=int(s["frame"]))
-        t.motion_model = model
-        t.use_brute = True
-        t.use_normalization = True
-        t.correlation_min = opts.correlation
-        t.frames_limit = 0
-        t.pattern_match = opts.pattern_match
+        if getattr(opts, "blender_defaults", False):
+            # `tracks.new` has already copied the clip's own defaults onto the track. Leave
+            # them: this seed must track identically to one the artist placed by hand. Only
+            # the geometry below is ours, because the pattern box IS the artist's input.
+            model = t.motion_model
+        else:
+            t.motion_model = model
+            t.use_brute = True
+            t.use_normalization = True
+            t.correlation_min = opts.correlation
+            t.frames_limit = 0
+            t.pattern_match = opts.pattern_match
         m = t.markers[0]
         m.co = (float(s["u"]), float(s["v"]))
         set_geom(m, pat, srch, w, h)

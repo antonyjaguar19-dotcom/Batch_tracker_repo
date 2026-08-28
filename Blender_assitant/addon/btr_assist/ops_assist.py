@@ -223,8 +223,11 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
                 "Falls back to Blender if the sidecar or CoTracker is unavailable")),
         description="Which engine carries a track BETWEEN occlusions. Crossing an occlusion "
                     "is CoTracker either way -- that is what the re-acquire has always been")
+    blender_tracking: BoolProperty(
+        name="Track with Blender's own settings", default=True,
+        description="Track with the same settings Blender itself uses, so a track the assistant makes is the track you would have made by hand. Turning this OFF applies this addon's own measured configuration -- PREV_FRAME matching with normalization, which survives 2.6-2.9x longer on real plates but does NOT reproduce Blender: measured 10.36 px apart over 14 frames of SH006 from the same seed")
     pin_to_pattern: BoolProperty(
-        name="Pin every frame to my pattern", default=True,
+        name="Pin every frame to my pattern", default=False,
         description="When the run finishes, register every frame against the pattern box you "
                     "drew rather than leaving it answerable to the previous frame. Measured "
                     "on a 250-frame reference: median 4.9 px -> 2.1 px, constant offset "
@@ -385,6 +388,7 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # watches a constant, and animating scale without watching it is how a box
             # quietly swells onto the background for forty frames.
             motion_model="LocScale" if self.animate_scale else "",
+            blender_defaults=bool(self.blender_tracking),
             edge_stop=bool(self.stop_at_frame_edge),
             # The watch's own "too far from your box" number, reused as a hard bound so the
             # box cannot reach a degenerate size in the first place. One number, two uses.
@@ -432,6 +436,20 @@ class CLIP_OT_btr_assist_track(bpy.types.Operator):
             # forever while appearance drifts. That track died at f158 with the feature 82 px
             # inside the frame, and nothing in the addon had touched the setting responsible.
             changed = []
+            if self.blender_tracking:
+                # Blender's tracker, exactly as the artist has it. The block below is this
+                # addon's own configuration and it is better on this project's numbers --
+                # but it is a DIFFERENT tracker, and forcing it onto the artist's markers is
+                # what made the assistant's result disagree with their own by 10.36 px over
+                # 14 frames. The one exception is the motion model, because `animate_scale`
+                # is the artist ticking a box that cannot work under `Loc`.
+                if self.animate_scale and tr.motion_model != "LocScale":
+                    changed.append("motion_model %s->LocScale (scale watch is on)"
+                                   % tr.motion_model)
+                    tr.motion_model = "LocScale"
+                if changed:
+                    print("[assist] %s: %s" % (tr.name, ", ".join(changed)))
+                continue
             if self.animate_scale and tr.motion_model != "LocScale":
                 # A `Loc` track would silently opt out of the whole scale watch.
                 changed.append("motion_model %s->LocScale" % tr.motion_model)

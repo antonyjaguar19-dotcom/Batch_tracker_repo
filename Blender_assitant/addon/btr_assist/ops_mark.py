@@ -337,8 +337,10 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         area = next((a for a in win.screen.areas if a.type == "CLIP_EDITOR"), None)
         region = next((r for r in area.regions if r.type == "WINDOW"), None) if area else None
         ctx = (win, area, region, clip, scene)
-        opts = track_core.Opts(leash=0.0, motion_model="LocScale", scale_clamp=1.6,
-                               edge_stop=True)
+        # Blender's tracker, untouched. Mark mode's whole claim is that the runs are what
+        # Blender would have produced and CoTracker only says WHERE a run restarts.
+        opts = track_core.Opts(leash=0.0, motion_model="", scale_clamp=0.0,
+                               edge_stop=True, blender_defaults=True)
         track_core.apply_settings(clip, opts)
 
         notes, started = [], []

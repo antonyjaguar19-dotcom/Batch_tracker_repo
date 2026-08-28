@@ -211,7 +211,8 @@ class CLIP_OT_btr_autoseed(bpy.types.Operator):
                                 % (data["width"], data["height"],
                                    clip.size[0], clip.size[1]))
 
-        opts = track_core.Opts()
+        # A Ctrl-clicked seed must be the same tracker as one the artist adds in Blender.
+        opts = track_core.Opts(blender_defaults=True)
         space = context.space_data
         p = prefs.get(context)
         self._proxy = track_core.FullResolution(
