@@ -251,6 +251,54 @@ class CLIP_PT_btr_opts(_Base):
         row.prop(p, "confirm_only_occluded", text="Only when hidden")
 
 
+class CLIP_PT_btr_mark(_Base):
+    """Mark mode: the artist says where the feature is visible, the tool only tracks.
+
+    Its own panel rather than a row in Options, because it is a WORKFLOW and not a setting --
+    marking, dragging and tracking happen in that order and the panel has to show where you
+    are in it.
+    """
+
+    bl_label = "Mark mode"
+    bl_parent_id = "CLIP_PT_btr_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        from . import ops_mark
+        layout = self.layout
+        clip = getattr(context.space_data, "clip", None)
+        tr = clip.tracking.tracks.active if clip else None
+        if tr is None:
+            layout.label(text="Select a track first", icon="INFO")
+            return
+
+        fs = ops_mark.marks_for(context.scene, tr.name)
+        col = layout.column(align=True)
+        col.scale_y = 1.2
+        col.operator("clip.btr_mark", text="Mark this frame",
+                     icon="MARKER_HLT").action = "ADD"
+        row = layout.row(align=True)
+        row.operator("clip.btr_mark", text="Unmark").action = "DROP"
+        row.operator("clip.btr_mark", text="Clear").action = "CLEAR"
+
+        if not fs:
+            layout.label(text="Mark the LAST visible frame, then the FIRST frame it is back.")
+            layout.label(text="Drag each mark onto the feature.")
+            return
+        box = layout.box()
+        box.label(text="%s: %s" % (tr.name, ", ".join("f%d" % f for f in fs)))
+        if len(fs) % 2:
+            # Saying which half of the pair is missing beats "invalid": the artist is mid-way
+            # through a deliberate two-step and needs to know which step.
+            box.label(text="one end of a stretch is unmarked", icon="ERROR")
+        else:
+            box.label(text="%d stretch(es) to track" % (len(fs) // 2), icon="CHECKMARK")
+        row = layout.row()
+        row.scale_y = 1.3
+        row.enabled = len(fs) >= 2 and len(fs) % 2 == 0
+        row.operator("clip.btr_track_runs", text="Track the marked runs", icon="TRACKING")
+
+
 class CLIP_PT_btr_3de(_Base):
     bl_label = "3DE tracks"
     bl_parent_id = "CLIP_PT_btr_main"
@@ -312,4 +360,5 @@ class CLIP_PT_btr_setup(_Base):
             box.label(text="clip source: %s" % clip.source)
 
 
-CLASSES = (CLIP_PT_btr_main, CLIP_PT_btr_opts, CLIP_PT_btr_3de, CLIP_PT_btr_setup)
+CLASSES = (CLIP_PT_btr_main, CLIP_PT_btr_opts, CLIP_PT_btr_mark, CLIP_PT_btr_3de,
+           CLIP_PT_btr_setup)

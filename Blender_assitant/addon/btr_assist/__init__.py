@@ -22,7 +22,7 @@ process and is reached over localhost, never imported here.
 bl_info = {
     "name": "Tracking Assistant",
     "author": "batch_tracker",
-    "version": (0, 15, 0),
+    "version": (0, 16, 0),
     "blender": (4, 2, 0),
     "location": "Movie Clip Editor > Sidebar (N) > Assist",
     "description": "AI-assisted 2D tracking: auto-seed, repair, 3DE import/export",
@@ -42,11 +42,11 @@ VERSION = bl_info["version"]
 #: moves on release cannot distinguish those. This moves on every build.
 BUILD = "dev"
 
-from . import (click_size, ops_3de, ops_assist, ops_diag, ops_fix, ops_pin,
-               ops_qc, ops_report, ops_seed, overlay, panel, prefs)
+from . import (click_size, ops_3de, ops_assist, ops_diag, ops_fix, ops_mark,
+               ops_pin, ops_qc, ops_report, ops_seed, overlay, panel, prefs)
 
-MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_fix, ops_pin,
-           ops_qc, ops_report, panel)
+MODULES = (prefs, ops_3de, ops_seed, ops_assist, ops_diag, ops_fix, ops_mark,
+           ops_pin, ops_qc, ops_report, panel)
 
 
 def register():
@@ -54,6 +54,9 @@ def register():
     for mod in MODULES:
         for cls in mod.CLASSES:
             bpy.utils.register_class(cls)
+    # After the classes: the pointer needs BtrMark to exist. Marks live on the Scene because
+    # MovieTrackingTrack accepts no ID properties.
+    bpy.types.Scene.btr_marks = bpy.props.CollectionProperty(type=ops_mark.BtrMark)
     # After the classes, because it reads the addon preferences.
     click_size.start()
 
@@ -67,6 +70,8 @@ def unregister():
     # holds the artist's own default box sizes -- stopping without restoring would leave
     # their preference overwritten by a disabled addon.
     click_size.stop()
+    if hasattr(bpy.types.Scene, "btr_marks"):
+        del bpy.types.Scene.btr_marks
     for mod in reversed(MODULES):
         for cls in reversed(mod.CLASSES):
             try:

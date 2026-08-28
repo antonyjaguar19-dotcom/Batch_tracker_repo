@@ -464,6 +464,134 @@ def job_fix(payload):
     return fn
 
 
+
+def job_runs(payload):
+    """Track between frames the ARTIST marked, with no re-acquisition anywhere.
+
+    The artist marks the corners of every visible stretch -- last frame before it goes
+    behind something, first frame it is back -- and drags each mark onto the feature. Those
+    pairs are the runs. Nothing here has to decide when the feature went or came back, which
+    is the one decision measured to be undecidable on this footage: the artist's own pattern
+    scores 0.86-0.96 on frames where the feature is definitively hidden, so no threshold
+    separates covered from visible.
+
+    It also drops the guide entirely, and that is measured rather than assumed. WITHIN a run,
+    pattern-only -- no neural model at all -- and CoTracker+pin scored identically to two
+    decimals against the artist's hand track: 0.1 px absolute, 0.12 px motion. The guide only
+    ever earned its place crossing occlusions, and there are none left to cross. So this is
+    CPU-only and needs no GPU, no CoTracker and no sweep.
+
+    Each run is walked from its seed with a previous-frame prior and the artist's own patch
+    as a permanent template, so there is no drift to accumulate -- what moves is only where
+    the search starts. The run's END is the artist's second mark, which makes drift
+    MEASURABLE for the first time: the walk either arrives where they said it would or it
+    does not, and the closing error is reported per run rather than inferred.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        reqs = payload.get("requests") or []
+        params = payload.get("params") or {}
+        path_ = clip.get("path", "")
+        if not os.path.exists(path_):
+            raise FileNotFoundError("plate not found: %s" % path_)
+        if not reqs:
+            raise ValueError("no runs to track")
+
+        out_dir = os.path.join(ASSIST, "logs", "runs", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path_, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        min_match = float(params.get("min_match", 0.60))
+        radius = float(params.get("radius", 12.0))
+
+        tracks, notes = {}, {}
+        for r in reqs:
+            if job.cancel.is_set():
+                break
+            tid = r["id"]
+            pat = r.get("pattern") or {}
+            ref = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
+                                           float(pat["cx"]), float(pat["cy"]),
+                                           float(pat["w"]), float(pat["h"])) if pat else None
+            if ref is None:
+                notes[tid] = "no pattern box to track with"
+                continue
+            patch, offset = ref
+            got, notes_r = [], []
+            for run in r.get("runs") or []:
+                a, b = int(run["start"]), int(run["end"])
+                ax, ay = float(run["start_x"]), float(run["start_y"])
+                bx = run.get("end_x")
+                by = run.get("end_y")
+                cur = (ax, ay)
+                got.append({"frame": a, "x": ax, "y": ay, "score": 1.0, "marked": True})
+                stopped = None
+                for f in range(a + 1, b + 1):
+                    if job.cancel.is_set():
+                        break
+                    img = patmatch._gray(plate.frame(f - 1))
+                    if img is None:
+                        stopped = (f, "the frame could not be read")
+                        break
+                    hit = patmatch.match_pinned(img, patch, cur[0], cur[1],
+                                                radius=radius, offset=offset)
+                    if hit is None:
+                        stopped = (f, "your pattern box does not fit here")
+                        break
+                    moved = math.hypot(hit[0] - cur[0], hit[1] - cur[1])
+                    if hit[2] < min_match:
+                        stopped = (f, "your pattern only reaches %.2f" % hit[2])
+                        break
+                    if moved > radius:
+                        stopped = (f, "it would have to jump %.0f px" % moved)
+                        break
+                    got.append({"frame": f, "x": float(hit[0]), "y": float(hit[1]),
+                                "score": round(float(hit[2]), 4), "marked": False})
+                    cur = (float(hit[0]), float(hit[1]))
+                # The closing error: the artist marked where this run ENDS, so for once the
+                # drift over a run is a measurement rather than a guess.
+                close = None
+                run_out = [g for g in got if a <= g["frame"] <= b]
+                if bx is not None and by is not None and run_out and run_out[-1]["frame"] == b:
+                    close = math.hypot(run_out[-1]["x"] - float(bx),
+                                       run_out[-1]["y"] - float(by))
+                    # REPORTED, NOT CORRECTED, and that was measured the hard way. Closing
+                    # the run onto the artist's end mark by spreading the residual linearly
+                    # is what an artist does by hand, and it took this reference from 47/47
+                    # frames on the feature to 37/47 with ten off it. The 44 px on the third
+                    # run is not gradual drift: it is a single late mis-step, so distributing
+                    # it dragged correct mid-run frames away from the feature.
+                    #
+                    # The number is worth having anyway. It is the first honest measure of
+                    # what a run did between two verified ends, and an artist reading
+                    # "drifted 44 px" knows to look -- which is more than any correlation
+                    # score told them.
+                notes_r.append("f%d-f%d: %s%s"
+                               % (a, b,
+                                  ("stopped at f%d -- %s" % stopped) if stopped
+                                  else "reached the end",
+                                  "" if close is None else
+                                  ", drifted %.1f px from your end mark" % close))
+            tracks[tid] = got
+            notes[tid] = "; ".join(notes_r)
+            job.say("%s: %s" % (tid, notes[tid]))
+        return {"tracks": tracks, "notes": notes, "min_match": min_match,
+                "radius": radius, "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_ctrack(payload):
     """Track a seed with CoTracker as the PRIMARY engine, pinned to the artist's pattern.
 
@@ -1456,7 +1584,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
                          "/jobs/hold", "/jobs/leash", "/jobs/report",
-                         "/jobs/pin", "/jobs/ctrack", "/jobs/fix"):
+                         "/jobs/pin", "/jobs/ctrack", "/jobs/fix",
+                         "/jobs/runs"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1471,7 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
                           "hold": job_hold, "leash": job_leash,
                           "report": job_report, "pin": job_pin,
                           "ctrack": job_ctrack,
-                          "fix": job_fix}[kind](payload))
+                          "fix": job_fix, "runs": job_runs}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

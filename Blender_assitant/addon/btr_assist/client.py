@@ -233,3 +233,13 @@ def start_fix(assist_root, clip_info, requests, params=None):
     return _request(info, "/jobs/fix",
                     {"clip": clip_info, "requests": requests, "params": params or {}},
                     timeout=30.0)
+
+
+def start_runs(assist_root, clip_info, requests, params=None):
+    """Track between frames the artist marked. CPU only -- no model is loaded for this."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/runs",
+                    {"clip": clip_info, "requests": requests, "params": params or {}},
+                    timeout=30.0)
