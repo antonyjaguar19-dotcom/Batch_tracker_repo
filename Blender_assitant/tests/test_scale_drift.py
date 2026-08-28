@@ -190,10 +190,20 @@ def main():
          [(f, 0.55 + 0.1 * ((f % 3) - 1)) for f in range(1, 40)], None),
         ("one bad frame does not cut a good track",
          [(f, 0.10 if f == 10 else 0.95) for f in range(1, 20)], None),
-        # Was "two bad frames in a row". Real data moved it: the artist's own hand track
-        # has a FOUR-frame dip at a correct position, so two is not enough to mean anything.
-        ("a short dip does not cut a good track",
-         [(f, 0.10 if f in (10, 11, 12, 13) else 0.95) for f in range(1, 20)], None),
+        # This case has been rewritten once and the history matters. It began as "two bad
+        # frames in a row", then became a FOUR-frame dip to 0.10 that must NOT cut, because
+        # the artist's own correct hand track dipped to 0.132 -- measured with the RIGID
+        # matcher. `hold_check` now scores with `match_pinned`, and that same dip bottoms out
+        # at 0.807. A correct track no longer produces scores like 0.10 at all, so a test
+        # asserting that 0.10 is survivable was describing a matcher we stopped using, and it
+        # was holding `settle` at five. Five cost three wrong frames across the references.
+        #
+        # So the dip is now the one the current matcher actually produces on correct work.
+        ("the dip a CORRECT track really shows (warped matcher: 0.807) does not cut",
+         [(f, 0.81 if f in (10, 11, 12, 13) else 0.95) for f in range(1, 20)], None),
+        # And a dip that deep, with this matcher, is a track that is gone -- so it must cut.
+        ("a four-frame collapse to 0.10 IS a loss now, and cuts",
+         [(f, 0.10 if f in (10, 11, 12, 13) else 0.95) for f in range(1, 20)], 10),
         ("five bad frames in a row is the real thing",
          [(f, 0.10 if 10 <= f <= 14 else 0.95) for f in range(1, 20)], 10),
         ("gentle decline (defocus) is still the feature",

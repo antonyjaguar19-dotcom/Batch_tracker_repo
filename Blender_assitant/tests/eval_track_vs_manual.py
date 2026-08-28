@@ -87,6 +87,14 @@ def main():
                          "sidecar for a CoTracker path pinned to the artist pattern box; "
                          "blender is the tracker Blender ships. Re-acquisition across an "
                          "occlusion is the same either way")
+    ap.add_argument("--hold-settle", type=int, default=5,
+                    help="frames of failure before a cut. Five was fitted to the RIGID "
+                         "matcher, whose worst dip on a correct hand track was 0.132; the "
+                         "warped matcher bottoms out at 0.807, so the reason for five may "
+                         "have gone with it")
+    ap.add_argument("--trim", type=int, default=0,
+                    help="drop this many frames before each cut. A cut means the track was "
+                         "already off the feature before anything noticed")
     ap.add_argument("--no-pin", action="store_true",
                     help="skip registering each frame against the artist's pattern -- the "
                          "behaviour before the pin pass existed")
@@ -164,6 +172,7 @@ def main():
             time.sleep(0.4)
 
     gave_up = False
+    cuts_at = []
     cut_by_check = False
     prev_resume = seed_f
     for rnd in range(a.rounds + 1):
@@ -229,14 +238,22 @@ def main():
                 if len(tr.markers) > 1:
                     tr.markers.delete_frame(g)
             cut_by_check = True
+            cuts_at.append(int(jf))
             log("round %d: jump cut at f%d (%.0f px vs its own %.0f)" % (rnd, jf, jstep, jmed))
 
         path = [[int(m.frame), m.co[0] * w, (1.0 - m.co[1]) * h]
                 for m in tr.markers if not m.mute]
         path.sort()
         st = wait(client.start_hold(ASSIST, ci,
-                                    [{"id": "EV", "pattern": pattern, "path": path}])["id"])
+                                    [{"id": "EV", "pattern": pattern, "path": path}],
+                                    {"settle": a.hold_settle})["id"])
         lost = None
+        if os.environ.get("BTR_DUMP_HOLD"):
+            t0d = ((st.get("result") or {}).get("tracks") or [{}])[0]
+            sc = t0d.get("scores") or []
+            got = [(int(r[0]), r[1]) for r in sc if 28 <= int(r[0]) <= 42]
+            log("hold scores f28-42: " + ", ".join(
+                "f%d %s" % (f, "-" if v is None else "%.3f" % v) for f, v in got))
         if st["state"] == "done":
             t0 = ((st["result"] or {}).get("tracks") or [{}])[0]
             lost = t0.get("lost_at")
@@ -245,6 +262,7 @@ def main():
                 if len(tr.markers) > 1:
                     tr.markers.delete_frame(f)
             cut_by_check = True
+            cuts_at.append(int(lost))
             log("round %d: cut at f%d" % (rnd, lost))
         fr = live_frames(tr)
         if not fr or fr[-1] >= clip.frame_duration - 2:
@@ -309,6 +327,30 @@ def main():
             % (rnd, rr["frame"], rr.get("match_score")))
     else:
         log("ran out of rounds (%d)" % a.rounds)
+
+    # ---- retrospective trim: a cut condemns the frames just before it ----------------
+    # Measured on the artist's track3 Track.001: every wrong frame the loop produced sat in
+    # the last four before a cut. Nothing detects that at the time -- the artist's own patch
+    # scores 0.86-0.96 on frames where the feature is definitively hidden -- and the clever
+    # version does not work either: a guide anchored on the VERIFIED resume and run backward
+    # crosses the same occluder in reverse and condemns the GOOD frames just as hard
+    # (22-33 px disagreement on f28-f32, which are correct, against 23-26 px on f33-f36,
+    # which are not).
+    #
+    # So the honest rule is blunt and its cost is measured rather than argued: a cut means the
+    # track was already gone before the check noticed, so drop the last `trim` frames leading
+    # into it.
+    if a.trim and cuts_at:
+        dropped = 0
+        for cf in cuts_at:
+            for k in range(1, int(a.trim) + 1):
+                ff = cf - k
+                if len(tr.markers) <= 1:
+                    break
+                if tr.markers.find_frame(ff, exact=True) is not None:
+                    tr.markers.delete_frame(ff)
+                    dropped += 1
+        log("trimmed %d frame(s) before %d cut(s)" % (dropped, len(cuts_at)))
 
     # ---- pin every frame onto the artist's own pattern -------------------------------
     # Mirrors what the addon does at the end of a run. Without it the eval scores a loop the

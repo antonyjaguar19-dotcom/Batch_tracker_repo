@@ -251,7 +251,9 @@ def job_hold(payload):
             # that merely changed PERSPECTIVE from being cut as drift. Default on.
             scores = patmatch.hold_check(plate, patch, off, path_pts,
                                          probe_radius=float(params.get("probe_radius", 60.0)))
-            lost = patmatch.first_loss(scores, floor=floor, drop=drop)
+            lost = patmatch.first_loss(scores, floor=floor, drop=drop,
+                                       settle=int(params.get("settle",
+                                                                  patmatch.HOLD_SETTLE)))
             got = [r[1] for r in scores if r[1] is not None]
             results.append({
                 "id": r["id"],

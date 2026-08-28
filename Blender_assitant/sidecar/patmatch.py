@@ -575,8 +575,61 @@ def hold_check(plate, patch, offset, path, radius=3.0, margin_radius=120.0,
 
 
 
-def first_loss(scores, floor=0.5, drop=0.6, settle=5, head=10, look=5, min_fall=0.20,
-               ambig_margin=0.05, ambig_drop=0.85, probe_gain=0.10):
+#: A failing run is only cleared by a CONVINCING recovery, as a fraction of the track's own
+#: opening score -- not merely by a frame that scrapes over the floor.
+#:
+#: Without this the cut lands late and the frames in between are written to the file as data.
+#: Measured on the artist's track3 Track.001, at the track's own positions: f28-f32 score
+#: 0.92-0.96 and are correct, then f33 0.435 and f34 0.328 are the occluder. f35 scores 0.596
+#: -- above the 0.50 floor, and above 0.6 x 0.96 = 0.58 BY 0.016 -- so it reset the run, the
+#: cut slid from f33 to f37, and f33-f36 shipped as real samples. Four wrong frames turned on
+#: sixteen thousandths of a correlation score.
+#:
+#: 0.8 of the opening is a recovery nobody would argue with; 0.62 (what f35 managed) is not.
+CLEAR_SHARE = 0.8
+
+#: A COLLAPSE needs no second opinion. Every other trigger here requires `better_exists` --
+#: proof that a better match sits nearby -- because a feature turning towards the camera loses
+#: score without having gone anywhere, and cutting on that deleted correct work. But an
+#: occluder that resembles the pattern IS the best match in its neighbourhood, so nothing
+#: better exists, and the track is judged healthy while sitting on a sign.
+#:
+#: Measured, and the two cases do not overlap:
+#:
+#:     a feature turning towards camera, correct    worst warped score  0.81 of baseline
+#:     the occluder on track3 Track.001 at f33      0.435 against 0.99  0.44 of baseline
+#:
+#: So a fall past half of what the track was holding is a collapse, and a collapse is allowed
+#: to cut on its own. Four wrong frames on that reference hung on this.
+COLLAPSE_SHARE = 0.5
+
+
+#: Frames of failure before a cut. It was FIVE, and five was fitted to the RIGID matcher:
+#: the artist's own correct hand track dipped to 0.132 there, so anything shorter cut their
+#: own work. `hold_check` now scores with `match_pinned`, and the same dip bottoms out at
+#: 0.807 -- the reason for five went with the matcher it was measured on.
+#:
+#: Two, measured across all three references. Every wrong frame the loop produced sat in the
+#: window five was waiting through:
+#:
+#:                       settle=5              settle=2
+#:     track3 T.001      46 on, 5 OFF          45 on, 1 OFF
+#:     250-frame ref     250 on, 0 off         249 on, 0 off
+#:     ref1              46 on, 0 off          46 on, 1 OFF
+#:     total             342 on, 5 off         340 on, 2 off
+#:
+#: Three wrong frames removed for two right ones, and the trade is not symmetric: a gap is
+#: honest and 3DE solves through it, while a wrong marker has to be found by hand and
+#: corrupts the solve if it is not. Note it is NOT monotonic -- cutting earlier moves the
+#: resume, which changes everything downstream, which is why ref1 gains a bad frame while
+#: track3 loses four.
+HOLD_SETTLE = 2
+
+
+def first_loss(scores, floor=0.5, drop=0.6, settle=HOLD_SETTLE, head=10, look=5,
+               min_fall=0.20,
+               ambig_margin=0.05, ambig_drop=0.85, probe_gain=0.10,
+               clear_share=CLEAR_SHARE, collapse_share=COLLAPSE_SHARE):
     """The first frame where a track stopped being on the artist's feature.
 
     Two conditions, and the second is what keeps this honest on difficult footage. An
@@ -665,6 +718,17 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=5, head=10, look=5, min_fall=
         #
         # Guarded by the score having given way at all, so a healthy track with a marginally
         # better neighbour is left alone.
+        # A collapse first, and without asking whether anything better is nearby. See
+        # COLLAPSE_SHARE: on an occluder that matches, nothing better IS nearby, which is
+        # exactly why the other three triggers stay silent through an occlusion.
+        if s < base * collapse_share:
+            bad_run += 1
+            if first_bad is None:
+                first_bad = f
+            if bad_run >= settle:
+                return first_bad
+            continue
+
         if (gain is not None and gain > probe_gain and s < base * ambig_drop):
             bad_run += 1
             if first_bad is None:
@@ -704,6 +768,20 @@ def first_loss(scores, floor=0.5, drop=0.6, settle=5, head=10, look=5, min_fall=
             # reach the settle count. Invisible while settle was 2; fatal at 5.
             continue
         else:
+            # HYSTERESIS. A run of failing frames is only cleared by a CONVINCING recovery,
+            # not by one frame that scrapes over the threshold. Measured on the artist's
+            # track3 Track.001: f33 (0.435) and f34 (0.328) are the occluder, and f35 at
+            # 0.596 cleared both the 0.50 floor and 0.6 x 0.96 = 0.58 -- by 0.016 -- so the
+            # run reset, the cut slid from f33 to f37, and four frames of occluder shipped as
+            # data. A frame that has recovered to 62 % of what the track was holding has not
+            # recovered.
+            if bad_run and s < base * clear_share:
+                # Still failing as far as this is concerned: keep the run and keep the frame
+                # out of `recent`, for the same reason rejected frames are kept out above.
+                bad_run += 1
+                if bad_run >= settle:
+                    return first_bad
+                continue
             bad_run = 0
             first_bad = None
         # Only frames that were ACCEPTED shape the recent level, so a drift cannot quietly
