@@ -161,6 +161,31 @@ def main():
     else:
         check("every mark the artist placed is untouched", True, True)
 
+    # ---- the bug the artist hit: selecting another track ------------------------------
+    # `tracks.active` does not follow selection, so the panel showed one track's marks while
+    # they were looking at another and the operator acted on the wrong one.
+    print("")
+    other = clip.tracking.tracks.new(name="SECOND", frame=fs[0])
+    tr.select, other.select = False, True
+    check("a freshly selected track is the target",
+          om.target(clip).name if om.target(clip) else None, "SECOND")
+    check("  and it carries none of the first track's marks",
+          om.marks_for(scene, "SECOND"), [])
+    check("  so there is nothing to track on it yet",
+          om.runs_from(scene, other, w, h)[0], [])
+    tr.select, other.select = True, False
+    check("selecting the first one back targets it again",
+          om.target(clip).name if om.target(clip) else None, tr.name)
+    check("  with its marks intact", len(om.marks_for(scene, tr.name)), len(ends))
+
+    # A deleted track must not leave marks that block anything.
+    with bpy.context.temp_override(window=win, area=area, region=region,
+                                   space_data=sp, edit_movieclip=clip):
+        other.select = True
+        tr.select = False
+        gone_before = om.stale_marks(scene, clip)
+    check("no stale marks while every track exists", gone_before, [])
+
     print("")
     if FAILED:
         print("MARK MODE: FAIL -- %s" % "; ".join(FAILED))

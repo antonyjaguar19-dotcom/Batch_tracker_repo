@@ -45,6 +45,45 @@ def _clip(context):
     return getattr(sd, "clip", None)
 
 
+def target(clip):
+    """The track the artist means, which is NOT always `tracks.active`.
+
+    `active` does not follow selection. Measured directly: with two tracks A and B, setting
+    `A.select = True` and `B.select = False` leaves `tracks.active` pointing at B. Reading
+    `active` therefore showed one track's marks while the artist was looking at another, and
+    the Track button acted on the wrong one -- which is exactly the trap this reports as
+    "the old frames won't let me".
+
+    So: the active track only when it is actually selected, otherwise the single selected
+    track, otherwise fall back to active so the panel still has something to say.
+    """
+    if clip is None:
+        return None
+    tracks = (clip.tracking.objects.active.tracks
+              if clip.tracking.objects.active else clip.tracking.tracks)
+    act = tracks.active
+    sel = [t for t in tracks if t.select]
+    if act is not None and act.select:
+        return act
+    if len(sel) == 1:
+        return sel[0]
+    return act
+
+
+def stale_marks(scene, clip):
+    """Marks whose track no longer exists -- a rename or a delete leaves them behind.
+
+    Not purged automatically: a rename would silently destroy work the artist did by hand.
+    Shown instead, with a button, so removing them is their decision.
+    """
+    if clip is None:
+        return []
+    tracks = (clip.tracking.objects.active.tracks
+              if clip.tracking.objects.active else clip.tracking.tracks)
+    have = {t.name for t in tracks}
+    return sorted({m.track for m in scene.btr_marks if m.track not in have})
+
+
 class BtrMark(bpy.types.PropertyGroup):
     """One frame the artist marked, on one track.
 
@@ -94,20 +133,30 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
     action: EnumProperty(
         items=(("ADD", "Mark", "Mark the current frame"),
                ("DROP", "Unmark", "Remove the mark on the current frame"),
-               ("CLEAR", "Clear", "Remove every mark on this track")),
+               ("CLEAR", "Clear", "Remove every mark on this track"),
+               ("STALE", "Clear stale", "Remove marks whose track no longer exists")),
         default="ADD")
 
     @classmethod
     def poll(cls, context):
         clip = _clip(context)
-        return clip is not None and clip.tracking.tracks.active is not None
+        return clip is not None and target(clip) is not None
 
     def execute(self, context):
         clip = _clip(context)
-        tr = clip.tracking.tracks.active
+        tr = target(clip)
         scene = context.scene
         f = int(scene.frame_current)
         w, h = clip.size
+
+        if self.action == "STALE":
+            gone = stale_marks(scene, clip)
+            for i in reversed([i for i, m in enumerate(scene.btr_marks)
+                               if m.track in gone]):
+                scene.btr_marks.remove(i)
+            self.report({"INFO"}, "cleared marks for %d track(s) that no longer exist"
+                        % len(gone))
+            return {"FINISHED"}
 
         if self.action == "CLEAR":
             for i in reversed([i for i, m in enumerate(scene.btr_marks)
@@ -181,12 +230,12 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         clip = _clip(context)
         if clip is None:
             return False
-        tr = clip.tracking.tracks.active
+        tr = target(clip)
         return tr is not None and len(marks_for(context.scene, tr.name)) >= 2
 
     def execute(self, context):
         clip = _clip(context)
-        tr = clip.tracking.tracks.active
+        tr = target(clip)
         w, h = clip.size
         runs, fs = runs_from(context.scene, tr, w, h)
         if not runs:

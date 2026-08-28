@@ -267,12 +267,21 @@ class CLIP_PT_btr_mark(_Base):
         from . import ops_mark
         layout = self.layout
         clip = getattr(context.space_data, "clip", None)
-        tr = clip.tracking.tracks.active if clip else None
+        tr = ops_mark.target(clip)
         if tr is None:
             layout.label(text="Select a track first", icon="INFO")
             return
 
+        # ALWAYS name it. `tracks.active` does not follow selection, so "which track am I
+        # marking" is a real question and the answer used to be invisible.
+        layout.label(text="Marking: %s" % tr.name, icon="TRACKING")
         fs = ops_mark.marks_for(context.scene, tr.name)
+        gone = ops_mark.stale_marks(context.scene, clip)
+        if gone:
+            row = layout.row()
+            row.label(text="%d deleted/renamed track(s) still hold marks" % len(gone),
+                      icon="ERROR")
+            row.operator("clip.btr_mark", text="Clear stale").action = "STALE"
         col = layout.column(align=True)
         col.scale_y = 1.2
         col.operator("clip.btr_mark", text="Mark this frame",
