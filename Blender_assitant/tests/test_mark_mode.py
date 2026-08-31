@@ -178,6 +178,55 @@ def main():
     check("the seed the artist placed is untouched",
           math.hypot(x0 - truth[runs[0][0]][0], y0 - truth[runs[0][0]][1]) < 0.01, True)
 
+    # ---- what each mark MEANS ----------------------------------------------------------
+    # Marks used to be a bare list of frames paired by position, so one missing mark shifted
+    # every run after it and nothing on screen said which frame had been read as which.
+    print("")
+    scene.btr_marks.clear()
+
+    def put(name, *marks):
+        for f, kind in marks:
+            mk = scene.btr_marks.add()
+            mk.track, mk.frame = name, int(f)
+            if kind:
+                mk.kind = kind
+
+    put(tr.name, (1, "START"), (14, "END"), (25, "START"), (32, "END"))
+    check("explicit kinds pair into the artist's own stretches",
+          om.runs(scene, tr.name)[0], [(1, 14), (25, 32)])
+    check("  with nothing to complain about", om.runs(scene, tr.name)[1], [])
+
+    scene.btr_marks.clear()
+    put(tr.name, (1, None), (14, None), (25, None), (32, None))
+    check("marks saved before kinds existed still read as they did",
+          om.runs(scene, tr.name)[0], [(1, 14), (25, 32)])
+
+    # The failure that used to be silent: a forgotten END. By position this reads f1-f14 and
+    # f25-f32 -- tracking straight across the occlusion and stopping inside the next stretch.
+    scene.btr_marks.clear()
+    put(tr.name, (1, "START"), (14, "END"), (25, "START"), (32, "START"))
+    pairs, problems = om.runs(scene, tr.name)
+    check("a forgotten end does not shift the runs after it", pairs, [(1, 14)])
+    # Two complaints for one mistake, and both are facts: f25 was never closed, and f32 is
+    # now hanging open too. Naming the frames is the point -- "invalid" would not tell the
+    # artist which of the four marks to fix.
+    check("  and the frames are named", all("f25" in problems[0]
+                                            for _ in [0]) and "f32" in problems[-1], True)
+    for msg in problems:
+        print("[mark]   says: %s" % msg)
+
+    scene.btr_marks.clear()
+    put(tr.name, (14, "END"), (25, "START"), (32, "END"))
+    pairs, problems = om.runs(scene, tr.name)
+    check("an end with no start is reported, not paired", pairs, [(25, 32)])
+    check("  and named too", len(problems) == 1 and "f14" in problems[0], True)
+    print("[mark]   says: %s" % problems[0])
+
+    scene.btr_marks.clear()
+    for f in ends:
+        mk = scene.btr_marks.add()
+        mk.track, mk.frame = tr.name, int(f)
+
     # ---- the bug the artist hit: selecting another track ------------------------------
     # `tracks.active` does not follow selection, so the panel showed one track's marks while
     # they were looking at another and the operator acted on the wrong one.

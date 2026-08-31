@@ -18,6 +18,8 @@ and makes the whole addon look broken when only a label is. `tests/test_panels_d
 calls each of these against the installed build.
 """
 
+import re
+
 import bpy
 
 from . import prefs, three_de, track_core
@@ -253,6 +255,15 @@ class CLIP_PT_btr_opts(_Base):
         row.prop(p, "confirm_only_occluded", text="Only when hidden")
 
 
+def _frames_named(msg):
+    """The frame numbers a problem message is about, so the rows it names can be flagged.
+
+    Read back out of the text rather than carried alongside it: the message is the thing the
+    artist reads, and a second channel that can disagree with it is worse than parsing.
+    """
+    return {int(n) for n in re.findall(r"f(\d+)", msg)}
+
+
 class CLIP_PT_btr_mark(_Base):
     """Mark mode: the artist says where the feature is visible, the tool only tracks.
 
@@ -284,10 +295,15 @@ class CLIP_PT_btr_mark(_Base):
             row.label(text="%d deleted/renamed track(s) still hold marks" % len(gone),
                       icon="ERROR")
             row.operator("clip.btr_mark", text="Clear stale").action = "STALE"
+        # Two buttons, not one. The kind is recorded WITH the mark, so what a frame means
+        # is something the artist states rather than something they have to reconstruct by
+        # counting the list in pairs.
         col = layout.column(align=True)
         col.scale_y = 1.2
-        col.operator("clip.btr_mark", text="Mark this frame",
-                     icon="MARKER_HLT").action = "ADD"
+        col.operator("clip.btr_mark", text="Appears here (start)",
+                     icon="TRIA_RIGHT").action = "START"
+        col.operator("clip.btr_mark", text="Last visible frame (end)",
+                     icon="TRIA_LEFT").action = "END"
         row = layout.row(align=True)
         row.operator("clip.btr_mark", text="Unmark").action = "DROP"
         row.operator("clip.btr_mark", text="Clear").action = "CLEAR"
@@ -296,21 +312,31 @@ class CLIP_PT_btr_mark(_Base):
         layout.operator("clip.btr_mark_guess", text="Guess where it went", icon="VIEWZOOM")
 
         if not fs:
-            layout.label(text="Mark the LAST visible frame, then the FIRST frame it is back.")
-            layout.label(text="Drag each mark onto the feature.")
+            layout.label(text="Seed ONE marker, then mark where it appears and disappears.")
+            layout.label(text="CoTracker finds it again; Blender tracks between the marks.")
             return
+
+        pairs, problems = ops_mark.runs(context.scene, tr.name)
+        now = int(context.scene.frame_current)
         box = layout.box()
-        box.label(text="%s: %s" % (tr.name, ", ".join("f%d" % f for f in fs)))
-        if len(fs) % 2:
-            # Saying which half of the pair is missing beats "invalid": the artist is mid-way
-            # through a deliberate two-step and needs to know which step.
-            box.label(text="one end of a stretch is unmarked", icon="ERROR")
-        else:
-            box.label(text="%d stretch(es) to track" % (len(fs) // 2), icon="CHECKMARK")
-        box.label(text="drag each mark ONTO the feature -- that is the re-acquisition")
+        # Every mark, named. A bare list of frame numbers cannot say which is which, and
+        # reading it wrong is what made a run track across the occlusion.
+        for f, kind in ops_mark.marked(context.scene, tr.name):
+            row = box.row(align=True)
+            row.alert = any(f in _frames_named(msg) for msg in problems)
+            row.label(text="f%-5d %s" % (f, "appears" if kind == "START" else "last visible"),
+                      icon=("TRIA_RIGHT" if kind == "START" else "TRIA_LEFT"))
+            if f == now:
+                row.label(text="", icon="LAYER_ACTIVE")
+        for msg in problems:
+            box.label(text=msg, icon="ERROR")
+        if pairs:
+            box.label(text="%d stretch(es) to track: %s"
+                      % (len(pairs), ", ".join("f%d-f%d" % p for p in pairs)),
+                      icon="CHECKMARK")
         row = layout.row()
         row.scale_y = 1.3
-        row.enabled = len(fs) >= 2 and len(fs) % 2 == 0
+        row.enabled = bool(pairs)
         row.operator("clip.btr_track_runs", text="Track the marked runs", icon="TRACKING")
 
 

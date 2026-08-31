@@ -12,17 +12,21 @@ And knowing WHEN it comes back is not enough on its own. Given the artist's exac
 frames, a search still landed on the wrong feature in two of their three gaps, scoring 0.89
 and 0.94 -- confident, and wrong, with nothing downstream able to tell.
 
-So this mode stops guessing. The artist marks the corners of each visible stretch and drags
-each mark onto the feature; consecutive marks are the runs, and every run has a verified
-start AND a verified end.
+So this mode stops guessing WHEN. The artist marks the frames -- the last one where the
+feature is visible, the first one where it is back -- and each mark records WHICH of the two
+it is, so the pairing is something they stated rather than something inferred from the order
+they happened to press the button in.
 
-Two things follow, and both are measured rather than argued:
+From there each engine does the one thing it is measured to be good at:
 
-  * **No re-acquisition anywhere.** The one decision the tool cannot make is no longer asked.
-  * **No neural model.** WITHIN a run, pattern-only and CoTracker+pin scored identically to
-    two decimals against the artist's hand track -- 0.1 px absolute, 0.12 px motion. The
-    guide only ever earned its keep crossing occlusions, and there are none left to cross.
-    Runs track on the CPU with the artist's own patch.
+  * **CoTracker finds it** at the first frame of every later run. It is asked WHERE, never
+    WHEN, and never on a frame the artist did not name.
+  * **Blender tracks the runs**, with Blender's own settings, so a run is the track the
+    artist would have got by hand.
+
+Measured on their `track3` Track.001 -- one seed at f1, six frame numbers, nothing dragged --
+44 of their 47 frames land on the feature, worst 2.5 px, with nothing planted inside an
+occlusion. The two re-acquisitions came back 2.5 px and 1.3 px off.
 
 The end mark also makes drift MEASURABLE for the first time. A run either arrives where the
 artist said it would or it does not, and the closing error is reported per run instead of
@@ -85,54 +89,119 @@ def stale_marks(scene, clip):
     return sorted({m.track for m in scene.btr_marks if m.track not in have})
 
 
+#: What a mark means. `AUTO` is not a choice the artist can make -- it is what a mark saved
+#: before marks had a kind reads back as, and it is resolved by position so those scenes keep
+#: behaving exactly as they did.
+KIND_ITEMS = (
+    ("AUTO", "Auto", "Saved before marks had a kind; read as start/end by position"),
+    ("START", "Appears", "The FIRST frame the feature is visible again -- a run begins here"),
+    ("END", "Last visible", "The LAST frame the feature is visible -- a run ends here"),
+)
+
+
 class BtrMark(bpy.types.PropertyGroup):
-    """One frame the artist marked, on one track.
+    """One frame the artist marked, on one track, and what that frame MEANS.
 
     Kept on the SCENE rather than the track because `MovieTrackingTrack` accepts no ID
     properties -- the same limitation `track_core` records for its own per-track state.
+
+    `kind` exists because a bare list of frames cannot be read back. Marks were paired by
+    POSITION -- first with second, third with fourth -- so a single mark placed out of order,
+    or one the artist forgot, silently shifted every run after it: the tool would then track
+    across the occlusion and stop inside the visible stretch, with nothing on screen saying
+    which frame it had understood as which.
     """
 
     track: StringProperty(name="Track")
     frame: IntProperty(name="Frame")
+    kind: EnumProperty(name="Means", items=KIND_ITEMS, default="AUTO")
 
 
 def marks_for(scene, name):
     return sorted((m.frame for m in scene.btr_marks if m.track == name))
 
 
-def runs_from(scene, track, w, h):
-    """Consecutive marks, paired into runs, with the artist's position at each end.
+def marked(scene, name):
+    """Every mark on one track as (frame, kind), in frame order, with AUTO resolved.
 
-    Pairs and not a continuous chain: mark 1 to mark 2 is a visible stretch, mark 2 to mark 3
-    is the occlusion, mark 3 to mark 4 is visible again. Taking every adjacent pair would
-    tell the assistant to track THROUGH the very gaps the marks exist to declare.
+    An AUTO mark is resolved the way marks were read before they had a kind: by its position
+    among that track's marks, even = start, odd = end. Mixed data is therefore stable rather
+    than clever -- an old scene reads as it always did, and any mark the artist has since set
+    explicitly keeps what they said.
     """
-    fs = [f for f in marks_for(scene, track.name)
-          if track.markers.find_frame(f, exact=True) is not None]
+    ms = sorted((m for m in scene.btr_marks if m.track == name), key=lambda m: m.frame)
     out = []
-    for a, b in zip(fs[0::2], fs[1::2]):
+    for i, m in enumerate(ms):
+        k = m.kind
+        out.append((int(m.frame), k if k in ("START", "END")
+                    else ("START" if i % 2 == 0 else "END")))
+    return out
+
+
+def runs(scene, name):
+    """Marks paired into runs, plus every reason a pair could not be made.
+
+    A START opens a run and the next END closes it. Not adjacent pairs: mark 1 to mark 2 is a
+    visible stretch, mark 2 to mark 3 is the OCCLUSION, mark 3 to mark 4 is visible again.
+    Pairing every neighbour would tell the assistant to track through the very gaps the marks
+    exist to declare.
+
+    Problems are returned rather than raised, and named by frame, because the artist is
+    usually mid-way through a deliberate two-step and needs to know which step is missing --
+    not that their marks are "invalid".
+    """
+    pairs, problems, open_at = [], [], None
+    for f, kind in marked(scene, name):
+        if kind == "START":
+            if open_at is not None:
+                problems.append("f%d and f%d are both starts -- the stretch that began at "
+                                "f%d was never ended" % (open_at, f, open_at))
+            open_at = f
+        else:
+            if open_at is None:
+                problems.append("f%d ends a stretch that never started" % f)
+                continue
+            if f <= open_at:
+                problems.append("f%d ends before it starts (f%d)" % (f, open_at))
+                open_at = None
+                continue
+            pairs.append((open_at, f))
+            open_at = None
+    if open_at is not None:
+        problems.append("f%d starts a stretch with no end marked" % open_at)
+    return pairs, problems
+
+
+def runs_from(scene, track, w, h):
+    """`runs`, restricted to pairs whose ends both carry a marker, with their positions."""
+    pairs, _problems = runs(scene, track.name)
+    out = []
+    for a, b in pairs:
         ma = track.markers.find_frame(a, exact=True)
         mb = track.markers.find_frame(b, exact=True)
-        if ma is None or mb is None or b <= a:
+        if ma is None or mb is None:
             continue
         ax, ay = marker_to_image_px(ma, w, h)
         bx, by = marker_to_image_px(mb, w, h)
         out.append({"start": int(a), "end": int(b),
                     "start_x": ax, "start_y": ay, "end_x": bx, "end_y": by})
-    return out, fs
+    return out, marks_for(scene, track.name)
 
 
 class CLIP_OT_btr_mark(bpy.types.Operator):
     bl_idname = "clip.btr_mark"
     bl_label = "Mark this frame"
-    bl_description = ("Mark the current frame on the selected track as a run boundary, and "
-                      "put a marker there for you to drag onto the feature. Mark the LAST "
-                      "frame it is visible before something covers it, then the FIRST frame "
-                      "it is back. Pairs of marks are the stretches the assistant will track")
+    bl_description = ("Mark the current frame on the selected track as the START or the END "
+                      "of a visible stretch. Which one is recorded WITH the mark, so the "
+                      "panel can show you what each frame means instead of leaving you to "
+                      "count them in pairs")
     bl_options = {"REGISTER", "UNDO"}
 
     action: EnumProperty(
-        items=(("ADD", "Mark", "Mark the current frame"),
+        items=(("START", "Appears", "The FIRST frame it is visible again -- start a run"),
+               ("END", "Last visible", "The LAST frame it is visible -- end the run"),
+               ("ADD", "Mark", "Mark the current frame, taking start or end from what is "
+                               "already marked"),
                ("DROP", "Unmark", "Remove the mark on the current frame"),
                ("CLEAR", "Clear", "Remove every mark on this track"),
                ("STALE", "Clear stale", "Remove marks whose track no longer exists")),
@@ -175,15 +244,29 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
                         "unmarked f%d" % f if hit else "nothing marked on f%d" % f)
             return {"FINISHED"}
 
-        if any(m.track == tr.name and m.frame == f for m in scene.btr_marks):
-            self.report({"WARNING"}, "f%d is already marked" % f)
+        have = marked(scene, tr.name)
+        clash = [k for g, k in have if g == f]
+        if clash:
+            self.report({"WARNING"}, "f%d is already marked as %s"
+                        % (f, "the start" if clash[0] == "START" else "the end"))
             return {"CANCELLED"}
+
+        if self.action == "ADD":
+            # No kind asked for. Whatever the marks BEFORE this frame leave open decides it,
+            # which is what the artist means by pressing one button twice -- and unlike
+            # counting the whole list in pairs, inserting a mark in the middle now gets the
+            # kind the surrounding marks imply rather than flipping every mark after it.
+            before = [k for g, k in have if g < f]
+            kind = "END" if (before and before[-1] == "START") else "START"
+        else:
+            kind = self.action
 
         m = tr.markers.find_frame(f, exact=True)
         if m is None:
-            # Put a marker here to drag. It starts at the nearest existing position, which is
-            # a starting point and not a claim -- the artist moves it onto the feature, and
-            # that drag is the whole value of the mark.
+            # A marker so the frame is visible in the dope sheet at all. Its POSITION is not
+            # a claim and nothing reads it: a run that starts here is placed by CoTracker,
+            # and one that ends here is tracked into by Blender. The artist may drag it, and
+            # need not.
             fs = live_frames(tr)
             near = min(fs, key=lambda g: abs(g - f)) if fs else None
             src = tr.markers.find_frame(near, exact=True) if near is not None else None
@@ -197,12 +280,13 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
             m.search_min, m.search_max = src.search_min, src.search_max
 
         mk = scene.btr_marks.add()
-        mk.track, mk.frame = tr.name, f
-        n = len(marks_for(scene, tr.name))
+        mk.track, mk.frame, mk.kind = tr.name, f, kind
+        pairs, problems = runs(scene, tr.name)
+        word = "APPEARS at" if kind == "START" else "LAST VISIBLE on"
         self.report({"INFO"},
-                    "marked f%d on %s (%d mark%s) -- drag it onto the feature%s"
-                    % (f, tr.name, n, "" if n == 1 else "s",
-                       "" if n % 2 == 0 else "; mark the far end of this stretch next"))
+                    "%s %s f%d -- %d stretch(es)%s"
+                    % (tr.name, word, f, len(pairs),
+                       "; " + problems[-1] if problems else ""))
         return {"FINISHED"}
 
 
@@ -263,7 +347,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         if clip is None:
             return False
         tr = target(clip)
-        return tr is not None and len(marks_for(context.scene, tr.name)) >= 2
+        return tr is not None and bool(runs(context.scene, tr.name)[0])
 
     def _guess(self, context, clip, tr, root, pattern, anchor_f, anchor_px, frame):
         """CoTracker's best position for `frame`. None if it cannot offer one."""
@@ -295,13 +379,17 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         tr = target(clip)
         scene = context.scene
         w, h = clip.size
-        fs = [f for f in marks_for(scene, tr.name)]
-        pairs = list(zip(fs[0::2], fs[1::2]))
+        pairs, problems = runs(scene, tr.name)
         if not pairs:
-            self.report({"WARNING"},
-                        "%d mark(s) on %s -- they come in PAIRS, one for each end of a "
-                        "visible stretch" % (len(fs), tr.name))
+            self.report({"WARNING"}, "%s: %s" % (
+                tr.name, problems[0] if problems else "nothing marked"))
             return {"CANCELLED"}
+        if problems:
+            # Tracked anyway, because the pairs that ARE complete are worth having -- but
+            # said out loud, since an unpaired mark is a stretch that will not be tracked and
+            # that is invisible in the result.
+            self.report({"WARNING"}, "%s (tracking the %d complete stretch(es))"
+                        % (problems[0], len(pairs)))
 
         live = live_frames(tr)
         if not live:

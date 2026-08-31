@@ -143,8 +143,18 @@ def main():
             # is the only thing that makes the Keep/Drop box draw.
             m = tr.markers.insert_frame(10, co=(0.55, 0.55))
             m.mute = True
+        # Marks, because Mark mode's list of "what does this frame mean" is a loop over data
+        # no other state provides -- without this the panel drew its empty branch and nothing
+        # else. One mark is deliberately left unpaired so the ERROR row draws too.
+        marks = bpy.context.scene.btr_marks
+        marks.clear()
+        if state == "marked":
+            tr.select = True
+            for f, kind in ((1, "START"), (14, "END"), (25, "START")):
+                mk = marks.add()
+                mk.track, mk.frame, mk.kind = tr.name, f, kind
 
-    STATES = ("empty", "unselected", "selected", "unread")
+    STATES = ("empty", "unselected", "selected", "unread", "marked")
 
     failures = []
     with bpy.context.temp_override(window=win, area=area, region=region,
