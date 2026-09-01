@@ -108,13 +108,28 @@ class StubOperator:
         if op is None:
             raise ValueError("no such operator: %s" % idname)
         rna = op.get_rna_type()
-        object.__setattr__(self, "_props",
-                           {p.identifier for p in rna.properties})
+        # name -> the set of valid identifiers for an enum, or None for anything else.
+        props = {}
+        for pr in rna.properties:
+            items = getattr(pr, "enum_items", None)
+            props[pr.identifier] = ({i.identifier for i in items}
+                                    if items is not None and len(items) else None)
+        object.__setattr__(self, "_props", props)
 
     def __setattr__(self, name, value):
-        if name not in object.__getattribute__(self, "_props"):
+        props = object.__getattribute__(self, "_props")
+        if name not in props:
             raise AttributeError("%s has no property %r"
                                  % (object.__getattribute__(self, "_id"), name))
+        # And the VALUE, for an enum. Checking only that the property exists is what let
+        # `op.motion_model = ""` draw green here and raise `enum "" not found` in the
+        # artist's session: Blender DROPS an empty identifier from an operator's enum, while
+        # the preference the panel copied it from kept one.
+        allowed = props[name]
+        if allowed is not None and value not in allowed:
+            raise ValueError("%s.%s has no item %r (has %s)"
+                             % (object.__getattribute__(self, "_id"), name, value,
+                                ", ".join(sorted(allowed))))
         object.__setattr__(self, name, value)
 
 

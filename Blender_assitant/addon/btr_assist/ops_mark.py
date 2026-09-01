@@ -382,8 +382,11 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
 
     motion_model: EnumProperty(
         name="Motion model",
-        items=(("", "Leave as it is", "Whatever the marker already carries -- Blender's own "
-                                      "default is Loc"),
+        # "KEEP" and not "" -- Blender DROPS an empty identifier from an operator's enum, so
+        # the panel's `op.motion_model = ""` raised `enum "" not found`. The preference kept
+        # it, which is what made the two disagree.
+        items=(("KEEP", "Leave as it is", "Whatever the marker already carries -- Blender's "
+                                          "own default is Loc"),
                ("Loc", "Location", "Position only. Blender's default, and it cannot follow a "
                                    "feature that TURNS"),
                ("LocRot", "Location & rotation", "Position and rotation"),
@@ -392,7 +395,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 "Position, rotation and size -- what a real feature does as the camera moves"),
                ("Affine", "Affine", "Also shear. The most freedom short of perspective"),
                ("Perspective", "Perspective", "Full planar warp")),
-        default="",
+        default="KEEP",
         description="How the pattern box is allowed to move. Blender's default is Loc, which "
                     "never turns the box -- so a feature that rotates walks out of it and "
                     "the track dies, which is why rotating the box by hand rescues it. "
@@ -556,12 +559,13 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         # size. So the pair is kept together, and the better pair is the one that is also
         # Blender's own.
         paired = []      # a motion model declined because of the matching mode
+        want = "" if self.motion_model in ("", "KEEP") else self.motion_model
         model = ""
-        if self.motion_model and self.blender_tracking:
-            model = self.motion_model
+        if want and self.blender_tracking:
+            model = want
             tr.motion_model = model
-        elif self.motion_model and not self.blender_tracking:
-            paired.append(self.motion_model)
+        elif want and not self.blender_tracking:
+            paired.append(want)
 
         # A box that may SCALE is clamped. `Loc` cannot resize the box, so the value is inert
         # there and this stays byte-identical to the Blender-default path.

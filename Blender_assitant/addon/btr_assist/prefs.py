@@ -78,7 +78,10 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                     "is CoTracker either way")
     mark_motion_model: EnumProperty(
         name="Mark mode motion model",
-        items=(("", "Leave as it is", "Whatever the marker already carries (Blender: Loc)"),
+        # Must match the operator's identifiers exactly -- the panel copies this straight
+        # onto it, and Blender drops an empty identifier from an operator enum.
+        items=(("KEEP", "Leave as it is",
+                "Whatever the marker already carries (Blender: Loc)"),
                ("Loc", "Location", "Position only -- Blender's default; cannot follow a "
                                    "feature that turns"),
                ("LocRot", "Location & rotation", "Position and rotation"),
@@ -87,7 +90,7 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                 "Position, rotation and size -- what a real feature does"),
                ("Affine", "Affine", "Also shear"),
                ("Perspective", "Perspective", "Full planar warp")),
-        default="",
+        default="KEEP",
         description="How a marked run's pattern box may move. Blender's own default is Loc, "
                     "which never turns the box -- so a feature that ROTATES walks out of it "
                     "and the run dies, which is why rotating the box by hand rescues it. "
