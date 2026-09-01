@@ -348,7 +348,19 @@ class CLIP_PT_btr_mark(_Base):
         row = layout.row()
         row.scale_y = 1.3
         row.enabled = bool(pairs)
-        row.operator("clip.btr_track_runs", text="Track the marked runs", icon="TRACKING")
+        op = row.operator("clip.btr_track_runs", text="Track the marked runs",
+                          icon="TRACKING")
+        p = prefs.get(context)
+        if p is not None:
+            # One value, two places: the preference is what the panel shows and what the
+            # operator is launched with, so the artist cannot be looking at one setting while
+            # the run uses another.
+            op.blender_tracking = p.blender_tracking
+        # Right under the button it changes, because on a long range it is the difference
+        # between Blender tracking the run and CoTracker rebuilding it -- measured on the
+        # artist's own f1-f312 reference at median 1.28 px against 4.24.
+        if p is not None:
+            layout.prop(p, "blender_tracking", text="Track with Blender's own settings")
 
 
 class CLIP_PT_btr_3de(_Base):

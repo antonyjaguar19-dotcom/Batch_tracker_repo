@@ -89,11 +89,19 @@ def stale_marks(scene, clip):
     return sorted({m.track for m in scene.btr_marks if m.track not in have})
 
 
-#: How many times Blender and CoTracker may take turns inside one run. Each round is one
-#: Blender pass plus at most one CoTracker chain, and a round that adds nothing ends the run
-#: -- so this is a guard against a pathological plate, not a normal working limit. A run that
-#: needs more than this is telling the artist their marks disagree with the plate.
-MAX_ROUNDS = 24
+def max_rounds(a, b):
+    """How many times Blender and CoTracker may take turns inside one run.
+
+    Every round either advances the run by at least one frame or ends it -- a round that adds
+    nothing breaks -- so a run can need at most one round per frame and the loop terminates
+    without any fixed cap. This is purely a guard against a pathological plate.
+
+    It was a flat 24, and that number became the answer: a run marked f1 to the end of the
+    shot came back at exactly 49 frames, because the two engines were advancing about two
+    frames per round and ran out of turns rather than out of plate. The artist's marks are
+    the specification; a constant in this file is not allowed to overrule them.
+    """
+    return max(8, int(b) - int(a) + 2)
 
 #: What a mark means. `AUTO` is not a choice the artist can make -- it is what a mark saved
 #: before marks had a kind reads back as, and it is resolved by position so those scenes keep
@@ -372,6 +380,14 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                       "than silent")
     bl_options = {"REGISTER", "UNDO"}
 
+    blender_tracking: BoolProperty(
+        name="Track with Blender's own settings", default=True,
+        description="Track the runs exactly as Blender would. Turning it OFF uses this "
+                    "addon's measured configuration -- PREV_FRAME matching with "
+                    "normalization -- which survives 2.6-2.9x longer on a real plate, so "
+                    "Blender carries more of the run and less is left to be filled in. On a "
+                    "312-frame range that is the difference between most frames being "
+                    "TRACKED and most being reconstructed")
     finish_runs: BoolProperty(
         name="Finish every marked run", default=True,
         description="You marked the frame the feature is last visible, so it IS visible "
@@ -506,8 +522,18 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         # Blender's tracker, untouched. Mark mode's whole claim is that the runs are what
         # Blender would have produced and CoTracker only says WHERE a run restarts.
         opts = track_core.Opts(leash=0.0, motion_model="", scale_clamp=0.0,
-                               edge_stop=True, blender_defaults=True)
+                               edge_stop=True,
+                               blender_defaults=bool(self.blender_tracking))
         track_core.apply_settings(clip, opts)
+        if not self.blender_tracking:
+            # `apply_settings` writes the CLIP's defaults, which are read when a track is
+            # created -- so a marker the artist placed earlier keeps whatever it was made
+            # with and never sees this configuration. ops_assist records the same trap.
+            tr.pattern_match = opts.pattern_match
+            tr.use_brute = True
+            tr.use_normalization = True
+            tr.correlation_min = opts.correlation
+            tr.frames_limit = 0
 
         notes, started, filled = [], [], []
         worst_id = 1.0
@@ -548,7 +574,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             # followed stopped at the first frame it could not match -- with 178 frames of
             # the artist's own range left, and nothing trying again.
             reached, added, blocked = int(a), 0, None
-            for _round in range(MAX_ROUNDS):
+            for _round in range(max_rounds(a, b)):
                 rec = [{"t": tr, "id": tr.name, "kind": "", "alive": True, "w": w, "h": h,
                         "seed_frame": int(reached), "seed_pat": (pw, ph)}]
                 # n_frames = b, so the last step is b-1 -> b. Passing b+1 would carry the
@@ -639,6 +665,9 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         # A run that came back short is the thing the artist most needs told, and it used to
         # be buried in a note behind whatever else happened. They marked that range: the
         # frames are theirs, and a hole in it is not a detail.
+        rebuilt = sum(n for _a, _b, n, _i in filled)
+        tracked = sum(len([f for f in live_frames(tr) if a <= f <= b])
+                      for a, b in pairs) - rebuilt
         short = [(a, b, got) for a, b, got in
                  [(a, b, len([f for f in live_frames(tr) if a <= f <= b]))
                   for a, b in pairs]
@@ -658,6 +687,27 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                             "short: %s -- %s"
                             % (", ".join("f%d-f%d got %d of %d" % (a, b, got, b - a + 1)
                                          for a, b, got in short), msg))
+        elif rebuilt > tracked:
+            # More of the artist's range was RECONSTRUCTED than tracked. That happens with
+            # Blender's own KEYFRAME matching on a long range -- it compares against the seed
+            # patch forever, so it dies as the feature turns and the fill takes over. The fill
+            # walks with a rolling template, and a rolling template drifts.
+            #
+            # Measured on Track.004 of the artist's own reference, f1-f312 marked end to end,
+            # the same seed and box:
+            #
+            #     Blender's settings   312/312   129 s   median 4.24 px  p90 14.6  max 17.9
+            #     this addon's config  312/312    10 s   median 1.28 px  p90  6.1  max  9.0
+            #
+            # The second tracked all 312 frames in one pass and filled nothing. Their choice,
+            # not ours -- they asked for Blender's tracker on purpose -- but they cannot
+            # choose what they are not told.
+            self.report({"WARNING"},
+                        "%d of %d frames were rebuilt rather than tracked, which drifts. "
+                        "Blender's own matching compares to your seed frame forever and "
+                        "gives out as the feature turns -- untick \"Track with Blender's own "
+                        "settings\" to let it carry the whole run. %s"
+                        % (rebuilt, rebuilt + tracked, msg))
         elif low:
             self.report({"WARNING"},
                         "CoTracker's landing looks wrong at %s -- check it, or drag the mark "
