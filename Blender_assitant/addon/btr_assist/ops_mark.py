@@ -380,6 +380,26 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                       "than silent")
     bl_options = {"REGISTER", "UNDO"}
 
+    motion_model: EnumProperty(
+        name="Motion model",
+        items=(("", "Leave as it is", "Whatever the marker already carries -- Blender's own "
+                                      "default is Loc"),
+               ("Loc", "Location", "Position only. Blender's default, and it cannot follow a "
+                                   "feature that TURNS"),
+               ("LocRot", "Location & rotation", "Position and rotation"),
+               ("LocScale", "Location & scale", "Position and size"),
+               ("LocRotScale", "Location, rotation & scale",
+                "Position, rotation and size -- what a real feature does as the camera moves"),
+               ("Affine", "Affine", "Also shear. The most freedom short of perspective"),
+               ("Perspective", "Perspective", "Full planar warp")),
+        default="",
+        description="How the pattern box is allowed to move. Blender's default is Loc, which "
+                    "never turns the box -- so a feature that rotates walks out of it and "
+                    "the track dies, which is why rotating the box by hand rescues it. "
+                    "Measured end to end on four hand-tracked references, median error "
+                    "against the artist's own track: Loc 4.24 / 5.65 / 3.53 / 1.12 px, "
+                    "LocRotScale 0.70 / 0.54 / 6.76 / 1.70. Set it to Loc for strict "
+                    "Blender parity")
     blender_tracking: BoolProperty(
         name="Track with Blender's own settings", default=True,
         description="Track the runs exactly as Blender would. Turning it OFF uses this "
@@ -519,9 +539,36 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         area = next((a for a in win.screen.areas if a.type == "CLIP_EDITOR"), None)
         region = next((r for r in area.regions if r.type == "WINDOW"), None) if area else None
         ctx = (win, area, region, clip, scene)
-        # Blender's tracker, untouched. Mark mode's whole claim is that the runs are what
-        # Blender would have produced and CoTracker only says WHERE a run restarts.
-        opts = track_core.Opts(leash=0.0, motion_model="", scale_clamp=0.0,
+        # The motion model is the one setting mark mode writes even under Blender's own
+        # defaults -- the same exception ops_assist makes for the scale watch. A model that
+        # cannot turn the box is not a preference here; it is a feature the run cannot follow,
+        # and Blender's default `Loc` never turns it.
+        #
+        # But it is chosen WITH the matching mode, not independently. PREV_FRAME re-cuts the
+        # pattern from the previous frame every step, so a box also free to turn compounds
+        # its own error. Measured end to end on Track.004 of the artist's reference:
+        #
+        #     Blender's settings (KEYFRAME) + LocRotScale     0.70 px   <- the default
+        #     addon's config     (PREV_FRAME) + Loc           1.28 px
+        #     addon's config     (PREV_FRAME) + LocRotScale  16.70 px   runaway, p90 859
+        #
+        # Clamping the box does not rescue the third -- the drift is in the rotation, not the
+        # size. So the pair is kept together, and the better pair is the one that is also
+        # Blender's own.
+        paired = []      # a motion model declined because of the matching mode
+        model = ""
+        if self.motion_model and self.blender_tracking:
+            model = self.motion_model
+            tr.motion_model = model
+        elif self.motion_model and not self.blender_tracking:
+            paired.append(self.motion_model)
+
+        # A box that may SCALE is clamped. `Loc` cannot resize the box, so the value is inert
+        # there and this stays byte-identical to the Blender-default path.
+        eff = model or getattr(tr, "motion_model", "Loc")
+        can_scale = ("Scale" in eff) or eff in ("Affine", "Perspective")
+        opts = track_core.Opts(leash=0.0, motion_model="",
+                               scale_clamp=1.6 if can_scale else 0.0,
                                edge_stop=True,
                                blender_defaults=bool(self.blender_tracking))
         track_core.apply_settings(clip, opts)
@@ -660,6 +707,10 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             msg += " | CoTracker started " + ", ".join(
                 "f%d (%s)" % (f, "no score" if sc is None else "%.2f" % sc)
                 for f, sc in started)
+        if paired:
+            msg += (" | kept the marker's own motion model: %s needs KEYFRAME matching, and "
+                    "PREV_FRAME with a turning box ran away to 16.7 px where the pair with "
+                    "KEYFRAME tracks at 0.70" % paired[0])
         print("[runs] %s: %s" % (tr.name, msg))
 
         # A run that came back short is the thing the artist most needs told, and it used to
@@ -693,21 +744,23 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             # patch forever, so it dies as the feature turns and the fill takes over. The fill
             # walks with a rolling template, and a rolling template drifts.
             #
-            # Measured on Track.004 of the artist's own reference, f1-f312 marked end to end,
-            # the same seed and box:
+            # Two things fix this and they are not equal. Measured on Track.004 of the
+            # artist's reference, f1-f312 marked end to end, same seed and box:
             #
-            #     Blender's settings   312/312   129 s   median 4.24 px  p90 14.6  max 17.9
-            #     this addon's config  312/312    10 s   median 1.28 px  p90  6.1  max  9.0
+            #     Blender's settings + Loc          median 4.24 px  p90 14.6   208 rebuilt
+            #     Blender's settings + LocRotScale  median 0.70 px  p90  8.0
+            #     addon's config     + Loc          median 1.28 px  p90  6.1
             #
-            # The second tracked all 312 frames in one pass and filled nothing. Their choice,
-            # not ours -- they asked for Blender's tracker on purpose -- but they cannot
-            # choose what they are not told.
+            # The motion model is both the bigger win and the cheaper change, so it is what
+            # this says. It is NOT applied automatically: on a shot with occlusions the same
+            # change took a reference from 47/47 frames to 14/47, because it perturbs a
+            # re-acquisition that no score can call either way. The artist knows whether
+            # their feature turns; the tool does not.
             self.report({"WARNING"},
-                        "%d of %d frames were rebuilt rather than tracked, which drifts. "
-                        "Blender's own matching compares to your seed frame forever and "
-                        "gives out as the feature turns -- untick \"Track with Blender's own "
-                        "settings\" to let it carry the whole run. %s"
-                        % (rebuilt, rebuilt + tracked, msg))
+                        "%d of %d frames were rebuilt rather than tracked, and rebuilding "
+                        "drifts. If your feature rotates, set \"Box may\" to Location, "
+                        "rotation & scale -- measured 4.24 px -> 0.70 px on a 312-frame "
+                        "reference. %s" % (rebuilt, rebuilt + tracked, msg))
         elif low:
             self.report({"WARNING"},
                         "CoTracker's landing looks wrong at %s -- check it, or drag the mark "

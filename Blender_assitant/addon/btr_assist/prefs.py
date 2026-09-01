@@ -76,6 +76,27 @@ class BtrAssistPrefs(bpy.types.AddonPreferences):
                 "Blender if the sidecar or CoTracker is unavailable")),
         description="Which engine carries a track BETWEEN occlusions. Crossing an occlusion "
                     "is CoTracker either way")
+    mark_motion_model: EnumProperty(
+        name="Mark mode motion model",
+        items=(("", "Leave as it is", "Whatever the marker already carries (Blender: Loc)"),
+               ("Loc", "Location", "Position only -- Blender's default; cannot follow a "
+                                   "feature that turns"),
+               ("LocRot", "Location & rotation", "Position and rotation"),
+               ("LocScale", "Location & scale", "Position and size"),
+               ("LocRotScale", "Location, rotation & scale",
+                "Position, rotation and size -- what a real feature does"),
+               ("Affine", "Affine", "Also shear"),
+               ("Perspective", "Perspective", "Full planar warp")),
+        default="",
+        description="How a marked run's pattern box may move. Blender's own default is Loc, "
+                    "which never turns the box -- so a feature that ROTATES walks out of it "
+                    "and the run dies, which is why rotating the box by hand rescues it. "
+                    "Set this to Location, rotation & scale for such a feature: measured on "
+                    "a 312-frame hand-tracked reference it took the median error from 4.24 "
+                    "px to 0.70. Left alone by default, because it cuts BOTH ways -- on a "
+                    "shot with occlusions to re-acquire across, the same change took a "
+                    "reference from 47/47 frames to 14/47. The re-acquisition is a coin "
+                    "flip no score can call, so perturbing it is not free")
     blender_tracking: BoolProperty(
         name="Track with Blender's own settings", default=True,
         description="Track with the same settings Blender itself uses, so a track the assistant makes is the track you would have made by hand. Turning this OFF applies this addon's own measured configuration -- PREV_FRAME matching with normalization, which survives 2.6-2.9x longer on real plates but does NOT reproduce Blender: measured 10.36 px apart over 14 frames of SH006 from the same seed")

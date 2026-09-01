@@ -356,10 +356,13 @@ class CLIP_PT_btr_mark(_Base):
             # operator is launched with, so the artist cannot be looking at one setting while
             # the run uses another.
             op.blender_tracking = p.blender_tracking
-        # Right under the button it changes, because on a long range it is the difference
-        # between Blender tracking the run and CoTracker rebuilding it -- measured on the
-        # artist's own f1-f312 reference at median 1.28 px against 4.24.
+            op.motion_model = p.mark_motion_model
+        # Right under the button they change. The model comes first: it decides whether a run
+        # survives at all. Blender's Loc never turns the box, so a rotating feature walks out
+        # of it and the fill has to rebuild the rest -- which is what "tracked 36 frames then
+        # stopped" looks like. The engine below it decides how much gets rebuilt.
         if p is not None:
+            layout.prop(p, "mark_motion_model", text="Box may")
             layout.prop(p, "blender_tracking", text="Track with Blender's own settings")
 
 

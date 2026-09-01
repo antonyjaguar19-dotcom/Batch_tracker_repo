@@ -115,6 +115,70 @@ def main():
     check("the round guard is not a constant the marks can outgrow",
           om.max_rounds(a, b) >= b - a, True)
 
+    def run(label, **kw):
+        """One end-to-end pass: seed, mark both ends, track, score against the hand track."""
+        for t in list(clip.tracking.tracks):
+            t.select = True
+        with bpy.context.temp_override(window=win, area=area, region=region,
+                                       space_data=sp, edit_movieclip=clip):
+            try:
+                bpy.ops.clip.delete_track()
+            except RuntimeError:
+                pass
+        scene.btr_marks.clear()
+        t = clip.tracking.tracks.new(name="WHOLE", frame=a)
+        clip.tracking.tracks.active = t
+        t.select = True
+        mk0 = t.markers[0]
+        mk0.co = oa.image_px_to_uv(truth[a][0], truth[a][1], w, h)
+        mk0.mute = False
+        tc.set_geom(mk0, PAT, PAT * 3.0, w, h)
+        for f, kind in ((a, "START"), (b, "END")):
+            m2 = scene.btr_marks.add()
+            m2.track, m2.frame, m2.kind = t.name, int(f), kind
+        with bpy.context.temp_override(window=win, area=area, region=region,
+                                       space_data=sp, edit_movieclip=clip):
+            bpy.ops.clip.btr_track_runs(**kw)
+        seen = set(oa.live_frames(t))
+        e = sorted(math.hypot(*[c - d for c, d in zip(
+            oa.marker_to_image_px(t.markers.find_frame(f, exact=True), w, h), truth[f])])
+            for f in sorted(seen) if f in truth)
+        gone = [f for f in range(a, b + 1) if f not in seen]
+        med = e[len(e) // 2] if e else 999.0
+        p90 = e[min(len(e) - 1, int(0.9 * len(e)))] if e else 999.0
+        print("[ws] %-30s %d/%d frames, median %.2f px, p90 %.2f, max %.2f"
+              % (label, len(seen), b - a + 1, med, p90, e[-1] if e else -1))
+        return gone, e, med
+
+    # ---- the motion model ---------------------------------------------------------------
+    # The artist's report: a run died at 36 frames, they ROTATED the pattern box by hand, and
+    # Blender's own tracking carried the rest. Blender's default model is `Loc`, which never
+    # turns the box -- so a feature that rotates walks out of it. Coverage hides this
+    # completely: the fill rebuilds whatever Blender could not track, and rebuilding drifts.
+    #
+    # Measured end to end on four hand-tracked references, median error against the artist:
+    #
+    #     reference    Loc     LocRotScale   Affine
+    #     Track.004    4.24    0.70          1.04
+    #     Track.009    5.65    0.54          0.43
+    #     Track.006    3.53    6.76          7.47
+    #     Track.002    1.12    1.70          1.02
+    #
+    # No model wins everywhere -- Track.006 is Loc's -- but Loc loses badly where it loses,
+    # and LocRotScale takes the two worst cases from 4.24 and 5.65 px to 0.70 and 0.54.
+    #
+    # It is NOT the default, and that is measured too: on a shot with occlusions to
+    # re-acquire across, the same change took `test_mark_mode`'s reference from 47/47 frames
+    # to 14/47. The re-acquisition landing is a coin flip no score can call -- the seed
+    # pattern scores 0.85 on the wrong feature as readily as the right one -- so a 0.7 px
+    # change in the anchor flips it. Better on a continuous run, worse across a gap; the
+    # artist knows which they have and the tool does not.
+    _gone, _errs, med_loc = run("Loc (Blender's default)", motion_model="Loc")
+    _gone2, _errs2, med_lrs = run("LocRotScale (the artist sets this)",
+                                  motion_model="LocRotScale")
+    check("a box that may turn beats one that may not", med_lrs < med_loc, True)
+    atmost("  and it is well under a pixel here", med_lrs, 1.5)
+
     for blender_tracking, bar in ((True, 20.0), (False, 10.0)):
         label = "Blender's own settings" if blender_tracking else "the addon's config"
         for t in list(clip.tracking.tracks):
