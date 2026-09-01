@@ -295,6 +295,68 @@ def main():
         gone_before = om.stale_marks(scene, clip)
     check("no stale marks while every track exists", gone_before, [])
 
+    # ---- the two shapes the artist hit that this test did not ---------------------------
+    # Reported from a real session: marked a range, "tracked for 1 frame and lost". Neither
+    # shape below was covered here, and both came back empty or nearly so.
+    print("")
+
+    def one_track(name, seed_frame, want_runs):
+        for t in list(clip.tracking.tracks):
+            t.select = True
+        with bpy.context.temp_override(window=win, area=area, region=region,
+                                       space_data=sp, edit_movieclip=clip):
+            try:
+                bpy.ops.clip.delete_track()
+            except RuntimeError:
+                pass
+        scene.btr_marks.clear()
+        t = clip.tracking.tracks.new(name=name, frame=seed_frame)
+        clip.tracking.tracks.active = t
+        t.select = True
+        mk0 = t.markers[0]
+        mk0.co = oa.image_px_to_uv(truth[seed_frame][0], truth[seed_frame][1], w, h)
+        mk0.mute = False
+        tc.set_geom(mk0, PAT, PAT * 3.0, w, h)
+        for ra, rb in want_runs:
+            for fr, kind in ((ra, "START"), (rb, "END")):
+                m2 = scene.btr_marks.add()
+                m2.track, m2.frame, m2.kind = t.name, int(fr), kind
+        with bpy.context.temp_override(window=win, area=area, region=region,
+                                       space_data=sp, edit_movieclip=clip):
+            bpy.ops.clip.btr_track_runs()
+        return t
+
+    # The seed is not at a run start: the artist seeded mid-shot, then marked a stretch
+    # BEFORE it. CoTracker was only ever asked forward, so the guess was refused outright
+    # ("the frame to guess must come after the mark before it") and the run came back with
+    # ZERO frames -- the whole stretch silently missing.
+    t2 = one_track("SEEDMIDDLE", runs[2][0], [(runs[0][0], runs[0][1]),
+                                              (runs[2][0], runs[2][1])])
+    early = [f for f in oa.live_frames(t2) if runs[0][0] <= f <= runs[0][1]]
+    check("a run marked BEFORE the seed is tracked, not skipped",
+          len(early), runs[0][1] - runs[0][0] + 1)
+    worst_early = max((math.hypot(*[c - d for c, d in zip(
+        oa.marker_to_image_px(t2.markers.find_frame(f, exact=True), w, h), truth[f])])
+        for f in early), default=999.0)
+    check("  and it is on the feature", worst_early < WRONG_PX, True)
+    print("[mark]   worst %.1f px over f%d-f%d" % (worst_early, runs[0][0], runs[0][1]))
+
+    # One long range. Blender stops partway and a SINGLE fill stops at the first frame it
+    # cannot match -- 22 of 200 frames, with nothing trying again. The two engines have to
+    # take turns.
+    t3 = one_track("LONGRUN", runs[0][0], [(runs[0][0], runs[2][1])])
+    got_long = len([f for f in oa.live_frames(t3)
+                    if runs[0][0] <= f <= runs[2][1]])
+    span = runs[2][1] - runs[0][0] + 1
+    print("[mark] one range f%d-f%d across BOTH occlusions -> %d of %d frames"
+          % (runs[0][0], runs[2][1], got_long, span))
+    # This range is deliberately WRONG -- it declares the occlusions visible -- so it CANNOT
+    # complete, and should not: f23 is inside a real occlusion and there is nothing there to
+    # find. What must hold is that the turns carry it well past where Blender stops on its
+    # own (f14), and that it ends at the occlusion rather than at Blender's patience.
+    atleast("  the turns carry it past where Blender stops alone",
+            got_long, runs[0][1] + 5)
+
     print("")
     if FAILED:
         print("MARK MODE: FAIL -- %s" % "; ".join(FAILED))

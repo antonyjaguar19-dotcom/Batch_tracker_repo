@@ -524,8 +524,16 @@ def job_fill(payload):
             raise ValueError("no frames to fill")
         anchor_f = int(req["anchor_frame"])
         anchor_px = (float(req["anchor_x"]), float(req["anchor_y"]))
-        if min(frames) <= anchor_f:
-            raise ValueError("the frames to fill must come after the anchor")
+        if anchor_f in frames:
+            raise ValueError("the anchor cannot be one of the frames to fill")
+        # Either direction. Forward-only was a real hole: an artist who seeds mid-shot and
+        # then marks a stretch BEFORE the seed got "the frame to guess must come after the
+        # mark before it" and zero frames back -- the whole run silently unfilled.
+        step = 1 if min(frames) > anchor_f else -1
+        if step > 0 and min(frames) <= anchor_f:
+            raise ValueError("cannot fill on both sides of the anchor in one call")
+        if step < 0 and max(frames) >= anchor_f:
+            raise ValueError("cannot fill on both sides of the anchor in one call")
 
         out_dir = os.path.join(ASSIST, "logs", "fill", job.id)
         os.makedirs(out_dir, exist_ok=True)
@@ -543,10 +551,15 @@ def job_fill(payload):
             seed = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
                                             float(pat["cx"]), float(pat["cy"]), pw, ph)
 
-        hi = min(int(plate.count), max(frames) + int(params.get("tail", 40)))
-        job.say("CoTracker from f%d, filling %s" % (anchor_f, frames))
-        guide = leash._chain(plate, anchor_f, anchor_px, anchor_f, hi,
-                             int(params.get("max_side", 768)), 120, job.say, +1)
+        tail = int(params.get("tail", 40))
+        if step > 0:
+            lo, hi = anchor_f, min(int(plate.count), max(frames) + tail)
+        else:
+            lo, hi = max(1, min(frames) - tail), anchor_f
+        job.say("CoTracker %s from f%d, filling %d frame(s)"
+                % ("forward" if step > 0 else "backward", anchor_f, len(frames)))
+        guide = leash._chain(plate, anchor_f, anchor_px, lo, hi,
+                             int(params.get("max_side", 768)), 120, job.say, step)
 
         radii = [float(r) for r in params.get("radii", [12.0, 28.0, 56.0])]
         # The gate is on the LOCALISATION match -- the last-good patch, which is one frame
@@ -561,7 +574,7 @@ def job_fill(payload):
         min_id = float(params.get("min_identity", 0.0))
         cur_f, cur_px = anchor_f, anchor_px
         placed, stopped = [], None
-        for f in sorted(frames):
+        for f in sorted(frames, reverse=(step < 0)):
             local = patmatch.reference_patch(plate, cur_f, cur_px[0], cur_px[1], pw, ph)
             if local is None:
                 stopped = "f%d: no patch to look with" % f
@@ -680,14 +693,21 @@ def job_guess(payload):
         anchor_f = int(req["anchor_frame"])
         anchor_px = (float(req["anchor_x"]), float(req["anchor_y"]))
         want = int(req["frame"])
-        if want <= anchor_f:
-            raise ValueError("the frame to guess must come after the mark before it")
+        if want == anchor_f:
+            raise ValueError("that frame IS the mark to look from")
 
+        # Either direction. An artist who seeds mid-shot and marks an earlier stretch was
+        # refused outright, which cost them the whole run.
+        step = 1 if want > anchor_f else -1
         span = int(params.get("span", 150))
-        hi = min(int(plate.count), max(want, anchor_f + span))
-        job.say("CoTracker from f%d, looking at f%d" % (anchor_f, want))
-        guide = leash._chain(plate, anchor_f, anchor_px, anchor_f, hi,
-                             int(params.get("max_side", 768)), 120, job.say, +1)
+        if step > 0:
+            lo, hi = anchor_f, min(int(plate.count), max(want, anchor_f + span))
+        else:
+            lo, hi = max(1, min(want, anchor_f - span)), anchor_f
+        job.say("CoTracker %s from f%d, looking at f%d"
+                % ("forward" if step > 0 else "backward", anchor_f, want))
+        guide = leash._chain(plate, anchor_f, anchor_px, lo, hi,
+                             int(params.get("max_side", 768)), 120, job.say, step)
         p = leash.predict(guide, anchor_f, anchor_px, want)
         img = patmatch._gray(plate.frame(want - 1))
         if p is None or img is None:

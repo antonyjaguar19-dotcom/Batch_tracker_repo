@@ -89,6 +89,12 @@ def stale_marks(scene, clip):
     return sorted({m.track for m in scene.btr_marks if m.track not in have})
 
 
+#: How many times Blender and CoTracker may take turns inside one run. Each round is one
+#: Blender pass plus at most one CoTracker chain, and a round that adds nothing ends the run
+#: -- so this is a guard against a pathological plate, not a normal working limit. A run that
+#: needs more than this is telling the artist their marks disagree with the plate.
+MAX_ROUNDS = 24
+
 #: What a mark means. `AUTO` is not a choice the artist can make -- it is what a mark saved
 #: before marks had a kind reads back as, and it is resolved by position so those scenes keep
 #: behaving exactly as they did.
@@ -431,7 +437,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 {"min_identity": float(self.fill_identity)})
         except Exception as exc:                                      # noqa: BLE001
             print("[runs] fill failed: %s" % exc)
-            return [], "the sidecar refused"
+            return [], "the sidecar refused: %s" % exc
         waited = 0.0
         while waited < 900.0:
             st = client.poll(root, job["id"])
@@ -504,6 +510,8 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         track_core.apply_settings(clip, opts)
 
         notes, started, filled = [], [], []
+        worst_id = 1.0
+        no_engine = ""   # set when the sidecar or CoTracker is the reason
         for i, (a, b) in enumerate(pairs):
             if b <= a:
                 continue
@@ -512,8 +520,12 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 # Not the seeded run: CoTracker has to find the feature here. Anchored on the
                 # last frame the track actually reached, which is the newest position anything
                 # has verified.
+                # The nearest verified position, on EITHER side. Preferring an earlier one
+                # keeps the common case unchanged; falling back to a later one is what makes
+                # a run marked before the seed work at all, instead of coming back empty.
                 have = [f for f in live_frames(tr) if f < a]
-                anchor_f = have[-1] if have else seed_f
+                after = [f for f in live_frames(tr) if f > a]
+                anchor_f = have[-1] if have else (after[0] if after else seed_f)
                 am = tr.markers.find_frame(anchor_f, exact=True)
                 if am is None:
                     notes.append("f%d-f%d: nothing before it to look from" % (a, b))
@@ -530,46 +542,65 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 started.append((a, cand.get("score")))
             m.mute = False
 
-            rec = [{"t": tr, "id": tr.name, "kind": "", "alive": True, "w": w, "h": h,
-                    "seed_frame": int(a), "seed_pat": (pw, ph)}]
-            # n_frames = b, so the last step is b-1 -> b. Passing b+1 would carry the track
-            # one frame INTO the occlusion the artist just told us about.
-            for _ in track_core.track_job(ctx, rec, int(b), {}, opts):
-                pass
-            reached = max([f for f in live_frames(tr) if a <= f <= b] or [a])
+            # Blender tracks, CoTracker rescues, and they take turns until the artist's end
+            # mark is reached. One pass of each was not enough: a run marked f1-f200 came
+            # back 22 frames, because Blender stopped at f22 and the single fill that
+            # followed stopped at the first frame it could not match -- with 178 frames of
+            # the artist's own range left, and nothing trying again.
+            reached, added, blocked = int(a), 0, None
+            for _round in range(MAX_ROUNDS):
+                rec = [{"t": tr, "id": tr.name, "kind": "", "alive": True, "w": w, "h": h,
+                        "seed_frame": int(reached), "seed_pat": (pw, ph)}]
+                # n_frames = b, so the last step is b-1 -> b. Passing b+1 would carry the
+                # track one frame INTO the occlusion the artist just told us about.
+                for _ in track_core.track_job(ctx, rec, int(b), {}, opts):
+                    pass
+                got_to = max([f for f in live_frames(tr) if a <= f <= b] or [reached])
+                if got_to >= b:
+                    reached = got_to
+                    break
+                if not self.finish_runs:
+                    reached = got_to
+                    break
 
-            # The artist's END mark is ground truth: they said the feature is visible on
-            # that frame. Blender stopping before it is Blender's correlation giving out as
-            # the occluder arrives, not the feature going away -- so the rest of THEIR range
-            # gets filled rather than silently left short.
-            if self.finish_runs and reached < b:
-                rm = tr.markers.find_frame(reached, exact=True)
-                # A frame Blender FAILED on still has a marker -- a muted one. Testing for
-                # absence therefore found nothing to fill and the whole pass was a no-op,
-                # which looked exactly like the fill deciding there was nothing to do.
+                # A frame Blender FAILED on still carries a marker -- a muted one. Testing
+                # for absence found nothing to fill and the pass was a silent no-op.
                 want = []
-                for f in range(reached + 1, b + 1):
+                for f in range(got_to + 1, b + 1):
                     mf = tr.markers.find_frame(f, exact=True)
                     if mf is None or mf.mute:
                         want.append(f)
-                if rm is not None and want:
-                    got, why = self._fill(context, clip, root, pattern, reached,
-                                          marker_to_image_px(rm, w, h), want)
-                    for hit in got:
-                        mk = (tr.markers.find_frame(int(hit["frame"]), exact=True)
-                              or tr.markers.insert_frame(int(hit["frame"])))
-                        mk.co = image_px_to_uv(float(hit["x"]), float(hit["y"]), w, h)
-                        mk.pattern_corners = pat_corners
-                        mk.search_min, mk.search_max = s_min, s_max
-                        mk.mute = False
-                    if got:
-                        filled.append((a, b, len(got),
-                                       min(h2.get("identity") or 1.0 for h2 in got)))
-                    if why and len(got) < len(want):
-                        notes.append("f%d-f%d: %s" % (a, b, why))
-                    reached = max([f for f in live_frames(tr) if a <= f <= b]
-                                  or [reached])
-
+                rm = tr.markers.find_frame(got_to, exact=True)
+                if rm is None or not want:
+                    reached = got_to
+                    break
+                hits, why = self._fill(context, clip, root, pattern, got_to,
+                                       marker_to_image_px(rm, w, h), want)
+                if why and not hits and not no_engine:
+                    low_why = why.lower()
+                    if "sidecar" in low_why or "cotracker" in low_why:
+                        no_engine = why
+                for hit in hits:
+                    mk = (tr.markers.find_frame(int(hit["frame"]), exact=True)
+                          or tr.markers.insert_frame(int(hit["frame"])))
+                    mk.co = image_px_to_uv(float(hit["x"]), float(hit["y"]), w, h)
+                    mk.pattern_corners = pat_corners
+                    mk.search_min, mk.search_max = s_min, s_max
+                    mk.mute = False
+                added += len(hits)
+                if hits:
+                    worst_id = min(h2.get("identity") or 1.0 for h2 in hits)
+                if not hits:
+                    # Neither engine can cross this frame. The artist marked it visible, so
+                    # say which frame stopped it rather than returning a short run silently.
+                    blocked = why or "f%d could not be matched" % (want[0],)
+                    reached = got_to
+                    break
+                reached = max([f for f in live_frames(tr) if a <= f <= b] or [got_to])
+            if added:
+                filled.append((a, b, added, worst_id))
+            if blocked:
+                notes.append("f%d-f%d: %s" % (a, b, blocked))
             notes.append("f%d-f%d: reached f%d%s"
                          % (a, b, reached, "" if reached >= b else " of f%d" % b))
 
@@ -604,13 +635,35 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 "f%d (%s)" % (f, "no score" if sc is None else "%.2f" % sc)
                 for f, sc in started)
         print("[runs] %s: %s" % (tr.name, msg))
+
+        # A run that came back short is the thing the artist most needs told, and it used to
+        # be buried in a note behind whatever else happened. They marked that range: the
+        # frames are theirs, and a hole in it is not a detail.
+        short = [(a, b, got) for a, b, got in
+                 [(a, b, len([f for f in live_frames(tr) if a <= f <= b]))
+                  for a, b in pairs]
+                 if got < (b - a + 1)]
         low = [f for f, sc in started if sc is not None and sc < 0.6]
-        if low:
+        if short:
+            if no_engine:
+                # The single most likely reason a run stops dead, and it is invisible from
+                # the viewport: without the sidecar there is nothing to re-acquire WITH, so
+                # a run ends wherever Blender's correlation happened to give out.
+                self.report({"ERROR"},
+                            "%d run(s) came back short and CoTracker never ran (%s) -- "
+                            "Blender tracked alone. %s"
+                            % (len(short), no_engine, msg))
+            else:
+                self.report({"WARNING"},
+                            "short: %s -- %s"
+                            % (", ".join("f%d-f%d got %d of %d" % (a, b, got, b - a + 1)
+                                         for a, b, got in short), msg))
+        elif low:
             self.report({"WARNING"},
                         "CoTracker's landing looks wrong at %s -- check it, or drag the mark "
                         "and track again" % ", ".join("f%d" % f for f in low))
         else:
-            self.report({"INFO"}, "%d run(s), %d frame(s) outside them removed -- %s"
+            self.report({"INFO"}, "%d run(s) complete, %d frame(s) outside them removed -- %s"
                         % (len(pairs), removed, msg))
         return {"FINISHED"}
 
