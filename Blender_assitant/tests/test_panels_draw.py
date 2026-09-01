@@ -59,6 +59,20 @@ class StubLayout:
             cls.ICONS = {i.identifier for i in params.enum_items}
         return cls.ICONS
 
+    #: The real keyword names each UILayout function takes. A stub that swallows any keyword
+    #: verifies that draw() runs, not that Blender would accept it -- the same hole the icon
+    #: check above was written to close, one argument along.
+    PARAMS = {}
+
+    @classmethod
+    def _params(cls, name):
+        if name not in cls.PARAMS:
+            import bpy
+            fn = bpy.types.UILayout.bl_rna.functions.get(name)
+            cls.PARAMS[name] = (None if fn is None
+                                else {p.identifier for p in fn.parameters})
+        return cls.PARAMS[name]
+
     def __getattr__(self, name):
         def call(*a, **kw):
             self.calls += 1
@@ -66,8 +80,42 @@ class StubLayout:
             if icon is not None and icon not in self._icons():
                 raise ValueError("icon %r does not exist in this Blender "
                                  "(UILayout.%s)" % (icon, name))
+            known = self._params(name)
+            if known is not None:
+                bad = sorted(set(kw) - known)
+                if bad:
+                    raise TypeError("UILayout.%s() takes no %s"
+                                    % (name, ", ".join(repr(b) for b in bad)))
+            if name == "operator" and a:
+                return StubOperator(str(a[0]))
             return self
         return call
+
+
+class StubOperator:
+    """What `layout.operator()` hands back: the operator's own properties, and only those.
+
+    Returning the layout instead meant `op.frame = 14` silently set an attribute on the stub
+    -- so a property the operator does not actually have, or a typo in its name, drew fine
+    here and raised in the artist's session.
+    """
+
+    def __init__(self, idname):
+        import bpy
+        object.__setattr__(self, "_id", idname)
+        mod, _, fn = idname.partition(".")
+        op = getattr(getattr(bpy.ops, mod, None), fn, None)
+        if op is None:
+            raise ValueError("no such operator: %s" % idname)
+        rna = op.get_rna_type()
+        object.__setattr__(self, "_props",
+                           {p.identifier for p in rna.properties})
+
+    def __setattr__(self, name, value):
+        if name not in object.__getattribute__(self, "_props"):
+            raise AttributeError("%s has no property %r"
+                                 % (object.__getattribute__(self, "_id"), name))
+        object.__setattr__(self, name, value)
 
 
 class FakePanel:

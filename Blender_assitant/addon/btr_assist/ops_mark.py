@@ -203,9 +203,15 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
                ("ADD", "Mark", "Mark the current frame, taking start or end from what is "
                                "already marked"),
                ("DROP", "Unmark", "Remove the mark on the current frame"),
+               ("GOTO", "Go to", "Jump to a marked frame"),
+               ("DROPAT", "Remove", "Remove one mark by frame, without going to it"),
                ("CLEAR", "Clear", "Remove every mark on this track"),
                ("STALE", "Clear stale", "Remove marks whose track no longer exists")),
         default="ADD")
+    frame: IntProperty(
+        name="Frame", default=0,
+        description="Which frame GOTO and DROPAT act on. 0 means the current frame, which "
+                    "is what every other action uses")
 
     @classmethod
     def poll(cls, context):
@@ -233,6 +239,29 @@ class CLIP_OT_btr_mark(bpy.types.Operator):
                                if m.track == tr.name]):
                 scene.btr_marks.remove(i)
             self.report({"INFO"}, "cleared every mark on %s" % tr.name)
+            return {"FINISHED"}
+
+        if self.action == "GOTO":
+            # Jump to a marked frame from the list. `frame_set` alone moves the scene, but
+            # the clip editor draws from the SPACE's own frame -- `track_core.track_group`
+            # records the same thing for the same reason -- so a jump that only set the
+            # scene left the viewport on the old frame in some layouts.
+            scene.frame_set(int(self.frame or f))
+            sp = getattr(context, "space_data", None)
+            cu = getattr(sp, "clip_user", None)
+            if cu is not None:
+                cu.frame_current = int(self.frame or f)
+            return {"FINISHED"}
+
+        if self.action == "DROPAT":
+            g = int(self.frame or f)
+            hit = [i for i, m in enumerate(scene.btr_marks)
+                   if m.track == tr.name and m.frame == g]
+            for i in reversed(hit):
+                scene.btr_marks.remove(i)
+            self.report({"INFO"} if hit else {"WARNING"},
+                        "removed the mark on f%d" % g if hit
+                        else "nothing marked on f%d" % g)
             return {"FINISHED"}
 
         if self.action == "DROP":

@@ -222,6 +222,34 @@ def main():
     check("  and named too", len(problems) == 1 and "f14" in problems[0], True)
     print("[mark]   says: %s" % problems[0])
 
+    # ---- reading the list without losing your place -------------------------------------
+    # Checking a mark used to mean reading a frame number off the panel and scrubbing to it
+    # by hand; removing one meant going there first. Both are per-mark, per-track work.
+    print("")
+    scene.btr_marks.clear()
+    put(tr.name, (1, "START"), (14, "END"), (25, "START"), (32, "END"))
+    scene.frame_set(1)
+    with bpy.context.temp_override(window=win, area=area, region=region,
+                                   space_data=sp, edit_movieclip=clip):
+        bpy.ops.clip.btr_mark(action="GOTO", frame=25)
+    check("clicking a mark jumps to its frame", int(scene.frame_current), 25)
+    check("  and the clip editor followed", int(sp.clip_user.frame_current), 25)
+
+    with bpy.context.temp_override(window=win, area=area, region=region,
+                                   space_data=sp, edit_movieclip=clip):
+        bpy.ops.clip.btr_mark(action="DROPAT", frame=14)
+    check("X removes that mark", om.marks_for(scene, tr.name), [1, 25, 32])
+    # The point of removing by frame: the playhead does not move, so a list being checked
+    # stays where it was.
+    check("  without moving the playhead", int(scene.frame_current), 25)
+    check("  and the runs re-pair around it", om.runs(scene, tr.name)[0], [(25, 32)])
+
+    with bpy.context.temp_override(window=win, area=area, region=region,
+                                   space_data=sp, edit_movieclip=clip):
+        bpy.ops.clip.btr_mark(action="DROPAT", frame=999)
+    check("removing an unmarked frame changes nothing",
+          om.marks_for(scene, tr.name), [1, 25, 32])
+
     scene.btr_marks.clear()
     for f in ends:
         mk = scene.btr_marks.add()

@@ -324,10 +324,21 @@ class CLIP_PT_btr_mark(_Base):
         for f, kind in ops_mark.marked(context.scene, tr.name):
             row = box.row(align=True)
             row.alert = any(f in _frames_named(msg) for msg in problems)
-            row.label(text="f%-5d %s" % (f, "appears" if kind == "START" else "last visible"),
-                      icon=("TRIA_RIGHT" if kind == "START" else "TRIA_LEFT"))
-            if f == now:
-                row.label(text="", icon="LAYER_ACTIVE")
+            # The row IS the jump. Checking a mark meant reading a frame number off the
+            # panel and scrubbing to it by hand, which is the one thing the artist does for
+            # every mark on every track.
+            op = row.operator("clip.btr_mark",
+                              text="f%-5d %s%s" % (f, "appears" if kind == "START"
+                                                   else "last visible",
+                                                   "  <" if f == now else ""),
+                              icon=("TRIA_RIGHT" if kind == "START" else "TRIA_LEFT"),
+                              depress=(f == now))
+            op.action, op.frame = "GOTO", f
+            # Delete by frame, not by "go there first and unmark". Removing a mark you can
+            # see should not require moving the playhead onto it -- and moving the playhead
+            # is what loses your place while you are checking a list.
+            rm = row.operator("clip.btr_mark", text="", icon="X")
+            rm.action, rm.frame = "DROPAT", f
         for msg in problems:
             box.label(text=msg, icon="ERROR")
         if pairs:
