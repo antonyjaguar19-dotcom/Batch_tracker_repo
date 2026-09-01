@@ -466,6 +466,150 @@ def job_fix(payload):
 
 
 
+
+def job_fill(payload):
+    """Finish a run the artist BOUNDED: they said the feature is visible on every frame here.
+
+    Blender stops where correlation drops, which on a real plate is a frame or two before the
+    occluder actually arrives -- so a run marked f41-f65 comes back f41-f63 and the last two
+    frames are simply missing. The artist already told us the feature is there. This finds it.
+
+    Frame by frame, forward from where the track stopped:
+
+      * CoTracker predicts the neighbourhood (it is 2-5 px out at this range),
+      * the LAST-GOOD PATCH -- the feature as the track saw it one frame ago -- localises,
+      * the artist's SEED patch scores the result, and only scores it.
+
+    Two references, not one, and which does which is measured. Localising with the seed patch
+    at the tail of the artist's own shot lands 24.1 px out at f65 and 4.9 at f64, because that
+    patch is 64 frames old and the feature has turned; the last-good patch lands 3.0 px and
+    1.1 px on the same frames from the same prediction. Against CoTracker alone (5.4 and
+    2.2 px) the seed patch is WORSE THAN NOT REFINING and the last-good patch is better.
+
+        anchor -> frame   guide only   seed patch      last-good patch
+        f31 -> f32          4.7 px      4.3  (0.924)    1.4 px  (0.986)
+        f63 -> f64          2.2 px      4.9  (0.851)    1.1 px  (0.986)
+        f63 -> f65          5.4 px     24.1  (0.734)    3.0 px  (0.924)
+        f13 -> f14         11.8 px      0.7  (0.979)    0.3 px  (0.988)
+
+    The cost of a rolling template is drift, and three things bound it: the walk only ever
+    fills what Blender left, it stops at the first frame that fails, and every frame is scored
+    against the seed -- the identity reference -- so a walk that slides onto something else is
+    visible rather than silent. That split is the one `project-blender-reacquire-reference`
+    settled: localise with what the track last saw, verify with what the artist chose.
+    """
+    def fn(job):
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from repo import require_repo                                # noqa: PLC0415
+        require_repo()
+        import blio                                                  # noqa: PLC0415
+        import cotrack                                               # noqa: PLC0415
+        import leash                                                 # noqa: PLC0415
+        import patmatch                                              # noqa: PLC0415
+
+        clip = payload.get("clip") or {}
+        req = payload.get("request") or {}
+        params = payload.get("params") or {}
+        path_ = clip.get("path", "")
+        if not os.path.exists(path_):
+            raise FileNotFoundError("plate not found: %s" % path_)
+        if not cotrack.available():
+            raise RuntimeError("CoTracker is not installed -- run "
+                               "bootstrap.bat --with-cotracker")
+
+        frames = [int(f) for f in (req.get("frames") or [])]
+        if not frames:
+            raise ValueError("no frames to fill")
+        anchor_f = int(req["anchor_frame"])
+        anchor_px = (float(req["anchor_x"]), float(req["anchor_y"]))
+        if min(frames) <= anchor_f:
+            raise ValueError("the frames to fill must come after the anchor")
+
+        out_dir = os.path.join(ASSIST, "logs", "fill", job.id)
+        os.makedirs(out_dir, exist_ok=True)
+        plate = blio.Plate(path_, ifl_dir=out_dir)
+        cw, ch = int(clip.get("width", plate.w)), int(clip.get("height", plate.h))
+        if (cw, ch) != (plate.w, plate.h):
+            raise RuntimeError("Blender reports %dx%d but the plate reads %dx%d"
+                               % (cw, ch, plate.w, plate.h))
+
+        pat = req.get("pattern") or {}
+        pw = float(pat.get("w", 41.0))
+        ph = float(pat.get("h", 41.0))
+        seed = None
+        if pat:
+            seed = patmatch.reference_patch(plate, int(pat.get("frame", 1)),
+                                            float(pat["cx"]), float(pat["cy"]), pw, ph)
+
+        hi = min(int(plate.count), max(frames) + int(params.get("tail", 40)))
+        job.say("CoTracker from f%d, filling %s" % (anchor_f, frames))
+        guide = leash._chain(plate, anchor_f, anchor_px, anchor_f, hi,
+                             int(params.get("max_side", 768)), 120, job.say, +1)
+
+        radii = [float(r) for r in params.get("radii", [12.0, 28.0, 56.0])]
+        # The gate is on the LOCALISATION match -- the last-good patch, which is one frame
+        # old -- and never on identity. Measured at the artist's OWN hand-tracked positions,
+        # their seed patch scores 0.656 at f32, 0.595 at f64 and 0.333 at f65: the feature
+        # genuinely turns at the end of this shot, so an identity threshold anywhere near
+        # useful REJECTS THE CORRECT ANSWER. A 0.55 gate did exactly that to f65, whose fill
+        # was 3.0 px from truth. The localisation score does behave -- 0.986, 0.986, 0.924
+        # and 0.988 on the four correct fills -- because it compares against what the feature
+        # looked like one frame ago rather than sixty.
+        min_score = float(params.get("min_score", 0.6))
+        min_id = float(params.get("min_identity", 0.0))
+        cur_f, cur_px = anchor_f, anchor_px
+        placed, stopped = [], None
+        for f in sorted(frames):
+            local = patmatch.reference_patch(plate, cur_f, cur_px[0], cur_px[1], pw, ph)
+            if local is None:
+                stopped = "f%d: no patch to look with" % f
+                break
+            patch, off = local
+            p = leash.predict(guide, cur_f, cur_px, f)
+            img = patmatch._gray(plate.frame(f - 1))
+            if p is None or img is None:
+                stopped = "f%d: the guide has no position there" % f
+                break
+            best = None
+            for r in radii:
+                hit = patmatch.match_pinned(img, patch, p[0], p[1], radius=r, offset=off)
+                if hit is not None and (best is None or hit[2] > best[2]):
+                    best = hit
+            if best is None:
+                stopped = "f%d: nothing correlated" % f
+                break
+            if best[2] < min_score:
+                stopped = ("f%d: %.2f against the frame before it -- the walk lost the "
+                           "feature" % (f, best[2]))
+                break
+            # Identity, against the artist's own patch. REPORTED, not gated: it falls on
+            # correct answers whenever the feature has legitimately changed, and it is the
+            # only thing that can say the walk has slid onto something else. The artist reads
+            # it; the tool does not act on it unless they set `min_identity` themselves.
+            ident = None
+            if seed is not None:
+                sp, soff = seed
+                iv = patmatch.match_pinned(img, sp, best[0], best[1], radius=2.0,
+                                           offset=soff)
+                ident = None if iv is None else round(float(iv[2]), 3)
+            if min_id > 0.0 and ident is not None and ident < min_id:
+                stopped = ("f%d: %.2f against your pattern -- stopping rather than "
+                           "planting something else" % (f, ident))
+                break
+            placed.append({"frame": f, "x": float(best[0]), "y": float(best[1]),
+                           "score": round(float(best[2]), 3), "identity": ident,
+                           "from_guide_px": round(math.hypot(best[0] - p[0],
+                                                             best[1] - p[1]), 1)})
+            cur_f, cur_px = f, (float(best[0]), float(best[1]))
+        job.say("filled %d of %d frame(s)" % (len(placed), len(frames)))
+        cotrack.free()
+        return {"placed": placed, "stopped": stopped,
+                "width": plate.w, "height": plate.h}
+    return fn
+
+
 def job_guess(payload):
     """Where might the feature be on the frame the artist marked? Offers, never decides.
 
@@ -1722,7 +1866,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/jobs/seed", "/jobs/reacquire", "/jobs/patcheck", "/jobs/motion",
                          "/jobs/hold", "/jobs/leash", "/jobs/report",
                          "/jobs/pin", "/jobs/ctrack", "/jobs/fix",
-                         "/jobs/runs", "/jobs/guess"):
+                         "/jobs/runs", "/jobs/guess", "/jobs/fill"):
             b = busy_job()
             if b is not None:
                 return self._send(409, {"error": {
@@ -1738,7 +1882,8 @@ class Handler(BaseHTTPRequestHandler):
                           "report": job_report, "pin": job_pin,
                           "ctrack": job_ctrack,
                           "fix": job_fix, "runs": job_runs,
-                          "guess": job_guess}[kind](payload))
+                          "guess": job_guess,
+                          "fill": job_fill}[kind](payload))
             return self._send(200, job.public())
 
         if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):

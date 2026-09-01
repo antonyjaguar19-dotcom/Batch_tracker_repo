@@ -253,3 +253,13 @@ def start_guess(assist_root, clip_info, request, params=None):
     return _request(info, "/jobs/guess",
                     {"clip": clip_info, "request": request, "params": params or {}},
                     timeout=30.0)
+
+
+def start_fill(assist_root, clip_info, request, params=None):
+    """Finish a run the artist bounded: find the feature on frames Blender did not reach."""
+    info = read_portfile(assist_root)
+    if info is None:
+        raise SidecarError("sidecar is not running")
+    return _request(info, "/jobs/fill",
+                    {"clip": clip_info, "request": request, "params": params or {}},
+                    timeout=30.0)

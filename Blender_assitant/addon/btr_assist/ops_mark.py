@@ -336,18 +336,21 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
     Nothing decides when the feature is hidden, because that is undecidable on this footage:
     the artist's own pattern scores 0.86-0.96 on frames where it is definitively covered.
 
-    WHERE it comes back is still a guess. Measured end to end on the artist's `track3`
-    Track.001 -- one seed marker at f1 and their six frame numbers, nothing dragged:
+    And the marked range is finished. Blender stops where correlation gives out, which is a
+    frame or two before the occluder actually arrives -- but the artist already said the
+    feature is visible on those frames, so `finish_runs` finds them: CoTracker predicts, the
+    feature as the track saw it ONE FRAME AGO localises, and the artist's seed patch scores
+    the result without gating it.
 
-        run        landed        tracked
-        f1-f14     seeded        f1-f14
-        f25-f32    2.5 px off    f25-f31
-        f41-f65    1.3 px off    f41-f63
+    Measured end to end on the artist's `track3` Track.001 -- one seed marker at f1 and their
+    six frame numbers, nothing dragged:
 
-    44 of their 47 frames on the feature, worst 2.5 px, and NOTHING inside an occlusion. The
-    three missing frames are the last one or two before a gap, where Blender loses the
-    feature as it starts to be covered -- it stops rather than following the occluder, which
-    is the behaviour worth having.
+        run        landed        Blender     finished
+        f1-f14     seeded        f1-f14      --
+        f25-f32    2.5 px off    f25-f31     +f32
+        f41-f65    1.3 px off    f41-f63     +f64, f65
+
+    47 of 47 frames on the feature, worst 2.5 px, NOTHING inside an occlusion.
 
     A wrong landing is silent: every frame after it is wrong and nothing downstream can tell.
     So each guessed run reports what the pattern scored where it started, for the artist to
@@ -363,6 +366,21 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                       "than silent")
     bl_options = {"REGISTER", "UNDO"}
 
+    finish_runs: BoolProperty(
+        name="Finish every marked run", default=True,
+        description="You marked the frame the feature is last visible, so it IS visible "
+                    "there. Blender stops a frame or two early -- correlation drops as the "
+                    "occluder arrives -- and this finds the rest rather than leaving your "
+                    "range unfilled. CoTracker predicts, the feature as the track last saw "
+                    "it localises, and your own pattern scores the result")
+    fill_identity: FloatProperty(
+        name="Stop filling below", default=0.0, min=0.0, max=1.0,
+        description="How well a filled frame must still match YOUR pattern before the fill "
+                    "gives up. OFF by default, and that is measured: at the artist's own "
+                    "hand-tracked positions this shot's seed patch scores 0.66 at f32, 0.60 "
+                    "at f64 and 0.33 at f65 -- the feature turns, so any useful threshold "
+                    "throws away correct frames. The score is reported per run instead. Set "
+                    "it only if your feature does NOT change appearance")
     backward: BoolProperty(
         name="Also track backwards", default=True,
         description="Within the run holding your seed, track back to the run's first frame "
@@ -401,6 +419,31 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             time.sleep(0.15)
             waited += 0.15
         return None
+
+    def _fill(self, context, clip, root, pattern, anchor_f, anchor_px, frames):
+        """Positions for frames Blender did not reach. [] if it cannot offer any."""
+        try:
+            job = client.start_fill(
+                root, clip_info(context, clip),
+                {"pattern": pattern, "anchor_frame": int(anchor_f),
+                 "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
+                 "frames": [int(f) for f in frames]},
+                {"min_identity": float(self.fill_identity)})
+        except Exception as exc:                                      # noqa: BLE001
+            print("[runs] fill failed: %s" % exc)
+            return [], "the sidecar refused"
+        waited = 0.0
+        while waited < 900.0:
+            st = client.poll(root, job["id"])
+            if st["state"] == "done":
+                r = st["result"] or {}
+                return (r.get("placed") or []), r.get("stopped")
+            if st["state"] == "error":
+                print("[runs] fill failed: %s" % st["error"]["message"])
+                return [], st["error"]["message"]
+            time.sleep(0.15)
+            waited += 0.15
+        return [], "timed out"
 
     def execute(self, context):
         from . import track_core                                      # noqa: PLC0415
@@ -460,7 +503,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                                edge_stop=True, blender_defaults=True)
         track_core.apply_settings(clip, opts)
 
-        notes, started = [], []
+        notes, started, filled = [], [], []
         for i, (a, b) in enumerate(pairs):
             if b <= a:
                 continue
@@ -494,7 +537,41 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             for _ in track_core.track_job(ctx, rec, int(b), {}, opts):
                 pass
             reached = max([f for f in live_frames(tr) if a <= f <= b] or [a])
-            notes.append("f%d-f%d: reached f%d" % (a, b, reached))
+
+            # The artist's END mark is ground truth: they said the feature is visible on
+            # that frame. Blender stopping before it is Blender's correlation giving out as
+            # the occluder arrives, not the feature going away -- so the rest of THEIR range
+            # gets filled rather than silently left short.
+            if self.finish_runs and reached < b:
+                rm = tr.markers.find_frame(reached, exact=True)
+                # A frame Blender FAILED on still has a marker -- a muted one. Testing for
+                # absence therefore found nothing to fill and the whole pass was a no-op,
+                # which looked exactly like the fill deciding there was nothing to do.
+                want = []
+                for f in range(reached + 1, b + 1):
+                    mf = tr.markers.find_frame(f, exact=True)
+                    if mf is None or mf.mute:
+                        want.append(f)
+                if rm is not None and want:
+                    got, why = self._fill(context, clip, root, pattern, reached,
+                                          marker_to_image_px(rm, w, h), want)
+                    for hit in got:
+                        mk = (tr.markers.find_frame(int(hit["frame"]), exact=True)
+                              or tr.markers.insert_frame(int(hit["frame"])))
+                        mk.co = image_px_to_uv(float(hit["x"]), float(hit["y"]), w, h)
+                        mk.pattern_corners = pat_corners
+                        mk.search_min, mk.search_max = s_min, s_max
+                        mk.mute = False
+                    if got:
+                        filled.append((a, b, len(got),
+                                       min(h2.get("identity") or 1.0 for h2 in got)))
+                    if why and len(got) < len(want):
+                        notes.append("f%d-f%d: %s" % (a, b, why))
+                    reached = max([f for f in live_frames(tr) if a <= f <= b]
+                                  or [reached])
+
+            notes.append("f%d-f%d: reached f%d%s"
+                         % (a, b, reached, "" if reached >= b else " of f%d" % b))
 
             if self.backward and a < seed_f <= b:
                 # Only the seeded run needs it, and only Blender's whole-sequence mode is
@@ -518,6 +595,10 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 removed += 1
 
         msg = "; ".join(notes)
+        if filled:
+            msg += " | finished " + ", ".join(
+                "f%d-f%d (+%d, your pattern %.2f)" % (a, b, n, ident)
+                for a, b, n, ident in filled)
         if started:
             msg += " | CoTracker started " + ", ".join(
                 "f%d (%s)" % (f, "no score" if sc is None else "%.2f" % sc)

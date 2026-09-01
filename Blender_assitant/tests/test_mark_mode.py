@@ -10,11 +10,16 @@ feature, every one of them inside an occlusion it could not see the start of.
 
 What must be true here:
 
+  * EVERY frame of every marked run comes back, because the marked range is ground truth --
+    the artist said the feature is visible there, so a run that stops short is finished
+    rather than left with a hole;
   * every run is re-acquired within a few px, because CoTracker is asked WHERE and never
     WHEN -- the frames came from the artist;
   * ZERO frames off the feature, and none inside an occlusion, because a run is bounded by
     the marks at both of its ends;
   * the seed is never moved -- it is the reference everything was tracked from.
+
+Measured: 47/47 frames, worst 2.5 px.
 
     blender.exe --background -noaudio --python tests/test_mark_mode.py -- \\
         --plate D:\\Jefrin\\IN\\SH006.mp4
@@ -157,9 +162,19 @@ def main():
                 if f not in truth and tr.markers.find_frame(f, exact=True) is not None]
     print("[mark] on the feature %d/%d, off %d, worst %.1f px, frames inside occlusions %d"
           % (on, len(fs), off, worst, len(intruded)))
-    # 44/47 measured, worst 2.5 px. The three that go missing are the last frame or two
-    # before a gap, where Blender stops rather than follow the occluder.
-    atleast("nearly every frame of every run is on the feature", on, 42)
+    # The marked range is GROUND TRUTH -- the artist said the feature is visible on every
+    # frame of it -- so every one of those frames must come back, on the feature. Not "most":
+    # a run that quietly stops short leaves the artist with a hole where they already did the
+    # work of saying there is none.
+    missing = []
+    for a, b in [tuple(r) for r in runs]:
+        for f in range(a, b + 1):
+            mk = tr.markers.find_frame(f, exact=True)
+            if mk is None or mk.mute:
+                missing.append(f)
+    check("every frame of every marked run came back", missing, [])
+    check("  and all of them are on the feature", off, 0)
+    check("  the whole range, not most of it", on, len(fs))
     check("nothing was planted inside an occlusion", len(intruded), 0)
 
     # The re-acquisitions specifically: this is what CoTracker is here for, and a landing
