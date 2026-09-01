@@ -97,6 +97,22 @@ def run_job(job, fn):
                          "log": os.path.join(ASSIST, "logs", "sidecar.log")}
             job.say("ERROR %s: %s" % (type(exc).__name__, exc))
             traceback.print_exc()
+        finally:
+            # The GPU goes back whatever happened. Every job body called `cotrack.free()` on
+            # its way out and NONE of them did it in a finally, so a job that raised -- or
+            # returned early down one of its own branches -- left the model resident. The
+            # sidecar outlives any one job, so that accumulates: seen at 15.9 GB of a 16 GB
+            # card, after which the next CoTracker pass thrashes for minutes, holds the
+            # single job slot while it does, and every request behind it is refused BUSY.
+            # The artist sees "CoTracker offered nothing" and a run tracked without it.
+            try:
+                import sys                           # noqa: PLC0415
+                if HERE not in sys.path:
+                    sys.path.insert(0, HERE)
+                import cotrack                       # noqa: PLC0415
+                cotrack.free()
+            except Exception:                        # noqa: BLE001
+                pass
     t = threading.Thread(target=body, daemon=True)
     t.start()
     return job

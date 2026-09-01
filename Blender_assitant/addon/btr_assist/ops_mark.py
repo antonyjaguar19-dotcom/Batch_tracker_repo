@@ -89,6 +89,13 @@ def stale_marks(scene, clip):
     return sorted({m.track for m in scene.btr_marks if m.track not in have})
 
 
+#: How long to wait for the sidecar's turn before calling it stuck. Generous on purpose: the
+#: job in front is a CoTracker pass, which on a long window is minutes, and waiting is always
+#: better than the alternative -- silently tracking the artist's range without the engine that
+#: crosses its occlusions.
+BUSY_WAIT_S = 900.0
+
+
 def max_rounds(a, b):
     """How many times Blender and CoTracker may take turns inside one run.
 
@@ -443,14 +450,14 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
 
     def _guess(self, context, clip, tr, root, pattern, anchor_f, anchor_px, frame):
         """CoTracker's best position for `frame`. None if it cannot offer one."""
-        try:
-            job = client.start_guess(
-                root, clip_info(context, clip),
-                {"pattern": pattern, "anchor_frame": int(anchor_f),
-                 "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
-                 "frame": int(frame)})
-        except Exception as exc:                                      # noqa: BLE001
-            print("[runs] guess failed: %s" % exc)
+        job, err = self._start(
+            client.start_guess, root, clip_info(context, clip),
+            {"pattern": pattern, "anchor_frame": int(anchor_f),
+             "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
+             "frame": int(frame)})
+        if job is None:
+            print("[runs] guess failed: %s" % err)
+            self._guess_error = err
             return None
         waited = 0.0
         while waited < 600.0:
@@ -465,18 +472,41 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
             waited += 0.15
         return None
 
+    def _start(self, fn, *args, **kw):
+        """Start a sidecar job, waiting for the sidecar's turn rather than giving up on it.
+
+        The sidecar runs ONE job at a time and answers 409 BUSY to anything else. That was
+        treated as a refusal, so a run whose turn came while another job was still finishing
+        reported "CoTracker offered nothing" and fell back to Blender alone -- seen in a real
+        session as f25-f31 getting 2 of 7 frames and f40-f65 getting 2 of 26, with the engine
+        the whole mode depends on never once running.
+
+        Busy is not a failure, it is a queue of one. Only a sidecar that stays busy for
+        `BUSY_WAIT_S` is a real problem, and then it is reported as one.
+        """
+        waited = 0.0
+        while True:
+            try:
+                return fn(*args, **kw), None
+            except Exception as exc:                                  # noqa: BLE001
+                if "already running" not in str(exc) or waited >= BUSY_WAIT_S:
+                    return None, str(exc)
+                if waited == 0.0:
+                    print("[runs] sidecar busy (%s) -- waiting" % str(exc)[:90])
+                time.sleep(0.5)
+                waited += 0.5
+
     def _fill(self, context, clip, root, pattern, anchor_f, anchor_px, frames):
         """Positions for frames Blender did not reach. [] if it cannot offer any."""
-        try:
-            job = client.start_fill(
-                root, clip_info(context, clip),
-                {"pattern": pattern, "anchor_frame": int(anchor_f),
-                 "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
-                 "frames": [int(f) for f in frames]},
-                {"min_identity": float(self.fill_identity)})
-        except Exception as exc:                                      # noqa: BLE001
-            print("[runs] fill failed: %s" % exc)
-            return [], "the sidecar refused: %s" % exc
+        job, err = self._start(
+            client.start_fill, root, clip_info(context, clip),
+            {"pattern": pattern, "anchor_frame": int(anchor_f),
+             "anchor_x": float(anchor_px[0]), "anchor_y": float(anchor_px[1]),
+             "frames": [int(f) for f in frames]},
+            {"min_identity": float(self.fill_identity)})
+        if job is None:
+            print("[runs] fill failed: %s" % err)
+            return [], "the sidecar refused: %s" % err
         waited = 0.0
         while waited < 900.0:
             st = client.poll(root, job["id"])
@@ -589,6 +619,7 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
         notes, started, filled = [], [], []
         worst_id = 1.0
         no_engine = ""   # set when the sidecar or CoTracker is the reason
+        self._guess_error = ""
         for i, (a, b) in enumerate(pairs):
             if b <= a:
                 continue
@@ -610,7 +641,13 @@ class CLIP_OT_btr_track_runs(bpy.types.Operator):
                 cand = self._guess(context, clip, tr, root, pattern,
                                    anchor_f, marker_to_image_px(am, w, h), a)
                 if cand is None:
-                    notes.append("f%d-f%d: CoTracker offered nothing" % (a, b))
+                    why = getattr(self, "_guess_error", "") or ""
+                    low = why.lower()
+                    if why and not no_engine and ("sidecar" in low or "running" in low
+                                                  or "cotracker" in low):
+                        no_engine = why
+                    notes.append("f%d-f%d: CoTracker offered nothing%s"
+                                 % (a, b, " (%s)" % why if why else ""))
                     continue
                 m = tr.markers.find_frame(a, exact=True) or tr.markers.insert_frame(a)
                 m.co = image_px_to_uv(float(cand["x"]), float(cand["y"]), w, h)
